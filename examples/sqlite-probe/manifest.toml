@@ -1,0 +1,26 @@
+manifest_version = 1
+
+# Array order is execution order. Nothing is sorted by filename or number, and
+# the leading digits below are a human convenience, not identities.
+
+[[migration]]
+id = "create-orders"
+path = "migrations/001-create-orders"
+language = "sql"
+mode = "restartable"
+entry = "up.sql"
+
+[[migration]]
+id = "seed-orders"
+path = "migrations/002-seed-orders"
+language = "sql"
+mode = "atomic"
+entry = "up.sql"
+
+[[migration]]
+id = "backfill-region"
+path = "migrations/003-backfill-region"
+language = "python"
+mode = "restartable"
+entry = "migration.py"
+require_valid = []

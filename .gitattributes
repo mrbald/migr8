@@ -1,0 +1,4 @@
+* text=auto eol=lf
+examples/** -text
+tests/fixtures/** -text
+migr8 text eol=lf

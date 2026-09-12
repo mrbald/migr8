@@ -1,0 +1,44 @@
+manifest_version = 1
+
+[[migration]]
+id = "create-orders"
+path = "migrations/010-create-orders"
+language = "sql"
+mode = "restartable"
+entry = "up.sql"
+
+[[migration]]
+id = "seed-orders"
+path = "migrations/020-seed-orders"
+language = "sql"
+mode = "atomic"
+entry = "up.sql"
+
+[[migration]]
+id = "pkg-orders-spec"
+path = "migrations/030-pkg-orders-spec"
+language = "sql"
+mode = "restartable"
+entry = "spec.sql"
+require_valid = [
+  { name = "PKG_ORDERS", type = "PACKAGE" },
+]
+
+[[migration]]
+id = "pkg-orders-body"
+path = "migrations/040-pkg-orders-body"
+language = "sql"
+mode = "restartable"
+entry = "body.sql"
+require_valid = [
+  { name = "PKG_ORDERS", type = "PACKAGE" },
+  { name = "PKG_ORDERS", type = "PACKAGE BODY" },
+]
+
+[[migration]]
+id = "backfill-region"
+path = "migrations/050-backfill-region"
+language = "python"
+mode = "restartable"
+entry = "migration.py"
+require_valid = []

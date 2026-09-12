@@ -1,0 +1,64 @@
+# Disposable local test services for migr8.
+#
+# Scope: this Compose project only. Ports are bound to loopback, credentials are
+# test-only, and storage is in named volumes belonging to this project. Never
+# point these at a shared or production database.
+#
+# Image digests are pinned. Record the actual server banner from the test
+# evidence, not the tag: tags and product names change.
+
+name: migr8-testenv
+
+services:
+  oracle:
+    # Oracle Database Free. This exercises the implementation on this release;
+    # it does not certify Oracle 19c.
+    image: gvenzl/oracle-free:23.9-slim@sha256:945400df5e3fc9589db628223385f906e1024932dc3b72e118fc4fcd0f0e9bbb
+    container_name: migr8-oracle
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_SYS_PASSWORD:-migr8_sys_test}
+      ORACLE_CHARACTERSET: AL32UTF8
+    ports:
+      - "127.0.0.1:${ORACLE_HOST_PORT:-15210}:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+    shm_size: "1gb"
+
+  postgres:
+    image: postgres:17.5@sha256:aadf2c0696f5ef357aa7a68da995137f0cf17bad0bf6e1f17de06ae5c769b302
+    container_name: migr8-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-migr8_test}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-migr8_pg_test}
+      POSTGRES_DB: ${POSTGRES_DB:-migr8_test}
+      # The official 17 image documents /var/lib/postgresql/data as the data
+      # directory; mounting a volume there requires PGDATA in a subdirectory.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      # Synchronous local commit durability is required by the adapter.
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-migr8_test} -d ${POSTGRES_DB:-migr8_test}"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  oracle-data:
+    name: migr8-testenv-oracle-data
+  postgres-data:
+    name: migr8-testenv-postgres-data
