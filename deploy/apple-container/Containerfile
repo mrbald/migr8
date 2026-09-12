@@ -1,0 +1,39 @@
+# The migration job as a container image.
+#
+# Two deliberate choices:
+#
+#   * the tool and the migrations are both baked in, so the fingerprints travel
+#     with the image. A migration artifact that can change after it is built is
+#     the thing fingerprints exist to prevent;
+#   * it runs as an unprivileged user and carries no credentials. The database
+#     password is supplied at run time through MIGR8_PASSWORD.
+#
+# Build with: deploy/apple-container/ctl.sh build
+
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /opt/migr8
+
+# Dependencies first, so editing a migration does not reinstall the drivers.
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-compile '.[oracle,postgres]'
+
+# Migrations and the provisioning helpers used by the disposable test setup.
+COPY examples ./examples
+COPY testenv/provision_oracle.py testenv/provision_postgres.py ./testenv/
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin runner \
+    && mkdir -p /var/log/migr8 && chown runner /var/log/migr8
+USER runner
+
+# The event log goes to a known path so `ctl.sh logs` can show it.
+ENV MIGR8_LOG_FILE=/var/log/migr8/run.jsonl
+
+ENTRYPOINT ["migr8"]
+CMD ["status"]

@@ -1,0 +1,33 @@
+manifest_version = 1
+
+[[migration]]
+# PostgreSQL DDL is transactional, so this create and its history row commit
+# together. On Oracle the same migration would have to be restartable.
+id = "create-orders"
+path = "migrations/010-create-orders"
+language = "sql"
+mode = "atomic"
+entry = "up.sql"
+
+[[migration]]
+id = "seed-orders"
+path = "migrations/020-seed-orders"
+language = "sql"
+mode = "atomic"
+entry = "up.sql"
+
+[[migration]]
+# CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so it belongs
+# to a restartable migration with its own native check.
+id = "concurrent-index"
+path = "migrations/030-concurrent-index"
+language = "python"
+mode = "restartable"
+entry = "migration.py"
+
+[[migration]]
+id = "backfill-region"
+path = "migrations/040-backfill-region"
+language = "python"
+mode = "restartable"
+entry = "migration.py"

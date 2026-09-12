@@ -1,0 +1,41 @@
+[project]
+name = "migr8"
+version = "0.1.0"
+description = "migr8 - an experimental, inspectable database migration engine (Oracle primary target)"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+oracle = ["oracledb>=3.4.0"]
+postgres = ["psycopg[binary]>=3.2.0"]
+
+[project.scripts]
+migr8 = "migr8.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "pytest-timeout>=2.4.0",
+  "oracledb>=3.4.0",
+  "psycopg[binary]>=3.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/migr8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "sqlite_probe: real SQLite probe adapter tests (no service required)",
+  "postgres: requires a live disposable PostgreSQL test service",
+  "oracle: requires a live disposable Oracle test service",
+  "slow: long-running acceptance scenarios",
+]
+timeout = 300

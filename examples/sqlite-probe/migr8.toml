@@ -1,0 +1,15 @@
+# SQLite local probe. Test and development support only: this is not an Oracle
+# emulator and says nothing about production behaviour.
+[database]
+adapter = "sqlite-probe"
+path = "build/probe.db"
+
+[lock]
+# A process-held POSIX advisory file lock beside the database file. This is the
+# probe's explicit exception to the database-backed lock requirement.
+provider = "file"
+timeout_seconds = 10
+
+[sqlite]
+journal_mode = "wal"
+busy_timeout_ms = 5000

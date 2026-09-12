@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Tests
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local test environment secrets and scratch
+testenv/.env
+testenv/secrets/
+.scratch/
+deploy/apple-container/generated/

@@ -1,0 +1,18 @@
+# Oracle is the primary target. Credentials never appear here: the password
+# comes from MIGR8_PASSWORD, or from supported wallet/external authentication.
+[database]
+adapter = "oracle"
+dsn = "localhost:15210/FREEPDB1"
+user = "MIGR8_TEST"
+target_schema = "MIGR8_TEST"
+
+[oracle]
+ddl_lock_timeout_seconds = 30
+
+[lock]
+# DBMS_LOCK with an explicitly configured user-lock id, recorded in m8_meta and
+# verified on every later run. All cooperating runners must use the same id.
+provider = "dbms_lock"
+package = "SYS.DBMS_LOCK"
+id = 4711
+timeout_seconds = 60
