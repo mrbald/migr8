@@ -19,7 +19,7 @@ import support
 from migr8.errors import Exit, UnitError
 from migr8.loader import PACKAGE_PREFIX, load_entry, package_name
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 
 @pytest.fixture

@@ -1,9 +1,12 @@
 """Exclusive execution and read-only inspection (spec Sections 8.1, 11.2, 14.2 group 8).
 
-Real cooperating processes against real SQLite files.  The probe's lock is a
-POSIX advisory file lock, which is an explicit exception to the production
-adapters' database-backed lock, so these tests establish the engine's exclusion
+Real cooperating processes against real SQLite files.  The SQLite namespace lock
+is a POSIX advisory file lock, which is an explicit exception to the Oracle and
+PostgreSQL database-backed lock, so these tests establish the engine's exclusion
 protocol rather than Oracle or PostgreSQL lock behaviour.
+
+The contended cases run in both supported journal modes: a second process reads
+and writes the same file through a different journal in each.
 """
 
 from __future__ import annotations
@@ -18,9 +21,10 @@ from pathlib import Path
 import pytest
 import support
 
+from migr8.adapters.sqlite import SUPPORTED_JOURNAL_MODES
 from migr8.errors import Exit
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 ENTRY = Path(__file__).resolve().parents[1] / "migr8"
 TIMEOUT = 60
@@ -68,8 +72,8 @@ def migrate(ctx):
 """
 
 
-@pytest.fixture
-def slow_project(tmp_path):
+@pytest.fixture(params=SUPPORTED_JOURNAL_MODES)
+def slow_project(request, tmp_path):
     ready = tmp_path / "ready"
     go = tmp_path / "go"
     db = tmp_path / "build" / "probe.db"
@@ -100,7 +104,7 @@ def slow_project(tmp_path):
             },
         ],
     )
-    support.sqlite_config(tmp_path, db_path=db, timeout=0)
+    support.sqlite_config(tmp_path, db_path=db, timeout=0, journal_mode=request.param)
     return tmp_path, db, ready, go
 
 
@@ -119,7 +123,7 @@ def test_zero_timeout_contention_is_deterministic(slow_project):
         _wait_for(ready)
         contender = run_cli(["migrate"], root)
         assert contender.returncode == Exit.LOCK_NOT_ACQUIRED
-        assert "holds the probe lock" in contender.stderr
+        assert "holds the namespace lock" in contender.stderr
         assert "not evidence that" in contender.stderr
     finally:
         go.write_text("continue")

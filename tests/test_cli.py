@@ -108,7 +108,7 @@ def test_unknown_adapter_is_a_usage_error(project):
 
 def test_unknown_config_table_is_a_usage_error(project):
     (project / "bad.toml").write_text(
-        '[database]\nadapter = "sqlite-probe"\npath = "x.db"\n\n'
+        '[database]\nadapter = "sqlite"\npath = "x.db"\n\n'
         '[lock]\nprovider = "file"\ntimeout_seconds = 1\n\n[mystery]\nkey = 1\n'
     )
     result = cli(["status", "--config", "bad.toml"], project)
@@ -118,7 +118,7 @@ def test_unknown_config_table_is_a_usage_error(project):
 
 def test_lock_id_out_of_range_is_a_usage_error(project):
     (project / "bad.toml").write_text(
-        '[database]\nadapter = "sqlite-probe"\npath = "x.db"\n\n'
+        '[database]\nadapter = "sqlite"\npath = "x.db"\n\n'
         '[lock]\nprovider = "file"\ntimeout_seconds = 1\nid = 1073741824\n'
     )
     result = cli(["status", "--config", "bad.toml"], project)
@@ -133,7 +133,7 @@ def test_json_reports_are_machine_readable(project):
         assert result.returncode == Exit.OK
         report = json.loads(result.stdout)
         assert report["command"] == command
-        assert report["adapter"] == "sqlite-probe"
+        assert report["adapter"] == "sqlite"
         assert report["initialized"] is True
         assert report["success_count"] == 1
         assert report["migrations"][0]["recorded_matches_current"] is True
@@ -192,6 +192,6 @@ def test_password_is_read_from_the_environment_only(project):
 def test_text_report_is_human_readable(project):
     assert cli(["migrate"], project).returncode == Exit.OK
     result = cli(["status"], project)
-    assert "adapter:   sqlite-probe" in result.stdout
+    assert "adapter:   sqlite" in result.stdout
     assert "create-t" in result.stdout
     assert "exit: 0" in result.stdout

@@ -1,8 +1,13 @@
-"""Real SQLite probe execution: atomic, restartable, progress and initialization.
+"""Real SQLite execution: atomic, restartable, progress and initialization.
 
-These are real SQLite files and real transactions, not mocks.  The probe's
-documented limits still apply: it is not an Oracle emulator, and its lock is a
-POSIX file lock rather than a database lock.
+These are real SQLite files and real transactions, not mocks.  The adapter's
+stated limits still apply: the namespace lock is a POSIX file lock rather than a
+database lock, and there is no server transaction identity.
+
+Every test here runs once per supported journal mode.  The two modes commit
+differently -- DELETE removes a rollback journal, WAL appends and syncs a commit
+record -- so the transaction, checkpoint, damage and restart cases are evidence
+for one mode only unless they are run in both.
 """
 
 from __future__ import annotations
@@ -12,16 +17,17 @@ from pathlib import Path
 import pytest
 import support
 
+from migr8.adapters.sqlite import SUPPORTED_JOURNAL_MODES
 from migr8.errors import Exit
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 
-@pytest.fixture
-def project(tmp_path):
+@pytest.fixture(params=SUPPORTED_JOURNAL_MODES)
+def project(request, tmp_path):
     """A workspace with a config whose database lives under ``tmp_path``."""
     db = tmp_path / "build" / "probe.db"
-    config = support.sqlite_config(tmp_path, db_path=db)
+    config = support.sqlite_config(tmp_path, db_path=db, journal_mode=request.param)
     return tmp_path, config, db
 
 
@@ -71,7 +77,7 @@ def test_recover_on_an_absent_namespace_creates_nothing(project):
 
 def test_recover_on_an_incomplete_namespace_completes_nothing(project):
     """A prefix left by an interrupted initialization holds no ACTIVE identity either."""
-    from migr8.adapters.sqlite_probe import _DDL
+    from migr8.adapters.sqlite import _DDL
     from migr8.model import HISTORY_TABLE
 
     root, config, db = project
@@ -87,7 +93,7 @@ def test_recover_on_an_incomplete_namespace_completes_nothing(project):
 def test_plain_migrate_still_completes_an_incomplete_namespace(project):
     """The refusal is specific to --recover; ordinary initialization is recoverable."""
     from migr8.adapters import metadata as md
-    from migr8.adapters.sqlite_probe import _DDL
+    from migr8.adapters.sqlite import _DDL
     from migr8.model import HISTORY_TABLE
 
     root, config, db = project
@@ -131,7 +137,7 @@ def test_first_migrate_initializes_and_applies(project):
     ]
     assert support.db_query(db, "SELECT COUNT(*) FROM t") == [(0,)]
     meta = support.db_query(db, "SELECT layout_version, adapter, lock_provider FROM m8_meta")
-    assert meta == [(1, "sqlite-probe", "file")]
+    assert meta == [(1, "sqlite", "file")]
 
 
 def test_read_only_commands_do_not_initialize(project):
@@ -723,7 +729,7 @@ def test_progress_key_and_value_limits(project):
 # --- required objects ---------------------------------------------------------------
 
 
-def test_probe_rejects_oracle_style_required_objects(project):
+def test_the_adapter_rejects_oracle_style_required_objects(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     manifest = support.manifest(
@@ -825,9 +831,7 @@ def test_interruption_after_each_metadata_object_creation_is_completed(project, 
 
     # A fresh run completes the permitted incomplete initialization.
     assert support.migrate(config, manifest) == Exit.OK
-    assert support.db_query(db, "SELECT layout_version, adapter FROM m8_meta") == [
-        (1, "sqlite-probe")
-    ]
+    assert support.db_query(db, "SELECT layout_version, adapter FROM m8_meta") == [(1, "sqlite")]
     assert [row[1] for row in support.history(db)] == ["create-t"]
 
 
@@ -914,7 +918,7 @@ def test_error_inserting_successful_history_rolls_back_the_migration_work(projec
 
 
 def test_read_only_commands_do_not_change_the_journal_mode(tmp_path):
-    """Spec Section 13.3: WAL setup is controlled probe initialization, never a
+    """Spec Section 13.3: the journal mode is set by migrate alone, never as a
     side effect of status or validate."""
     db = tmp_path / "build" / "probe.db"
     delete_mode = support.sqlite_config(tmp_path, db_path=db, journal_mode="delete")

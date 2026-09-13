@@ -1,0 +1,18 @@
+# SQLite: one local database file, opened by cooperating processes under this
+# canonical path. It is not an Oracle emulator.
+[database]
+adapter = "sqlite"
+path = "build/probe.db"
+
+[lock]
+# A process-held POSIX advisory file lock beside the database file. This is
+# SQLite's explicit exception to the database-backed lock requirement.
+provider = "file"
+timeout_seconds = 10
+
+[sqlite]
+journal_mode = "wal"
+# FULL is the durable WAL commit; EXTRA adds the directory sync a DELETE-mode
+# journal removal needs. There is no weaker setting.
+synchronous = "full"
+busy_timeout_ms = 5000

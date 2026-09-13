@@ -24,7 +24,7 @@ from migr8.diagnostics import RunLog, default_log_path
 from migr8.errors import Exit
 from migr8.testing import hooks
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 ENTRY = Path(__file__).resolve().parents[1] / "migr8"
 
@@ -103,7 +103,7 @@ def test_event_log_records_the_phases_in_order(project):
 
     start = events[names.index("run_start")]
     assert start["command"] == "migrate"
-    assert start["adapter"] == "sqlite-probe"
+    assert start["adapter"] == "sqlite"
     assert start["units"] == 2
     plan = events[names.index("plan")]
     assert plan["pending"] == ["create-t", "seed-t"]
@@ -247,7 +247,7 @@ def test_migrate_json_outcome_on_success(project):
     assert report["outcome"] == "ok"
     assert report["exit_code"] == 0
     assert report["executed"] == ["create-t", "seed-t"]
-    assert report["adapter"] == "sqlite-probe"
+    assert report["adapter"] == "sqlite"
     assert report["namespace"].endswith("probe.db")
     assert report["failed_migration"] is None
     assert report["duration_seconds"] >= 0

@@ -20,7 +20,7 @@ import support
 from migr8.diagnostics import RunLog
 from migr8.errors import Exit
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 CANARY = "REVIEW_CANARY_91"
 
@@ -168,9 +168,9 @@ def test_the_description_names_the_type_and_the_engine_error_code():
     """Spec Section 11.5: a code identifies the fault without carrying the data."""
     import sqlite3
 
-    from migr8.adapters.sqlite_probe import SqliteProbeAdapter
+    from migr8.adapters.sqlite import SqliteAdapter
 
-    probe = SqliteProbeAdapter.__new__(SqliteProbeAdapter)
+    probe = SqliteAdapter.__new__(SqliteAdapter)
     try:
         sqlite3.connect(":memory:").execute(f"SELECT {CANARY}")
     except sqlite3.Error as exc:
@@ -181,9 +181,9 @@ def test_the_description_names_the_type_and_the_engine_error_code():
 
 
 def test_an_adapter_without_a_code_for_an_exception_still_names_its_type():
-    from migr8.adapters.sqlite_probe import SqliteProbeAdapter
+    from migr8.adapters.sqlite import SqliteAdapter
 
-    probe = SqliteProbeAdapter.__new__(SqliteProbeAdapter)
+    probe = SqliteAdapter.__new__(SqliteAdapter)
     exc = PoisonedRejection(CANARY)
     assert probe.error_code(exc) is None
     described = probe.describe_exception(exc)
@@ -212,7 +212,7 @@ def test_a_safe_description_keeps_engine_text_and_drops_everything_else():
     assert CANARY not in described
 
 
-def test_the_sqlite_probe_reports_its_symbolic_result_code(project):
+def test_the_sqlite_adapter_reports_its_symbolic_result_code(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "INSERT INTO absent (id) VALUES (1);\n"})
     manifest = support.manifest(
@@ -304,11 +304,11 @@ def test_a_canary_in_a_metadata_read_does_not_reach_the_status_report(project, c
     """``status`` goes through inspect_metadata(), which Engine.run() does not own."""
     import sqlite3
 
-    from migr8.adapters.sqlite_probe import SqliteProbeAdapter
+    from migr8.adapters.sqlite import SqliteAdapter
 
     root, config, db = project
     _initialized(root, config)
-    real_query = SqliteProbeAdapter._metadata_query
+    real_query = SqliteAdapter._metadata_query
 
     def poisoned(self, sql, params):
         if "m8_meta" in sql:
@@ -317,11 +317,11 @@ def test_a_canary_in_a_metadata_read_does_not_reach_the_status_report(project, c
             sqlite3.connect(":memory:").execute(f"SELECT {CANARY}")
         return real_query(self, sql, params)
 
-    SqliteProbeAdapter._metadata_query = poisoned
+    SqliteAdapter._metadata_query = poisoned
     try:
         code = support.run_cli(["status", "--json"], cwd=root)
     finally:
-        SqliteProbeAdapter._metadata_query = real_query
+        SqliteAdapter._metadata_query = real_query
     captured = capsys.readouterr()
 
     assert code == Exit.METADATA_DAMAGED
