@@ -1,4 +1,4 @@
-"""Run diagnostics: a correlation id and an append-only event log.
+"""Run diagnostics: a correlation id and an append-only event log (spec Section 11.5).
 
 Records the order things happened in, how long each step took, which identity
 and fingerprint were involved, and the phase that failed -- what a failure
