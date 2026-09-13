@@ -8,7 +8,7 @@ recreated once the completion marker exists.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 from typing import NamedTuple, TypedDict
 
@@ -236,6 +236,7 @@ def check_problems(
     expected: tuple[str, ...],
     *,
     fold: Callable[[str], str],
+    equivalents: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Compare one table's check constraints against the complete supported set.
 
@@ -245,14 +246,24 @@ def check_problems(
     altered one and an added one are all reported.  Nothing is altered to make
     it pass.
 
+    ``equivalents`` maps a *recorded* alternative rendering to the supported
+    condition it stands for.  One engine can render the same condition more than
+    one way -- PostgreSQL re-parses a dumped definition into a different but
+    equivalent form -- and a namespace restored from a logical backup is the
+    same namespace.  Each entry is a rendering someone observed and wrote down,
+    named with the release it came from; nothing is inferred at run time and no
+    equivalence is decided by inspection.
+
     The engine-owned rows in a metadata table are always valid against a check
     that enforces nothing, so the existing rows cannot stand in for this: only
     the definition says what the next write will be held to.
     """
     problems: list[str] = []
     seen: set[str] = set()
+    renderings = equivalents or {}
     for stored, enforced, state in rows:
         condition = canonical_condition(stored, fold=fold)
+        condition = renderings.get(condition, condition) if condition is not None else None
         if condition is None:
             problems.append(
                 f"{table} has a check constraint whose condition is not in a form this tool "

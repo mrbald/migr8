@@ -462,6 +462,7 @@ class PostgresAdapter(Adapter):
                     ((row[2], bool(row[1]), "NOT VALID") for row in rows if row[0] == "c"),
                     expected["checks"],
                     fold=self._fold,
+                    equivalents=_DUMPED_RENDERINGS,
                 )
             )
         return problems
@@ -806,6 +807,30 @@ _EXPECTED_COLUMNS = {
 #: check is the canonical form of ``pg_get_constraintdef`` for the DDL above,
 #: recorded from PostgreSQL 17.5 on 2026-09-13 rather than guessed.  Semantics
 #: are compared, never the database-generated constraint name.
+#: Renderings PostgreSQL produces for a condition it re-parsed from a dumped
+#: definition, mapped to the supported rendering each one stands for.
+#:
+#: `pg_dump` writes `pg_get_constraintdef` output, and the server renders the
+#: result differently from the `IN (...)` this engine issued: the cast moves
+#: inside the array elements.  The condition is the same one -- the same column,
+#: the same two literals, the same comparison -- and a namespace restored from a
+#: logical backup is the same namespace, so it is accepted here rather than
+#: reported as damage.  Observed on PostgreSQL 17.5 on 2026-09-13 by dumping and
+#: restoring an initialized namespace.  Each entry is a recorded observation; no
+#: equivalence is decided at run time.
+_DUMPED_RENDERINGS = {
+    f"check ( ( ( {column} ) :: text = any ( array [ "
+    + " , ".join(f"( '{value}' :: character varying ) :: text" for value in values)
+    + " ] ) ) )": f"check ( ( ( {column} ) :: text = any ( ( array [ "
+    + " , ".join(f"'{value}' :: character varying" for value in values)
+    + " ] ) :: text [ ] ) ) )"
+    for column, values in (
+        ("language", ("sql", "python")),
+        ("mode", ("atomic", "restartable")),
+        ("status", ("ACTIVE", "SUCCESS")),
+    )
+}
+
 _EXPECTED_CONSTRAINTS: dict[str, md.ExpectedConstraints] = {
     HISTORY_TABLE: {
         "keys": (md.ExpectedKey("p", "migration_id"), md.ExpectedKey("u", "seq")),
