@@ -15,16 +15,18 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 import oracledb
 
-from ..config import Config
+from ..config import PASSWORD_ENV, Config
 from ..errors import (
     ConfigError,
     LockNotAcquiredError,
     MetadataDamagedError,
     UnsupportedCapabilityError,
     UsageError,
+    describe_safely,
 )
 from ..manifest import Mode, RequiredObject
 from ..model import (
@@ -158,6 +160,88 @@ CLIENT_SIDE_DPY_CODES = frozenset(
 )
 
 
+#: Oracle's proxy-authentication connect string: the session user in brackets,
+#: optionally preceded by the user that authenticates.  `RUNNER[APP_DBA]`
+#: connects as RUNNER and becomes APP_DBA; `[APP_DBA]` does the same with
+#: external authentication and names no connecting user.
+_PROXY_USER_RE = re.compile(r"^(?P<connecting>[^\[\]]*)\[(?P<target>[^\[\]]*)\]$")
+
+
+def _parse_user(value: str) -> tuple[str, str | None, str]:
+    """Split ``database.user`` into effective user, connecting user and connect string.
+
+    Proxy authentication makes the session user the *target*: after connecting,
+    ``USER`` is the bracketed name, its schema is the default one, and the
+    privileges are its own.  So the target is what the target schema defaults to
+    and what ``CURRENT_SCHEMA`` is compared against, while the bracketed string
+    is what the driver is given.  Both halves are held to the same identifier
+    rule as a plain user: an unquoted uppercase name, and nothing else.
+    """
+    match = _PROXY_USER_RE.match(value)
+    if match is None:
+        user = _require_identifier(value, "database.user")
+        return user, user, user
+    target = _require_identifier(match.group("target").strip(), "the proxy target in database.user")
+    connecting = match.group("connecting").strip()
+    if not connecting:
+        return target, None, f"[{target}]"
+    authenticating = _require_identifier(connecting, "the connecting user in database.user")
+    return target, authenticating, f"{authenticating}[{target}]"
+
+
+def _optional_directory(value: object, what: str) -> str | None:
+    """A configured directory, checked here rather than by a driver error later."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"oracle.{what} must be a path")
+    if not Path(value).is_dir():
+        raise ConfigError(f"oracle.{what} {value!r} is not a directory")
+    return value
+
+
+def _enable_thick_mode(lib_dir: str | None, config_dir: str | None) -> None:
+    """Load the Oracle Client libraries, once per process.
+
+    python-oracledb is Thin unless something calls this, and there is no
+    environment switch for it: a runner that is configured for thick mode has to
+    make the call itself, before it connects.  The call is process-wide and
+    cannot be undone, so a second call with different directories is a
+    configuration error rather than a silent no-op.
+    """
+    global _THICK_MODE
+    requested = (lib_dir, config_dir)
+    if _THICK_MODE is not None and requested != _THICK_MODE:
+        raise UsageError(
+            "thick mode was already initialized in this process with "
+            f"{_THICK_MODE}; the Oracle Client libraries cannot be reloaded"
+        )
+    if not oracledb.is_thin_mode():
+        # Thick mode is already in force, here or in whatever started this
+        # process.  The driver's own state is the authority: initializing twice
+        # is an error, and it cannot be undone once a connection exists.
+        _THICK_MODE = requested
+        return
+    try:
+        oracledb.init_oracle_client(lib_dir=lib_dir, config_dir=config_dir)
+    except oracledb.Error as exc:
+        # The driver's own text is the diagnostic here, and it names the library
+        # that is missing.  This runs before any migration and quotes no data,
+        # which is the stated exception to reporting failures by code alone.
+        detail = str(exc).splitlines()[0] if exc.args else describe_safely(exc)
+        raise UnsupportedCapabilityError(
+            f"the Oracle Client libraries could not be loaded for thick mode: {detail}. "
+            "The client resolves its own libraries through the dynamic loader, so the "
+            "directory has to be on the library search path as well -- ldconfig, or "
+            "LD_LIBRARY_PATH in the environment that starts the runner"
+        ) from exc
+    _THICK_MODE = requested
+
+
+#: The directories thick mode was initialized with, or None while the process is Thin.
+_THICK_MODE: tuple[str | None, str | None] | None = None
+
+
 def _require_identifier(value: str, what: str) -> str:
     upper = value.upper()
     if not IDENTIFIER_RE.match(upper) or upper != value:
@@ -191,20 +275,35 @@ class OracleAdapter(Adapter):
             raise ConfigError("the oracle adapter requires database.dsn")
         if not config.user:
             raise ConfigError("the oracle adapter requires database.user")
-        self._user = _require_identifier(config.user, "database.user")
-        schema = config.target_schema or config.user
+        #: ``_user`` is the session user the run ends up as, which is the proxy
+        #: target when one is named; ``_connect_string`` is what the driver gets.
+        self._user, self._connecting_user, self._connect_string = _parse_user(config.user)
+        schema = config.target_schema or self._user
         self._schema = _require_identifier(schema, "database.target_schema")
 
         options = config.options.get("oracle", {})
         if not isinstance(options, dict):
             raise ConfigError("[oracle] must be a table")
-        unknown = sorted(set(options) - {"ddl_lock_timeout_seconds", "allow_thick_mode"})
+        unknown = sorted(
+            set(options)
+            - {"ddl_lock_timeout_seconds", "allow_thick_mode", "client_lib_dir", "config_dir"}
+        )
         if unknown:
             raise ConfigError(f"[oracle] has unknown keys: {', '.join(unknown)}")
         self._ddl_lock_timeout = int(options.get("ddl_lock_timeout_seconds", 30))
         if self._ddl_lock_timeout < 0:
             raise ConfigError("oracle.ddl_lock_timeout_seconds must not be negative")
         self._allow_thick = bool(options.get("allow_thick_mode", False))
+        self._client_lib_dir = _optional_directory(options.get("client_lib_dir"), "client_lib_dir")
+        #: Where the driver reads `tnsnames.ora`, `sqlnet.ora` and a wallet, in
+        #: both modes.  Thick mode takes it at initialization; thin mode reads it
+        #: per process, so it is set on the driver's defaults.
+        self._config_dir = _optional_directory(options.get("config_dir"), "config_dir")
+        if self._client_lib_dir and not self._allow_thick:
+            raise ConfigError(
+                "oracle.client_lib_dir names the Oracle Client libraries for thick mode, "
+                "so it requires oracle.allow_thick_mode = true"
+            )
 
         lock = config.lock
         if lock.provider != "dbms_lock":
@@ -240,7 +339,24 @@ class OracleAdapter(Adapter):
             database_backed_lock=True,
             transaction_identity_tripwire=True,
             notes=(
-                "python-oracledb Thin mode; thick mode refused unless explicitly enabled.",
+                f"python-oracledb {'Thick' if self._allow_thick else 'Thin'} mode"
+                + (
+                    f", client libraries from {self._client_lib_dir}"
+                    if self._client_lib_dir
+                    else ""
+                )
+                + (f", driver configuration from {self._config_dir}" if self._config_dir else "")
+                + ". The mode is the configured one and is read back from the connection.",
+                f"Session user {self._user}"
+                + (
+                    f", reached by proxy authentication through {self._connecting_user}."
+                    if self._connecting_user not in (None, self._user)
+                    else (
+                        ", reached by external authentication with no connecting user."
+                        if self._connecting_user is None
+                        else "."
+                    )
+                ),
                 "COMMIT_WAIT = FORCE_WAIT is set before the lock and any metadata write. "
                 f"Read-back: {self._commit_wait_note}",
                 "DDL is restartable only. A plain CREATE that fails on repetition is not "
@@ -268,11 +384,31 @@ class OracleAdapter(Adapter):
 
     def connect(self) -> None:
         password = self.config.password()
+        if password is None and not self._allow_thick:
+            raise ConfigError(
+                f"no password is set in {PASSWORD_ENV}. A run without one authenticates "
+                "externally, through a wallet, which python-oracledb provides in Thick mode "
+                f"only: set {PASSWORD_ENV}, or set oracle.allow_thick_mode = true"
+            )
+        if self._connecting_user is None and password is not None:
+            raise ConfigError(
+                f"database.user names no connecting user, so the run authenticates "
+                f"externally and no password is used; unset {PASSWORD_ENV} or name the "
+                "connecting user, as in RUNNER[APP_DBA]"
+            )
+        if self._allow_thick:
+            _enable_thick_mode(self._client_lib_dir, self._config_dir)
+        elif self._config_dir is not None:
+            # Thin mode reads tnsnames.ora, sqlnet.ora and a wallet from here.
+            oracledb.defaults.config_dir = self._config_dir
         try:
             self._conn = oracledb.connect(
-                user=self._user,
+                user=self._connect_string,
                 password=password,
                 dsn=self.config.dsn,
+                # No password means a wallet: the driver is told so explicitly
+                # rather than inferring it from the empty argument.
+                externalauth=password is None,
                 # Transparent reconnect and replay are not used by this runner.
                 # Thin mode implements neither; see the thick-mode check below.
             )
@@ -287,8 +423,18 @@ class OracleAdapter(Adapter):
             self._conn.close()
             self._conn = None
             raise UnsupportedCapabilityError(
-                "this adapter is tested in python-oracledb Thin mode only; set "
-                "oracle.allow_thick_mode = true only after running the suite in thick mode"
+                "this connection is in python-oracledb Thick mode, which this run did not "
+                "ask for; set oracle.allow_thick_mode = true to select it deliberately"
+            )
+        if self._conn.thin and self._allow_thick:
+            # The configured mode is the one that must be in force: a run that
+            # asked for thick and got thin is using different libraries, a
+            # different network stack and different authentication paths.
+            self._conn.close()
+            self._conn = None
+            raise UnsupportedCapabilityError(
+                "oracle.allow_thick_mode is set but the connection is in Thin mode; the "
+                "Oracle Client libraries did not take effect"
             )
         self._conn.autocommit = False
         self._configure_session()

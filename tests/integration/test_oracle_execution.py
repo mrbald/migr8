@@ -731,6 +731,88 @@ def test_recover_cannot_change_mode(oracle_project, oracle_query):
 # --- separate connect user and target schema ----------------------------------------
 
 
+def test_a_proxy_connect_string_migrates_as_the_target_user(tmp_path, oracle_settings):
+    """Spec Section 12: `RUNNER[OWNER]` authenticates as one user and runs as another.
+
+    Proxy authentication is how a deployment separates the identity that proves
+    who is running from the schema that owns the objects. The session user is the
+    target, so the target schema defaults to it, no `CURRENT_SCHEMA` is set, and
+    the objects belong to the owner without the runner holding `ANY` privileges.
+    """
+    import oracledb
+
+    runner = f"{oracle_settings['user']}_RUNNER"
+    owner = f"{oracle_settings['user']}_OWNER"
+    with oracledb.connect(
+        user=owner, password=oracle_settings["password"], dsn=oracle_settings["dsn"]
+    ) as probe:
+        cursor = probe.cursor()
+        for name, kind in cursor.execute(
+            "SELECT object_name, object_type FROM all_objects WHERE owner = :owner "
+            "AND object_type IN ('TABLE','VIEW') ORDER BY object_type DESC",
+            owner=owner,
+        ).fetchall():
+            suffix = " CASCADE CONSTRAINTS PURGE" if kind == "TABLE" else ""
+            with contextlib.suppress(oracledb.DatabaseError):
+                cursor.execute(f'DROP {kind} "{owner}"."{name}"{suffix}')
+        probe.commit()
+
+    config = support.write(
+        tmp_path / "migr8.toml",
+        f"""
+        [database]
+        adapter = "oracle"
+        dsn = "{oracle_settings["dsn"]}"
+        user = "{runner}[{owner}]"
+
+        [oracle]
+        ddl_lock_timeout_seconds = 10
+{support.oracle_mode_options()}
+        [lock]
+        provider = "dbms_lock"
+        package = "SYS.DBMS_LOCK"
+        id = 4715
+        timeout_seconds = 20
+    """,
+    )
+    os.environ["MIGR8_PASSWORD"] = oracle_settings["password"]
+    support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE proxy_t (id NUMBER(10))"})
+    manifest = support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "create-proxy-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            }
+        ],
+    )
+
+    assert support.migrate(config, manifest) == Exit.OK
+    assert support.report_for("validate", config, manifest).exit_code == Exit.OK
+
+    with oracledb.connect(
+        user=f"{runner}[{owner}]", password=oracle_settings["password"], dsn=oracle_settings["dsn"]
+    ) as probe:
+        cursor = probe.cursor()
+        assert cursor.execute("SELECT USER FROM dual").fetchone()[0] == owner
+        assert (
+            cursor.execute("SELECT sys_context('USERENV','PROXY_USER') FROM dual").fetchone()[0]
+            == runner
+        )
+        owned = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT object_name FROM all_objects WHERE owner = :owner "
+                "AND object_name IN ('PROXY_T','M8_HISTORY','M8_META')",
+                owner=owner,
+            ).fetchall()
+        }
+    assert owned == {"PROXY_T", "M8_HISTORY", "M8_META"}
+
+
 def test_connect_user_differs_from_target_schema(tmp_path, oracle_settings, oracle_query):
     """Spec Section 12: CURRENT_SCHEMA changes resolution, not ownership."""
     runner = f"{oracle_settings['user']}_RUNNER"
@@ -762,7 +844,7 @@ def test_connect_user_differs_from_target_schema(tmp_path, oracle_settings, orac
 
         [oracle]
         ddl_lock_timeout_seconds = 10
-
+{support.oracle_mode_options()}
         [lock]
         provider = "dbms_lock"
         package = "SYS.DBMS_LOCK"

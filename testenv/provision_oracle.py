@@ -7,7 +7,7 @@ creates two users:
 * the main test schema, where the connect user and the target schema are the
   same; and
 * a second fixture pair that exercises a connect user whose target schema is a
-  different owner.
+  different owner, reached either by privilege or by proxy authentication.
 
 ``DBMS_LOCK`` execute is granted directly, which is what the engine requires.
 """
@@ -102,6 +102,10 @@ def main() -> int:
         execute(cursor, f"GRANT ALTER SESSION TO {RUNNER_USER}")
         execute(cursor, f"GRANT ALTER SESSION TO {TEST_USER}")
         execute(cursor, f"GRANT ALTER SESSION TO {OWNER_USER}")
+        # Proxy authentication: the runner may connect *as* the owner, which is
+        # the shape a deployment uses when the migration identity is a personal
+        # or certificate-held account and the objects belong to a schema owner.
+        execute(cursor, f"ALTER USER {OWNER_USER} GRANT CONNECT THROUGH {RUNNER_USER}")
         connection.commit()
     print(f"provisioned {TEST_USER}, {RUNNER_USER} -> {OWNER_USER} on {DSN}")
     print(f"server version: {banner}")
