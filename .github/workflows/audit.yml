@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       # --no-hashes deliberately: the audit needs name==version, and the
       # hash set pins wheels per platform, so a lock built on one
       # architecture fails the install step on the runner's.
