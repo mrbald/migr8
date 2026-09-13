@@ -14,8 +14,9 @@ from __future__ import annotations
 import pytest
 import support
 
+from migr8.adapters import metadata as md
 from migr8.errors import Exit
-from migr8.model import ACTIVE_INDEX, HISTORY_TABLE, PROGRESS_TABLE
+from migr8.model import ACTIVE_INDEX, HISTORY_TABLE, META_TABLE, PROGRESS_TABLE
 
 
 def _one_migration(root):
@@ -65,6 +66,39 @@ class TestOracle:
         manifest = _one_migration(root)
         assert support.migrate(config, manifest) == Exit.OK
         return root, config, schema, manifest
+
+    def test_a_namespace_whose_checks_were_re_created_is_the_same_namespace(
+        self, initialized, oracle_query
+    ):
+        """The question a restore asks: does the server render a re-issued condition anew?
+
+        A logical restore re-creates each constraint from the definition the
+        dictionary holds. PostgreSQL renders the result differently and the
+        adapter records those renderings; this establishes what Oracle does with
+        the same round trip. The engine's own named checks are re-created; the
+        NOT NULL rows are left alone, because re-adding one as an ordinary CHECK
+        would make the column nullable and that is a different change.
+        """
+        root, config, schema, manifest = initialized
+        history = f'"{schema}"."{HISTORY_TABLE.upper()}"'
+        stored = [
+            (name, str(condition))
+            for name, condition in oracle_query(
+                "SELECT constraint_name, search_condition FROM all_constraints "
+                "WHERE owner = :owner AND table_name = :name AND constraint_type = 'C'",
+                owner=schema.upper(),
+                name=HISTORY_TABLE.upper(),
+            )
+            if not md.is_not_null_condition(md.canonical_condition(condition, fold=str.upper) or "")
+        ]
+        assert stored, "the history table carries check constraints to round-trip"
+        for name, condition in stored:
+            oracle_query(f'ALTER TABLE {history} DROP CONSTRAINT "{name}"')
+            oracle_query(f'ALTER TABLE {history} ADD CONSTRAINT "{name}" CHECK ({condition})')
+
+        report = support.migrate_report(config, manifest)
+        assert report.exit_code == Exit.OK, report.message
+        assert support.report_for("validate", config, manifest).exit_code == Exit.OK
 
     def test_a_replaced_index_expression_is_reported_as_damage(self, initialized, oracle_query):
         """A per-row key admits two ACTIVE rows, so it is not the supported index."""
@@ -263,9 +297,12 @@ class TestPostgres:
         report = support.migrate_report(config, manifest)
         assert report.exit_code == Exit.METADATA_DAMAGED
         assert "unsupported check constraint" in (report.message or "")
-        # Damage is reported, not repaired.
+        # Damage is reported, not repaired.  The lookup is qualified by the
+        # namespace: another schema in the same database is another namespace,
+        # and this database may well hold one.
         definition = pg_query(
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = %s",
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            f"WHERE conrelid = '{schema}.{HISTORY_TABLE}'::regclass AND conname = %s",
             ("m8_history_seq_ck",),
         )[0][0]
         assert "1 = 1" in definition
@@ -307,3 +344,38 @@ class TestPostgres:
         report = support.migrate_report(config, manifest)
         assert report.exit_code == Exit.OK
         assert report.executed == []
+
+    def test_a_namespace_restored_from_a_dump_is_the_same_namespace(self, initialized, pg_query):
+        """A logical restore re-parses each condition, and PostgreSQL renders it anew.
+
+        `pg_dump` writes what `pg_get_constraintdef` returns, and restoring that
+        text produces a condition the server spells differently from the
+        `IN (...)` this engine issued -- the cast moves inside the array. The
+        round trip is reproduced here without `pg_dump`, by re-creating every
+        check constraint from its own definition, because the tool has to accept
+        a namespace that came back from a backup.
+        """
+        root, config, schema, manifest = initialized
+
+        def checks(table: str) -> list[tuple]:
+            return pg_query(
+                "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+                f"WHERE conrelid = '{schema}.{table}'::regclass AND contype = 'c'"
+            )
+
+        changed = False
+        for table in (HISTORY_TABLE, PROGRESS_TABLE, META_TABLE):
+            qualified = f'"{schema}"."{table}"'
+            stored = checks(table)
+            assert stored, f"{table} carries check constraints to round-trip"
+            for name, definition in stored:
+                pg_query(f'ALTER TABLE {qualified} DROP CONSTRAINT "{name}"')
+                pg_query(f'ALTER TABLE {qualified} ADD CONSTRAINT "{name}" {definition}')
+            changed = changed or {row[1] for row in checks(table)} != {row[1] for row in stored}
+        assert changed, (
+            "this release renders every restored condition identically, so the case is gone"
+        )
+
+        report = support.migrate_report(config, manifest)
+        assert report.exit_code == Exit.OK, report.message
+        assert support.report_for("validate", config, manifest).exit_code == Exit.OK
