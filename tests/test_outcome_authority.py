@@ -25,7 +25,7 @@ import support
 
 from migr8.errors import Exit
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 
 class SimulatedTransportLoss(Exception):

@@ -19,7 +19,7 @@ from migr8.errors import ContractViolationError, Exit, UnknownOutcomeError
 from migr8.latch import LatchState, RunLatch
 from migr8.testing import hooks
 
-pytestmark = pytest.mark.sqlite_probe
+pytestmark = pytest.mark.sqlite
 
 
 class SimulatedTransportLoss(Exception):

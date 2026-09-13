@@ -116,7 +116,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
-  "sqlite_probe: real SQLite probe adapter tests (no service required)",
+  "sqlite: real SQLite adapter tests (no database service required)",
   "postgres: requires a live disposable PostgreSQL test service",
   "oracle: requires a live disposable Oracle test service",
   "slow: long-running acceptance scenarios",

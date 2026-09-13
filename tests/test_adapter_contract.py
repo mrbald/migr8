@@ -5,7 +5,7 @@ right. They live in one place so that adding an adapter means filling in a
 dialect and running this file, rather than writing a new test module and hoping
 it covers the same ground. Drift between adapters shows up here.
 
-The SQLite probe always runs. Oracle and PostgreSQL run when their services are
+The SQLite adapter always runs. Oracle and PostgreSQL run when their services are
 configured and skip with an explicit reason otherwise; a skip is never treated as
 coverage.
 """
@@ -39,6 +39,7 @@ def _oracle_config(tmp_path):
         if not os.environ.get(name):
             pytest.skip(f"Oracle test service not configured: {name} is unset")
     oracledb = pytest.importorskip("oracledb")
+    support.enable_oracle_thick_mode(oracledb)
     dsn = os.environ["MIGR8_ORACLE_DSN"]
     user = os.environ["MIGR8_ORACLE_USER"].upper()
     password = os.environ["MIGR8_ORACLE_PASSWORD"]
@@ -69,7 +70,7 @@ def _oracle_config(tmp_path):
 
         [oracle]
         ddl_lock_timeout_seconds = 10
-
+{support.oracle_mode_options()}
         [lock]
         provider = "dbms_lock"
         package = "SYS.DBMS_LOCK"
@@ -116,13 +117,13 @@ def _postgres_config(tmp_path):
 
 
 BUILDERS = {
-    "sqlite-probe": _sqlite_config,
+    "sqlite": _sqlite_config,
     "oracle": _oracle_config,
     "postgres": _postgres_config,
 }
 
 ADAPTERS = [
-    pytest.param("sqlite-probe", marks=pytest.mark.sqlite_probe),
+    pytest.param("sqlite", marks=pytest.mark.sqlite),
     pytest.param("oracle", marks=pytest.mark.oracle),
     pytest.param("postgres", marks=pytest.mark.postgres),
 ]

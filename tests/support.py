@@ -68,7 +68,7 @@ def sqlite_config(
         root / name,
         f"""
         [database]
-        adapter = "sqlite-probe"
+        adapter = "sqlite"
         path = "{target}"
 
         [lock]
@@ -103,6 +103,26 @@ def simple_sql_project(
     )
     config_path = sqlite_config(root)
     return config_path, manifest_path
+
+
+#: Set to an Oracle Client library directory to run the Oracle suites in Thick
+#: mode.  The switch is the adapter's own: the generated configs carry
+#: `allow_thick_mode` and `client_lib_dir`, so every runner the suite starts, in
+#: this process and in a subprocess, is in the mode named here.
+ORACLE_CLIENT_LIB = os.environ.get("MIGR8_ORACLE_CLIENT_LIB")
+
+
+def oracle_mode_options() -> str:
+    """The `[oracle]` lines that select the driver mode, for a generated config."""
+    if not ORACLE_CLIENT_LIB:
+        return ""
+    return f'        allow_thick_mode = true\n        client_lib_dir = "{ORACLE_CLIENT_LIB}"\n'
+
+
+def enable_oracle_thick_mode(oracledb) -> None:
+    """Load the Oracle Client libraries for this process, if the suite asks for it."""
+    if ORACLE_CLIENT_LIB and oracledb.is_thin_mode():
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB)
 
 
 def run_cli(argv: list[str], *, cwd: Path | None = None) -> int:
@@ -183,6 +203,19 @@ def report_for(command: str, config_path: Path, manifest_path: Path):
     return runner(adapter, capture)
 
 
+def report_for_offline(config_path: Path, manifest_path: Path, *, baseline: Path | None = None):
+    """Run ``validate --offline`` and return its report object."""
+    from migr8 import adapters
+    from migr8.config import load as load_config
+    from migr8.manifest import load as load_manifest
+    from migr8.readonly import run_offline
+    from migr8.staging import capture_in_place
+
+    config = load_config(config_path)
+    capture = capture_in_place(load_manifest(manifest_path))
+    return run_offline(adapters.create(config), capture, baseline=baseline)
+
+
 def db_query(db_path: Path, sql: str, params: tuple = ()) -> list[tuple]:
     import sqlite3
 
@@ -199,6 +232,53 @@ def db_exec(db_path: Path, sql: str, params: tuple = ()) -> None:
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute(sql, params)
+    finally:
+        conn.close()
+
+
+def db_redefine(db_path: Path, name: str, sql: str) -> None:
+    """Replace one object's stored definition, as a hand-edited schema would.
+
+    `PRAGMA writable_schema` is SQLite's own way to rewrite a stored definition
+    without recreating the object, and it is what expresses "the layout was
+    changed underneath a namespace that is already initialized".  The schema
+    version is bumped so the next connection reloads rather than serving a
+    cached schema.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute("UPDATE sqlite_master SET sql = ? WHERE name = ?", (sql, name))
+        conn.execute(f"PRAGMA schema_version = {version + 1}")
+        conn.execute("PRAGMA writable_schema = OFF")
+    finally:
+        conn.close()
+
+
+def db_rebuild(db_path: Path, name: str, sql: str, after: tuple[str, ...] = ()) -> None:
+    """Recreate one table from a different definition, keeping its rows.
+
+    Dropping a table drops the indexes on it, so *after* carries whatever has to
+    be recreated alongside it.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        rows = conn.execute(f"SELECT * FROM {name}").fetchall()
+        width = len(conn.execute(f"PRAGMA table_info({name})").fetchall())
+        conn.execute("BEGIN")
+        conn.execute(f"DROP TABLE {name}")
+        conn.execute(sql)
+        for statement in after:
+            conn.execute(statement)
+        if rows:
+            conn.executemany(f"INSERT INTO {name} VALUES ({', '.join('?' * width)})", rows)
+        conn.execute("COMMIT")
     finally:
         conn.close()
 

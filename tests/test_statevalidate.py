@@ -462,7 +462,7 @@ def test_first_and_latest_equality_does_not_prove_no_edit_occurred():
 def meta(layout_version: int) -> MetaRow:
     return MetaRow(
         layout_version=layout_version,
-        adapter="sqlite-probe",
+        adapter="sqlite",
         lock_provider="file",
         lock_binding="4711",
         target_namespace="main",
