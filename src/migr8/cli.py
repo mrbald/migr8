@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=TOOL_NAME,
         description=(
-            "Experimental ordered migration engine. Commands are migrate, validate and "
+            "Ordered database migration engine. Commands are migrate, validate and "
             "status. There is no undo, clean, baseline, repair or forced unlock."
         ),
     )

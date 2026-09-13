@@ -7,7 +7,9 @@ Compose.
 It is the realistic production shape: migrations are a job that runs once,
 alongside the database, from an image whose contents are fixed.
 
-Verified on this machine:
+Verified on this machine. **The run predates the current `ctl.sh` and
+`Containerfile` and has not been repeated against them**, so the table is
+evidence about the runtime rather than about the files as they stand:
 
 | Component | Version |
 |---|---|

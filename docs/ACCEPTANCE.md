@@ -1,34 +1,15 @@
 # Acceptance report
 
-Specification: [`SPEC.md`](SPEC.md) (v6.1, maintained). Implementation:
-`src/migr8/`. Architecture review and the decisions taken:
-[`ARCHITECTURE.md`](ARCHITECTURE.md). Report date: 2026-09-12, second pass after
-the review.
-
-The tool was renamed from `flyway.py` / `flywaypy` to `migr8` after that pass.
-The rename also changed the metadata object prefix from `fw_` to `m8_`, the
-fingerprint domain string, the `MIGR8_*` environment variables and the default
-configuration name `migr8.toml`. A third pass then acted on a fresh architectural
-review, recorded as findings 13 to 18 in [`ARCHITECTURE.md`](ARCHITECTURE.md):
-two defects fixed, about 180 source lines removed, and metadata initialization
-and inspection moved into the adapter base. The full suite, the three examples
-and the recorded versions below were re-run after each pass against freshly
-created services. The Apple `container` deployment section at the end was **not**
-re-run.
-
-Two output changes came with that third pass. `status --json` and
-`validate --json` no longer carry the always-empty `notes` key. Running the tool
-from a checkout is `./migr8` rather than `python migr8.py`, because a file named
-`migr8.py` in the project root would shadow the `migr8` package.
+Specification: [`SPEC.md`](SPEC.md) (v6.1). Implementation: `src/migr8/`.
+Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md). Report date: 2026-09-13.
 
 ## Status
 
-**Experimental. Not production-ready.** Every test listed below passes, and that
-is not the same claim. The gates that would be needed for a production claim are
-enumerated under [Open gates](#open-gates), and the largest of them, the Oracle
-19c release gate, is **NOT RUN**.
+Every test listed below passes, and that is not the same thing as a
+production-readiness claim. What is open is enumerated under
+[Open gates](#open-gates).
 
-What this report does claim, for the exact versions recorded below:
+What this report claims, for the exact versions recorded below:
 
 - The state machine, fingerprint encoding, manifest rules, lexical scanner and
   pure state validator behave as specified, with deterministic fixtures.
@@ -48,6 +29,11 @@ What it does not claim: nothing about Oracle 19c, thick-mode drivers, wallet or
 external authentication, Windows, network filesystems, RAC, Data Guard,
 performance, or scale.
 
+The Oracle adapter is verified against Oracle Database Free 23ai, which is the
+only Oracle release distributed as a freely redistributable container image and
+is therefore the release this project's CI and acceptance runs can use. A 19c
+result would require a licensed installation; see [Open gates](#open-gates).
+
 ## Recorded environment
 
 | Component | Value |
@@ -64,9 +50,9 @@ performance, or scale.
 | Oracle | `gvenzl/oracle-free:23.9-slim` | `sha256:945400df5e3fc9589db628223385f906e1024932dc3b72e118fc4fcd0f0e9bbb` | Oracle Database 23ai Free Release 23.0.0.0.0, Version **23.9.0.25.07** |
 | PostgreSQL | `postgres:17.5` | `sha256:aadf2c0696f5ef357aa7a68da995137f0cf17bad0bf6e1f17de06ae5c769b302` | **PostgreSQL 17.5** (Debian 17.5-1.pgdg130+1), aarch64, `synchronous_commit=on`, `fsync=on` |
 
-Both images are arm64. PostgreSQL is published on `127.0.0.1:15433` rather than
-the documented default, because an unrelated container on this host already held
-`15432`; nothing belonging to that container was changed.
+Both images are arm64 here; both digests are multi-architecture indexes, and CI
+runs the same suite against the same digests on linux/amd64. PostgreSQL is
+published on `127.0.0.1:15433`; `testenv/.env` overrides any port or credential.
 
 ## Reproducing this report
 
@@ -106,35 +92,37 @@ cd examples/postgres && MIGR8_PASSWORD=... uv run migr8 migrate
 
 | Level | Result | Tests | Evidence |
 |---|---|---|---|
-| Pure / unit | **PASS** | 214 | Deterministic fixtures, including malformed, colliding and corrupt definitions. No database. |
-| SQLite probe | **PASS** | 101 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
+| Pure / unit | **PASS** | 229 | Deterministic fixtures, including malformed, colliding and corrupt definitions. No database. |
+| SQLite probe | **PASS** | 102 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
 | PostgreSQL integration | **PASS** | 56 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures. |
 | Oracle integration | **PASS** | 89 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures. |
-| Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available in this environment. See [Open gates](#open-gates). |
+| Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available. See [Open gates](#open-gates). |
 
-Total: **460 tests, 460 passed, 0 failed, 0 skipped** when all services are up.
-Run time about 52 s. Without the services, 315 run and the live suites skip with
+Total: **476 tests, 476 passed, 0 failed, 0 skipped** when all services are up.
+Run time about 51 s. Without the services, 331 run and the live suites skip with
 an explicit message naming the missing environment variables; a skip is never
-counted as coverage.
+counted as coverage. The `databases` job in CI runs the whole suite against both
+servers on every push and pull request, and fails if anything skipped.
 
-The adapter contract suite contributes 88 of those tests, in one file. It earned
-its place on first run by finding a real defect, a nested `begin()` accepted on
-Oracle, described in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#5-oracle-accepted-a-nested-begin--fixed), and
-again on the third pass, where it is what holds the reserved-object fix to the
-same behaviour on all three engines.
+Branch coverage over the pure decision core -- `errors`, `fingerprint`, `latch`,
+`model`, `statevalidate` -- is held at 100% by the `checks` job. The scope and
+the reason for it are argued in `[tool.coverage.report]` in `pyproject.toml`.
+
+The adapter contract suite contributes 88 of those tests, in one file. It is one
+suite parametrised over every adapter, and `adapters.SUPPORTED` is asserted
+against the parametrisation, so a new adapter cannot skip it.
 
 | File | Tests |
 |---|---|
 | `tests/test_adapter_contract.py` | 88 |
 | `tests/test_sqltext.py` | 66 |
-| `tests/test_manifest.py` | 48 |
+| `tests/test_statevalidate.py` | 52 |
+| `tests/test_manifest.py` | 49 |
 | `tests/test_sqlite_probe.py` | 41 |
-| `tests/test_statevalidate.py` | 38 |
 | `tests/test_fingerprint.py` | 21 |
 | `tests/test_cli.py` | 17 |
 | `tests/test_diagnostics.py` | 16 |
-| `tests/test_unknown_outcome.py` | 11 |
+| `tests/test_unknown_outcome.py` | 12 |
 | `tests/test_loader.py` | 10 |
 | `tests/test_staging.py` | 8 |
 | `tests/test_concurrency_probe.py` | 5 |
@@ -233,22 +221,21 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 |---|---|---|
 | Client-side statement timeout | **NOT IMPLEMENTED, by decision** | Nothing bounds a single migration statement; a blocked statement holds the namespace lock indefinitely. The specification declines a client-side timeout for the initial runner, and adding one would create a new unknown-outcome surface, since a timeout firing during a commit is indistinguishable from a lost acknowledgement. Bound long statements with database policy instead: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout` on PostgreSQL. |
 | Host-to-container TCP under Apple `container` | **BLOCKED on this machine** | Published ports reset and direct container IPs gave "no route to host" while ICMP succeeded, so the Apple `container` deployment runs the migration job as a sibling container. Both engines pass that way. See [`../deploy/apple-container/README.md`](../deploy/apple-container/README.md). The acceptance suite uses the Docker Compose services, which publish working host ports. |
-| Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle Free 23.9.0.25.07 results say nothing about 19c. Until then no 19c support may be published. |
+| Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle publishes no freely redistributable 19c container image, so this gate needs a licensed installation. Results on Free 23ai are results on Free 23ai; 19c support is not published on the strength of them. |
 | python-oracledb Thick mode | **NOT RUN** | Run the Oracle suite with `oracle.allow_thick_mode = true` against a client installation. The adapter refuses thick mode by default precisely so this gate cannot be skipped silently. |
 | Wallet and external authentication | **NOT RUN** | A fixture using a wallet, plus the supported-combination matrix. The password path is the only one tested. |
 | Windows | **NOT SUPPORTED, NOT RUN** | The SQLite probe refuses to start on Windows by design. Nothing has been run there. |
 | Network filesystems, hard-link aliases, shared in-memory SQLite | **OUT OF PROFILE** | Out of the first probe profile by declaration, not by test. |
-| Oracle RAC, Data Guard, Transaction Guard, Application Continuity | **OUT OF SCOPE** | Explicitly out of this MVP's recovery path. |
+| Oracle RAC, Data Guard, Transaction Guard, Application Continuity | **OUT OF SCOPE** | Explicitly out of this recovery path. |
 | Performance and scale | **NOT RUN** | No load, volume or long-running migration measurements were taken. The largest fixture is 2500 rows. |
 | Security review | **NOT RUN** | No review of identifier handling, credential handling or the test-hook activation gate by anyone other than the implementation. |
 
 ## Remaining risks
 
-1. **The 19c gap is the dominant risk.** The Oracle features this engine leans on
-   most, `DBMS_LOCK`, `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`, `ALL_ERRORS`,
-   function-based unique indexes, `FETCH FIRST` with a bind, all exist in 19c, but
-   "exists" is not "tested". Treat the Oracle adapter as verified on 23ai Free
-   only.
+1. **The Oracle adapter is verified on 23ai Free only.** The features it leans on
+   most -- `DBMS_LOCK`, `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`, `ALL_ERRORS`,
+   function-based unique indexes, `FETCH FIRST` with a bind -- all exist in 19c,
+   but "exists" is not "tested".
 2. **Trusted code is genuinely trusted.** The facade's statement admission is an
    honest-mistake guard. A migration that calls a routine with autonomous
    transactions, external effects, or indirect DDL can defeat it, and the
@@ -288,19 +275,13 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 4. Decide and document an operational policy for metadata backup and restoration,
    since total metadata loss is explicitly outside this protocol.
 
-Until all four are done, the package stays labelled experimental.
-
-## Deployment verified under Apple `container`
-
-**Recorded before the rename to `migr8` and not re-run since.** The container and
-image names, the mount paths and the environment variables in
-[`../deploy/apple-container/`](../deploy/apple-container/) were renamed with
-everything else, so this table describes the previous run, not the current
-scripts.
+## Deployment under Apple `container`
 
 Separate from the acceptance gates above, the containerised deployment in
 [`../deploy/apple-container/`](../deploy/apple-container/) was run end to end on
-this machine:
+this machine. **The run predates the current scripts and has not been repeated
+against them**, so read the table as evidence about the runtime rather than about
+the files as they stand:
 
 | Component | Version | Result |
 |---|---|---|
