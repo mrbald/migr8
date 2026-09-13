@@ -24,9 +24,9 @@ def _isolate_credential_env():
     The live-database fixtures set it; tests that assert a clean configuration
     must not see their leftovers.
     """
-    from migr8.config import PASSWORD_ENV
-
     import os
+
+    from migr8.config import PASSWORD_ENV
 
     previous = os.environ.get(PASSWORD_ENV)
     os.environ.pop(PASSWORD_ENV, None)

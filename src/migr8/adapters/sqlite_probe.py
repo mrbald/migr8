@@ -16,6 +16,7 @@ and Windows locking are outside this probe profile.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import sqlite3
@@ -59,17 +60,39 @@ _NOW = "strftime('%Y-%m-%dT%H:%M:%f','now')"
 #: PRAGMA, VACUUM, ATTACH and DETACH are not: they can commit or change
 #: connection-wide state.
 _POLICY = StatementPolicy(
-    atomic=frozenset({
-        "SELECT", "WITH", "VALUES", "INSERT", "REPLACE", "UPDATE", "DELETE",
-        "CREATE", "ALTER", "DROP",
-    }),
+    atomic=frozenset(
+        {
+            "SELECT",
+            "WITH",
+            "VALUES",
+            "INSERT",
+            "REPLACE",
+            "UPDATE",
+            "DELETE",
+            "CREATE",
+            "ALTER",
+            "DROP",
+        }
+    ),
     query=frozenset({"SELECT", "WITH", "VALUES"}),
     procedural=frozenset(),
     ddl=frozenset({"CREATE", "ALTER", "DROP"}),
-    forbidden=frozenset({
-        "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE",
-        "PRAGMA", "VACUUM", "ATTACH", "DETACH", "ANALYZE", "REINDEX",
-    }),
+    forbidden=frozenset(
+        {
+            "BEGIN",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "RELEASE",
+            "PRAGMA",
+            "VACUUM",
+            "ATTACH",
+            "DETACH",
+            "ANALYZE",
+            "REINDEX",
+        }
+    ),
     allows_plsql=False,
 )
 
@@ -127,21 +150,37 @@ _DDL = {
 #: Expected ``(name, declared type, notnull)`` per logical table, checked on every run.
 _EXPECTED_COLUMNS = {
     HISTORY_TABLE: (
-        ("seq", "INTEGER", 1), ("migration_id", "TEXT", 1), ("fingerprint", "TEXT", 1),
-        ("first_fingerprint", "TEXT", 1), ("language", "TEXT", 1), ("mode", "TEXT", 1),
-        ("status", "TEXT", 1), ("attempt", "INTEGER", 0), ("started_at", "TEXT", 1),
-        ("last_attempt_at", "TEXT", 0), ("finished_at", "TEXT", 0),
-        ("runner_host", "TEXT", 0), ("runner_user", "TEXT", 0), ("runner_pid", "INTEGER", 0),
-        ("db_session", "TEXT", 0), ("tool_version", "TEXT", 1),
+        ("seq", "INTEGER", 1),
+        ("migration_id", "TEXT", 1),
+        ("fingerprint", "TEXT", 1),
+        ("first_fingerprint", "TEXT", 1),
+        ("language", "TEXT", 1),
+        ("mode", "TEXT", 1),
+        ("status", "TEXT", 1),
+        ("attempt", "INTEGER", 0),
+        ("started_at", "TEXT", 1),
+        ("last_attempt_at", "TEXT", 0),
+        ("finished_at", "TEXT", 0),
+        ("runner_host", "TEXT", 0),
+        ("runner_user", "TEXT", 0),
+        ("runner_pid", "INTEGER", 0),
+        ("db_session", "TEXT", 0),
+        ("tool_version", "TEXT", 1),
     ),
     PROGRESS_TABLE: (
-        ("migration_id", "TEXT", 1), ("prog_key", "TEXT", 1),
-        ("prog_value", "TEXT", 1), ("updated_at", "TEXT", 1),
+        ("migration_id", "TEXT", 1),
+        ("prog_key", "TEXT", 1),
+        ("prog_value", "TEXT", 1),
+        ("updated_at", "TEXT", 1),
     ),
     META_TABLE: (
-        ("meta_key", "TEXT", 1), ("layout_version", "INTEGER", 1), ("adapter", "TEXT", 1),
-        ("lock_provider", "TEXT", 1), ("lock_binding", "TEXT", 1),
-        ("target_namespace", "TEXT", 1), ("initialized_at", "TEXT", 1),
+        ("meta_key", "TEXT", 1),
+        ("layout_version", "INTEGER", 1),
+        ("adapter", "TEXT", 1),
+        ("lock_provider", "TEXT", 1),
+        ("lock_binding", "TEXT", 1),
+        ("target_namespace", "TEXT", 1),
+        ("initialized_at", "TEXT", 1),
     ),
 }
 
@@ -150,7 +189,7 @@ class SqliteProbeAdapter(Adapter):
     name = ADAPTER_NAME
     driver_error = sqlite3.Error
 
-    # --- dialect ---------------------------------------------------------------
+    # --- dialect ----------------------------------------------------------------------------------
 
     paramstyle = "named"
     now_expression = _NOW
@@ -182,7 +221,7 @@ class SqliteProbeAdapter(Adapter):
         if self._journal_mode not in ("wal", "delete"):
             raise ConfigError("sqlite.journal_mode must be 'wal' or 'delete'")
 
-    # --- reporting --------------------------------------------------------------
+    # --- reporting --------------------------------------------------------------------------------
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -220,13 +259,15 @@ class SqliteProbeAdapter(Adapter):
     def session_identity(self) -> str | None:
         return f"pid={os.getpid()}"
 
-    # --- lifecycle ---------------------------------------------------------------
+    # --- lifecycle --------------------------------------------------------------------------------
 
     def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Legacy transaction control with isolation_level=None means the driver
         # never issues an implicit BEGIN: every transaction here is explicit.
-        self._conn = sqlite3.connect(
+        # typeshed types `autocommit` as bool; sqlite3.LEGACY_TRANSACTION_CONTROL
+        # is the documented int sentinel for it.
+        self._conn = sqlite3.connect(  # type: ignore[call-overload]
             self._path,
             isolation_level=None,
             autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,
@@ -255,14 +296,12 @@ class SqliteProbeAdapter(Adapter):
     def discard(self) -> None:
         """Drop the connection without issuing any SQL."""
         if self._conn is not None:
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 self._conn.close()
-            except sqlite3.Error:
-                pass
             self._conn = None
         self.release_lock()
 
-    # --- namespace lock ----------------------------------------------------------
+    # --- namespace lock ---------------------------------------------------------------------------
 
     def acquire_lock(self) -> None:
         import fcntl
@@ -279,9 +318,7 @@ class SqliteProbeAdapter(Adapter):
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
                     os.close(fd)
-                    raise UsageError(
-                        f"cannot lock {self._lock_path}: {exc}"
-                    ) from exc
+                    raise UsageError(f"cannot lock {self._lock_path}: {exc}") from exc
                 if time.monotonic() >= deadline:
                     os.close(fd)
                     raise LockNotAcquiredError(
@@ -302,7 +339,7 @@ class SqliteProbeAdapter(Adapter):
             os.close(self._lock_fd)
             self._lock_fd = None
 
-    # --- internals ---------------------------------------------------------------
+    # --- internals --------------------------------------------------------------------------------
 
     @property
     def _db(self) -> sqlite3.Connection:
@@ -312,8 +349,7 @@ class SqliteProbeAdapter(Adapter):
 
     def _objects_present(self) -> set[str]:
         rows = self._db.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name IN "
-            "(?,?,?,?)",
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name IN (?,?,?,?)",
             (HISTORY_TABLE, PROGRESS_TABLE, META_TABLE, ACTIVE_INDEX),
         ).fetchall()
         return {row[0] for row in rows}
@@ -327,8 +363,7 @@ class SqliteProbeAdapter(Adapter):
             actual = tuple((row[1], row[2].upper(), row[3]) for row in info)
             if actual != expected:
                 problems.append(
-                    f"{table} column layout does not match the supported layout: "
-                    f"found {actual}"
+                    f"{table} column layout does not match the supported layout: found {actual}"
                 )
         if ACTIVE_INDEX in present:
             row = self._db.execute(
@@ -344,7 +379,7 @@ class SqliteProbeAdapter(Adapter):
                 )
         return problems
 
-    # --- engine-owned SQL path, transactions and admission policy -----------------
+    # --- engine-owned SQL path, transactions and admission policy ---------------------------------
 
     def _metadata_execute(self, sql: str, params) -> int:
         cursor = self._db.execute(sql, dict(params))
@@ -370,7 +405,7 @@ class SqliteProbeAdapter(Adapter):
     def statement_policy(self) -> StatementPolicy:
         return _POLICY
 
-    # --- metadata -----------------------------------------------------------------
+    # --- metadata ---------------------------------------------------------------------------------
 
     def _create_metadata_object(self, name: str) -> None:
         """SQLite DDL is transactional, so each CREATE is its own durable step."""
@@ -397,8 +432,7 @@ class SqliteProbeAdapter(Adapter):
             progress = tuple(
                 md.progress_row(tuple(row), md.parse_iso_timestamp)
                 for row in db.execute(
-                    f"SELECT {progress_cols} FROM {PROGRESS_TABLE} "
-                    "ORDER BY migration_id, prog_key"
+                    f"SELECT {progress_cols} FROM {PROGRESS_TABLE} ORDER BY migration_id, prog_key"
                 ).fetchall()
             )
             meta, _rows = self._read_meta()
@@ -408,12 +442,12 @@ class SqliteProbeAdapter(Adapter):
                 self._txn_epoch += 1
         return Snapshot(history=history, progress=progress, meta=meta)
 
-    # --- transaction control --------------------------------------------------------
+    # --- transaction control ----------------------------------------------------------------------
 
     def has_open_transaction(self) -> bool:
         return bool(self._db.in_transaction)
 
-    # --- transaction identity -------------------------------------------------------
+    # --- transaction identity ---------------------------------------------------------------------
 
     def establish_transaction_identity(self) -> str | None:
         """SQLite has no server transaction id; the epoch plus native state is the guard."""
@@ -428,7 +462,7 @@ class SqliteProbeAdapter(Adapter):
             return None
         return f"sqlite-txn:{self._txn_epoch}"
 
-    # --- execution --------------------------------------------------------------------
+    # --- execution --------------------------------------------------------------------------------
 
     def _run(self, text: str, params: object | None):
         return self._db.execute(text, _bind(params))
@@ -437,7 +471,7 @@ class SqliteProbeAdapter(Adapter):
         cursor = self._db.executemany(statement.text, [_bind(item) for item in parameter_sets])
         return max(cursor.rowcount, 0)
 
-    # --- error classification -----------------------------------------------------------
+    # --- error classification ---------------------------------------------------------------------
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
         """SQLite runs in-process, so a library error is a definite rejection.

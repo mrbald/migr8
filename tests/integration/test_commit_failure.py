@@ -33,12 +33,12 @@ import time
 from pathlib import Path
 
 import pytest
-
 import support
+from proxy import DirectionalProxy
+
 from migr8.adapters.base import Boundary
 from migr8.errors import Exit
 from migr8.testing import hooks
-from proxy import DirectionalProxy
 
 REQUEST_NOT_DELIVERED = "request_not_delivered"
 RESPONSE_WITHHELD = "response_withheld"
@@ -48,8 +48,16 @@ BRANCHES = (REQUEST_NOT_DELIVERED, RESPONSE_WITHHELD)
 class Interceptor:
     """Arms one directional transport failure at one engine-owned boundary."""
 
-    def __init__(self, proxy: DirectionalProxy, boundary: Boundary, *, branch: str,
-                 occurrence: int = 1, observe=None, delay: float = 1.0) -> None:
+    def __init__(
+        self,
+        proxy: DirectionalProxy,
+        boundary: Boundary,
+        *,
+        branch: str,
+        occurrence: int = 1,
+        observe=None,
+        delay: float = 1.0,
+    ) -> None:
         self.proxy = proxy
         self.boundary = boundary
         self.branch = branch
@@ -133,7 +141,7 @@ PG_CREATE = "CREATE TABLE IF NOT EXISTS items (id integer PRIMARY KEY, tag text)
 ORACLE_SEED = "INSERT INTO items (id, tag) SELECT LEVEL, NULL FROM dual CONNECT BY LEVEL <= 6"
 PG_SEED = "INSERT INTO items (id, tag) SELECT g, NULL FROM generate_series(1, 6) g"
 
-ORACLE_BATCH = '''\
+ORACLE_BATCH = """\
 def migrate(ctx):
     last = int(ctx.progress.get("last_id", "0"))
     while True:
@@ -152,9 +160,9 @@ def migrate(ctx):
             )
             last = max(ids)
             ctx.progress.set("last_id", str(last))
-'''
+"""
 
-PG_BATCH = '''\
+PG_BATCH = """\
 def migrate(ctx):
     last = int(ctx.progress.get("last_id", "0"))
     while True:
@@ -172,21 +180,39 @@ def migrate(ctx):
             )
             last = max(ids)
             ctx.progress.set("last_id", str(last))
-'''
+"""
 
 
 def _build_project(root: Path, *, create: str, seed: str, batch: str) -> Path:
     support.unit(root, "m1", {"up.sql": create})
     support.unit(root, "m2", {"up.sql": seed})
     support.unit(root, "m3", {"migration.py": batch})
-    return support.manifest(root, [
-        {"id": "create-items", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "seed-items", "path": "m2", "language": "sql", "mode": "atomic",
-         "entry": "up.sql"},
-        {"id": "tag-items", "path": "m3", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    return support.manifest(
+        root,
+        [
+            {
+                "id": "create-items",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "seed-items",
+                "path": "m2",
+                "language": "sql",
+                "mode": "atomic",
+                "entry": "up.sql",
+            },
+            {
+                "id": "tag-items",
+                "path": "m3",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
 
 
 #: ``boundary``, ``occurrence``, and a predicate name resolved per database.
@@ -232,17 +258,25 @@ def _predicates(query, schema: str, *, oracle: bool) -> dict:
     }
 
 
-def _drive(*, config: Path, manifest: Path, proxy: DirectionalProxy, scenario: str,
-           branch: str, predicates: dict) -> Interceptor:
+def _drive(
+    *,
+    config: Path,
+    manifest: Path,
+    proxy: DirectionalProxy,
+    scenario: str,
+    branch: str,
+    predicates: dict,
+) -> Interceptor:
     boundary, occurrence, key = SCENARIOS[scenario]
     predicate = predicates[key]
     interceptor = Interceptor(
-        proxy, boundary, branch=branch, occurrence=occurrence,
+        proxy,
+        boundary,
+        branch=branch,
+        occurrence=occurrence,
         observe=(lambda: predicate() > 0),
     )
-    report = support.migrate_report(
-        config, manifest, adapter_hook=interceptor.install
-    )
+    report = support.migrate_report(config, manifest, adapter_hook=interceptor.install)
     interceptor.join()
     assert interceptor.fired, f"the {boundary} boundary was never reached"
     assert report.exit_code == Exit.UNKNOWN_OUTCOME, report.message
@@ -259,6 +293,7 @@ def _drive(*, config: Path, manifest: Path, proxy: DirectionalProxy, scenario: s
 
 
 # --- Oracle ---------------------------------------------------------------------
+
 
 @pytest.fixture
 def oracle_proxy(oracle_project, oracle_settings):
@@ -280,15 +315,18 @@ def oracle_proxy(oracle_project, oracle_settings):
 @pytest.mark.oracle
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 @pytest.mark.parametrize("branch", BRANCHES)
-def test_oracle_commit_acknowledgement_branches(oracle_proxy, oracle_query, scenario,
-                                                branch):
+def test_oracle_commit_acknowledgement_branches(oracle_proxy, oracle_query, scenario, branch):
     root, direct, proxied, schema, proxy = oracle_proxy
-    manifest = _build_project(
-        root, create=ORACLE_CREATE, seed=ORACLE_SEED, batch=ORACLE_BATCH
-    )
+    manifest = _build_project(root, create=ORACLE_CREATE, seed=ORACLE_SEED, batch=ORACLE_BATCH)
     predicates = _predicates(oracle_query, schema, oracle=True)
-    _drive(config=proxied, manifest=manifest, proxy=proxy, scenario=scenario,
-           branch=branch, predicates=predicates)
+    _drive(
+        config=proxied,
+        manifest=manifest,
+        proxy=proxy,
+        scenario=scenario,
+        branch=branch,
+        predicates=predicates,
+    )
 
     key = SCENARIOS[scenario][2]
     if branch == REQUEST_NOT_DELIVERED:
@@ -303,13 +341,16 @@ def test_oracle_commit_acknowledgement_branches(oracle_proxy, oracle_query, scen
     # A fresh invocation reacquires the lock and reconciles.
     assert support.migrate(direct, manifest) == Exit.OK
     assert oracle_query("SELECT count(*) FROM items WHERE tag = 'EU'") == [(6,)]
-    assert oracle_query(
-        "SELECT status FROM m8_history ORDER BY seq"
-    ) == [("SUCCESS",), ("SUCCESS",), ("SUCCESS",)]
+    assert oracle_query("SELECT status FROM m8_history ORDER BY seq") == [
+        ("SUCCESS",),
+        ("SUCCESS",),
+        ("SUCCESS",),
+    ]
     assert oracle_query("SELECT count(*) FROM m8_progress") == [(0,)]
 
 
 # --- PostgreSQL -------------------------------------------------------------------
+
 
 @pytest.fixture
 def pg_proxy(pg_project, pg_settings):
@@ -334,8 +375,14 @@ def test_postgres_commit_acknowledgement_branches(pg_proxy, pg_query, scenario, 
     root, direct, proxied, schema, proxy = pg_proxy
     manifest = _build_project(root, create=PG_CREATE, seed=PG_SEED, batch=PG_BATCH)
     predicates = _predicates(pg_query, schema, oracle=False)
-    _drive(config=proxied, manifest=manifest, proxy=proxy, scenario=scenario,
-           branch=branch, predicates=predicates)
+    _drive(
+        config=proxied,
+        manifest=manifest,
+        proxy=proxy,
+        scenario=scenario,
+        branch=branch,
+        predicates=predicates,
+    )
 
     key = SCENARIOS[scenario][2]
     if branch == REQUEST_NOT_DELIVERED:
@@ -347,7 +394,9 @@ def test_postgres_commit_acknowledgement_branches(pg_proxy, pg_query, scenario, 
 
     assert support.migrate(direct, manifest) == Exit.OK
     assert pg_query("SELECT count(*) FROM items WHERE tag = 'EU'") == [(6,)]
-    assert pg_query(
-        f"SELECT status FROM {schema}.m8_history ORDER BY seq"
-    ) == [("SUCCESS",), ("SUCCESS",), ("SUCCESS",)]
+    assert pg_query(f"SELECT status FROM {schema}.m8_history ORDER BY seq") == [
+        ("SUCCESS",),
+        ("SUCCESS",),
+        ("SUCCESS",),
+    ]
     assert pg_query(f"SELECT count(*) FROM {schema}.m8_progress") == [(0,)]

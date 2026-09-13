@@ -11,6 +11,7 @@ and ``ctx.ddl`` genuinely do not exist in an atomic migration.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from .adapters.base import Adapter, Boundary, OutcomeClass
 from .diagnostics import RunLog
@@ -28,8 +29,15 @@ LOGGER = logging.getLogger("migr8.migration")
 class _BaseContext:
     """Members available in every execution mode."""
 
-    def __init__(self, *, adapter: Adapter, unit: CapturedUnit, latch: RunLatch,
-                 attempt: int | None, run_log: RunLog) -> None:
+    def __init__(
+        self,
+        *,
+        adapter: Adapter,
+        unit: CapturedUnit,
+        latch: RunLatch,
+        attempt: int | None,
+        run_log: RunLog,
+    ) -> None:
         self._adapter = adapter
         self._unit = unit
         self._latch = latch
@@ -37,7 +45,7 @@ class _BaseContext:
         self._log = run_log
         self._in_batch = False
 
-    # --- identity --------------------------------------------------------------
+    # --- identity ---------------------------------------------------------------------------------
 
     @property
     def migration_id(self) -> str:
@@ -47,7 +55,7 @@ class _BaseContext:
     def attempt(self) -> int | None:
         return self._attempt
 
-    # --- internals -------------------------------------------------------------
+    # --- internals --------------------------------------------------------------------------------
 
     @property
     def _mode(self) -> Mode:
@@ -59,8 +67,7 @@ class _BaseContext:
         self._adapter.admit_statement(statement, mode=self._mode, in_batch=self._in_batch)
         return statement
 
-    def _guard_call(self, operation: str, func, *args,
-                    phase: str = "migration_execution"):
+    def _guard_call(self, operation: str, func, *args, phase: str = "migration_execution"):
         """Run a non-commit-capable driver call and classify any failure.
 
         A call that is not commit-capable can still lose the transport.  When it
@@ -89,7 +96,7 @@ class _BaseContext:
         """
         return False
 
-    # --- SQL -------------------------------------------------------------------
+    # --- SQL --------------------------------------------------------------------------------------
 
     def execute(self, sql: str, params: object | None = None) -> int:
         """Execute one statement.  Returns the affected-row count for supported DML."""
@@ -106,16 +113,14 @@ class _BaseContext:
         statement = self._prepare(sql)
         if not parameter_sets:
             return 0
-        return self._guard_call(
-            "executemany", self._adapter.executemany, statement, parameter_sets
-        )
+        return self._guard_call("executemany", self._adapter.executemany, statement, parameter_sets)
 
     def query(self, sql: str, params: object | None = None) -> list[tuple]:
         """Execute one query and return a list of tuples in selected-column order."""
         statement = self._prepare(sql)
         return self._guard_call("query", self._adapter.query, statement, params)
 
-    # --- unit-local files -------------------------------------------------------
+    # --- unit-local files -------------------------------------------------------------------------
 
     def sql(self, relative_path: str) -> str:
         """Read text from a regular SQL file inside this migration's staged unit."""
@@ -129,16 +134,13 @@ class _BaseContext:
             )
         if relative_path not in self._unit.relpaths:
             raise UsageError(
-                f"ctx.sql({relative_path!r}) is not a fingerprinted file of "
-                f"{self.migration_id!r}"
+                f"ctx.sql({relative_path!r}) is not a fingerprinted file of {self.migration_id!r}"
             )
         if candidate.is_symlink() or not candidate.is_file():
-            raise UsageError(
-                f"ctx.sql({relative_path!r}) is not a regular file in the staged unit"
-            )
+            raise UsageError(f"ctx.sql({relative_path!r}) is not a regular file in the staged unit")
         return candidate.read_text(encoding="utf-8")
 
-    # --- logging ---------------------------------------------------------------
+    # --- logging ----------------------------------------------------------------------------------
 
     def log(self, message: str, **fields: object) -> None:
         """Structured log line correlated with this run and migration.
@@ -149,8 +151,11 @@ class _BaseContext:
         credentials or sensitive bind values.
         """
         self._log.event(
-            "migration_log", migration=self.migration_id, attempt=self._attempt,
-            message=message, **fields,
+            "migration_log",
+            migration=self.migration_id,
+            attempt=self._attempt,
+            message=message,
+            **fields,
         )
 
 
@@ -174,9 +179,7 @@ class ProgressFacade:
         ctx = self._context
         ctx._latch.check()
         _check_progress_key(key)
-        value = ctx._guard_call(
-            "progress_get", ctx._adapter.progress_get, ctx.migration_id, key
-        )
+        value = ctx._guard_call("progress_get", ctx._adapter.progress_get, ctx.migration_id, key)
         return default if value is None else value
 
     def set(self, key: str, value: str) -> None:
@@ -195,18 +198,14 @@ class ProgressFacade:
                 "checkpoint always commits with the batch it describes",
                 migration_id=ctx.migration_id,
             )
-        ctx._guard_call(
-            "progress_set", ctx._adapter.progress_set, ctx.migration_id, key, value
-        )
+        ctx._guard_call("progress_set", ctx._adapter.progress_set, ctx.migration_id, key, value)
 
 
 def _check_progress_key(key: str) -> None:
     if not isinstance(key, str) or not key:
         raise UsageError("progress keys must be non-empty strings")
     if len(key) > PROGRESS_KEY_MAX_CHARS:
-        raise UsageError(
-            f"progress key exceeds {PROGRESS_KEY_MAX_CHARS} characters: {len(key)}"
-        )
+        raise UsageError(f"progress key exceeds {PROGRESS_KEY_MAX_CHARS} characters: {len(key)}")
     if not key.isascii():
         raise UsageError(f"progress key {key!r} must be ASCII")
 
@@ -219,9 +218,7 @@ def _check_progress_value(value: str) -> None:
         )
     size = len(value.encode("utf-8"))
     if size > PROGRESS_VALUE_MAX_BYTES:
-        raise UsageError(
-            f"progress value exceeds {PROGRESS_VALUE_MAX_BYTES} UTF-8 bytes: {size}"
-        )
+        raise UsageError(f"progress value exceeds {PROGRESS_VALUE_MAX_BYTES} UTF-8 bytes: {size}")
 
 
 class _BatchContext:
@@ -256,7 +253,7 @@ class _BatchContext:
         owner._open_batch = self
         return owner
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
         owner = self._owner
         owner._in_batch = False
         owner._open_batch = None
@@ -297,9 +294,7 @@ class RestartableContext(_BaseContext):
 
     def _commit_batch(self) -> None:
         try:
-            self._adapter.durable_commit(
-                Boundary.RESTARTABLE_BATCH, migration_id=self.migration_id
-            )
+            self._adapter.durable_commit(Boundary.RESTARTABLE_BATCH, migration_id=self.migration_id)
         except UnknownOutcomeError:
             raise
         except Exception as exc:
@@ -327,14 +322,16 @@ class RestartableContext(_BaseContext):
             )
         hooks.fire(Boundary.RESTARTABLE_DDL, hooks.BEFORE_DDL)
         self._guard_call(
-            "DDL execution", self._adapter.execute_ddl, statement,
+            "DDL execution",
+            self._adapter.execute_ddl,
+            statement,
             phase="restartable_ddl",
         )
         hooks.fire(Boundary.RESTARTABLE_DDL, hooks.AFTER_DDL)
 
 
-def build_context(*, adapter: Adapter, unit: CapturedUnit, latch: RunLatch,
-                  attempt: int | None, run_log: RunLog) -> _BaseContext:
+def build_context(
+    *, adapter: Adapter, unit: CapturedUnit, latch: RunLatch, attempt: int | None, run_log: RunLog
+) -> _BaseContext:
     cls = RestartableContext if unit.mode is Mode.RESTARTABLE else AtomicContext
-    return cls(adapter=adapter, unit=unit, latch=latch, attempt=attempt,
-               run_log=run_log)
+    return cls(adapter=adapter, unit=unit, latch=latch, attempt=attempt, run_log=run_log)

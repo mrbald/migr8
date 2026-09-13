@@ -38,9 +38,9 @@ def main() -> int:
         connection.execute(f'DROP SCHEMA IF EXISTS "{SCHEMA}" CASCADE')
         connection.execute(f'CREATE SCHEMA "{SCHEMA}"')
         row = connection.execute(
-            "SELECT version(), current_setting('synchronous_commit'), "
-            "current_setting('fsync')"
+            "SELECT version(), current_setting('synchronous_commit'), current_setting('fsync')"
         ).fetchone()
+    assert row is not None
     print(f"provisioned schema {SCHEMA}")
     print(f"server version: {row[0]}")
     print(f"synchronous_commit={row[1]} fsync={row[2]}")

@@ -9,6 +9,7 @@ they inspected.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import stat
@@ -92,9 +93,7 @@ def stage(manifest: Manifest, *, parent: Path | None = None) -> Capture:
                 )
             )
         _make_read_only(root)
-        return Capture(
-            manifest=manifest, units=tuple(units), staged=True, staging_root=root
-        )
+        return Capture(manifest=manifest, units=tuple(units), staged=True, staging_root=root)
     except BaseException:
         cleanup(root)
         raise
@@ -131,10 +130,8 @@ def _make_read_only(root: Path) -> None:
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
             path = Path(dirpath) / name
-            try:
+            with contextlib.suppress(OSError):
                 path.chmod(0o444)
-            except OSError:
-                pass
 
 
 def cleanup(root: Path | None) -> None:
@@ -143,8 +140,6 @@ def cleanup(root: Path | None) -> None:
         return
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
-            try:
+            with contextlib.suppress(OSError):
                 (Path(dirpath) / name).chmod(0o644)
-            except OSError:
-                pass
     shutil.rmtree(root, ignore_errors=True)

@@ -26,7 +26,7 @@ def package_name(migration_id: str) -> str:
 class LoadedUnit:
     """A loaded unit's entry callable, plus what to discard afterwards."""
 
-    __slots__ = ("migrate", "_names")
+    __slots__ = ("_names", "migrate")
 
     def __init__(self, migrate: Callable[[object], object], names: list[str]) -> None:
         self.migrate = migrate
@@ -91,10 +91,7 @@ def load_entry(*, migration_id: str, staged_dir: Path, entry: str) -> LoadedUnit
             )
         # Capture every module the unit imported under its own namespace so the
         # whole namespace can be discarded afterwards.
-        names = sorted(
-            name for name in sys.modules
-            if name == root or name.startswith(root + ".")
-        )
+        names = sorted(name for name in sys.modules if name == root or name.startswith(root + "."))
         return LoadedUnit(target, names)
     except BaseException:
         for name in sorted(

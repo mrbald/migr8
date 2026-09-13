@@ -31,8 +31,9 @@ class Migr8Error(Exception):
 
     exit_code: Exit = Exit.USAGE
 
-    def __init__(self, message: str, *, phase: str | None = None,
-                 migration_id: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, phase: str | None = None, migration_id: str | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.phase = phase
@@ -100,8 +101,14 @@ class UnknownOutcomeError(Migr8Error):
 
     exit_code = Exit.UNKNOWN_OUTCOME
 
-    def __init__(self, message: str, *, operation: str, phase: str | None = None,
-                 migration_id: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str,
+        phase: str | None = None,
+        migration_id: str | None = None,
+    ) -> None:
         super().__init__(message, phase=phase, migration_id=migration_id)
         self.operation = operation
 

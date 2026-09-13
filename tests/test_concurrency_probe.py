@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 import pytest
-
 import support
+
 from migr8.errors import Exit
 
 pytestmark = pytest.mark.sqlite_probe
@@ -29,14 +29,20 @@ TIMEOUT = 60
 def run_cli(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
     )
 
 
 def start_cli(args: list[str], cwd: Path) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
@@ -68,15 +74,32 @@ def slow_project(tmp_path):
     go = tmp_path / "go"
     db = tmp_path / "build" / "probe.db"
     support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE dst (id INTEGER PRIMARY KEY);\n"})
-    support.unit(tmp_path, "m2", {
-        "migration.py": SLOW_BODY.format(ready=str(ready), go=str(go)),
-    })
-    support.manifest(tmp_path, [
-        {"id": "dst", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "slow", "path": "m2", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    support.unit(
+        tmp_path,
+        "m2",
+        {
+            "migration.py": SLOW_BODY.format(ready=str(ready), go=str(go)),
+        },
+    )
+    support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "dst",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "slow",
+                "path": "m2",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
     support.sqlite_config(tmp_path, db_path=db, timeout=0)
     return tmp_path, db, ready, go
 
@@ -114,7 +137,7 @@ def test_status_is_read_only_and_does_not_take_the_migration_lock(slow_project):
         assert inspect.returncode == Exit.OK
         report = json.loads(inspect.stdout)
         assert report["active_id"] == "slow"
-        entry = [m for m in report["migrations"] if m["id"] == "slow"][0]
+        entry = next(m for m in report["migrations"] if m["id"] == "slow")
         assert entry["state"] == "ACTIVE"
         assert entry["attempt"] == 1
         assert entry["recorded_matches_current"] is True
@@ -146,15 +169,32 @@ def test_waiter_acquires_the_lock_and_finds_no_pending_work(tmp_path):
     go = tmp_path / "go"
     db = tmp_path / "build" / "probe.db"
     support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE dst (id INTEGER PRIMARY KEY);\n"})
-    support.unit(tmp_path, "m2", {
-        "migration.py": SLOW_BODY.format(ready=str(ready), go=str(go)),
-    })
-    support.manifest(tmp_path, [
-        {"id": "dst", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "slow", "path": "m2", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    support.unit(
+        tmp_path,
+        "m2",
+        {
+            "migration.py": SLOW_BODY.format(ready=str(ready), go=str(go)),
+        },
+    )
+    support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "dst",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "slow",
+                "path": "m2",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
     support.sqlite_config(tmp_path, db_path=db, timeout=50)
 
     holder = start_cli(["migrate"], tmp_path)
@@ -175,10 +215,18 @@ def test_lock_file_is_not_unlinked_and_is_reused(tmp_path):
     root = tmp_path
     db = root / "build" / "probe.db"
     support.unit(root, "m1", {"up.sql": "CREATE TABLE dst (id INTEGER PRIMARY KEY);\n"})
-    support.manifest(root, [
-        {"id": "dst", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-    ])
+    support.manifest(
+        root,
+        [
+            {
+                "id": "dst",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+        ],
+    )
     support.sqlite_config(root, db_path=db, timeout=5)
     assert run_cli(["migrate"], root).returncode == Exit.OK
     lock_file = db.with_name(db.name + ".m8lock")

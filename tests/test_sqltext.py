@@ -21,6 +21,7 @@ def lead_words(sql: str) -> tuple[str, ...]:
 
 # --- literals and comments -----------------------------------------------------
 
+
 def test_literal_containing_a_semicolon_and_slash_is_preserved():
     sql = "INSERT INTO t (c) VALUES ('a;b/c');"
     statement = normalize(sql)
@@ -73,10 +74,20 @@ def test_unterminated_quoted_identifier_is_rejected():
         normalize('SELECT "Odd FROM t')
 
 
-@pytest.mark.parametrize("literal", [
-    "q'[a;b/c]'", "q'{a;b}'", "q'(a;b)'", "q'<a;b>'", "q'!a;b!'", "Q'#a;b#'",
-    "nq'[unicode;]'", "NQ'{x}'", "n'plain;'",
-])
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "q'[a;b/c]'",
+        "q'{a;b}'",
+        "q'(a;b)'",
+        "q'<a;b>'",
+        "q'!a;b!'",
+        "Q'#a;b#'",
+        "nq'[unicode;]'",
+        "NQ'{x}'",
+        "n'plain;'",
+    ],
+)
 def test_alternative_and_national_quoting_forms_are_scanned(literal):
     sql = f"INSERT INTO t (c) VALUES ({literal});"
     statement = normalize(sql)
@@ -96,6 +107,7 @@ def test_alternative_quote_with_whitespace_delimiter_is_refused():
 
 # --- significant tokens, not line prefixes -------------------------------------
 
+
 def test_multiline_update_whose_line_starts_with_set_is_valid_sql():
     sql = "UPDATE orders\nSET region = 'EU'\nWHERE id = 1;"
     statement = normalize(sql)
@@ -104,13 +116,7 @@ def test_multiline_update_whose_line_starts_with_set_is_valid_sql():
 
 
 def test_plsql_exit_when_is_not_treated_as_a_client_command():
-    sql = (
-        "BEGIN\n"
-        "  LOOP\n"
-        "    EXIT WHEN TRUE;\n"
-        "  END LOOP;\n"
-        "END;"
-    )
+    sql = "BEGIN\n  LOOP\n    EXIT WHEN TRUE;\n  END LOOP;\nEND;"
     statement = normalize(sql)
     assert statement.kind is StatementKind.PLSQL_BLOCK
     assert statement.text.endswith("END;")
@@ -122,10 +128,19 @@ def test_set_role_is_real_sql_but_sqlplus_set_is_refused():
         normalize("SET SERVEROUTPUT ON")
 
 
-@pytest.mark.parametrize("command", [
-    "SPOOL out.log", "DESCRIBE orders", "PROMPT hello", "CONNECT scott/tiger",
-    "WHENEVER SQLERROR EXIT 1", "SHOW ERRORS", "VARIABLE x NUMBER", "EXECUTE p",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "SPOOL out.log",
+        "DESCRIBE orders",
+        "PROMPT hello",
+        "CONNECT scott/tiger",
+        "WHENEVER SQLERROR EXIT 1",
+        "SHOW ERRORS",
+        "VARIABLE x NUMBER",
+        "EXECUTE p",
+    ],
+)
 def test_top_level_sqlplus_commands_are_refused(command):
     with pytest.raises(SqlSyntaxError, match="unsupported SQL\\*Plus"):
         normalize(command)
@@ -137,6 +152,7 @@ def test_script_inclusion_is_refused():
 
 
 # --- terminator handling --------------------------------------------------------
+
 
 def test_one_trailing_terminator_is_removed_from_plain_sql():
     assert normalize("SELECT 1 FROM DUAL;").text == "SELECT 1 FROM DUAL"
@@ -191,16 +207,20 @@ def test_nul_byte_is_refused():
 
 # --- stored PL/SQL grammar -------------------------------------------------------
 
-@pytest.mark.parametrize("header", [
-    "CREATE PROCEDURE p IS BEGIN NULL; END;",
-    "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;",
-    "CREATE OR REPLACE EDITIONABLE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;",
-    "CREATE NONEDITIONABLE PACKAGE pkg AS PROCEDURE p; END;",
-    "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p IS BEGIN NULL; END; END;",
-    "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t BEGIN NULL; END;",
-    "CREATE TYPE ty AS OBJECT (x NUMBER);",
-    "CREATE OR REPLACE TYPE BODY ty AS END;",
-])
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "CREATE PROCEDURE p IS BEGIN NULL; END;",
+        "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;",
+        "CREATE OR REPLACE EDITIONABLE FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;",
+        "CREATE NONEDITIONABLE PACKAGE pkg AS PROCEDURE p; END;",
+        "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p IS BEGIN NULL; END; END;",
+        "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t BEGIN NULL; END;",
+        "CREATE TYPE ty AS OBJECT (x NUMBER);",
+        "CREATE OR REPLACE TYPE BODY ty AS END;",
+    ],
+)
 def test_stored_plsql_definitions_are_classified(header):
     assert classify(header) is StatementKind.PLSQL_DEFINITION
 
@@ -212,13 +232,16 @@ def test_create_library_is_not_a_plsql_body():
     assert normalize(sql).text.endswith("'/tmp/lib.so'")
 
 
-@pytest.mark.parametrize("sql", [
-    "CREATE TABLE t (id NUMBER);",
-    "CREATE UNIQUE INDEX i ON t (id);",
-    "CREATE VIEW v AS SELECT 1 FROM DUAL;",
-    "CREATE MATERIALIZED VIEW mv AS SELECT 1 FROM DUAL;",
-    "CREATE SEQUENCE s;",
-])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE t (id NUMBER);",
+        "CREATE UNIQUE INDEX i ON t (id);",
+        "CREATE VIEW v AS SELECT 1 FROM DUAL;",
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1 FROM DUAL;",
+        "CREATE SEQUENCE s;",
+    ],
+)
 def test_other_create_statements_are_plain_sql(sql):
     assert classify(sql) is StatementKind.SQL
 
@@ -245,6 +268,7 @@ def test_significant_tokens_exclude_comments():
 
 
 # --- PostgreSQL dollar quoting ---------------------------------------------------
+
 
 def test_dollar_quoted_body_protects_semicolons():
     sql = "DO $$ BEGIN INSERT INTO t VALUES (1); COMMIT; END $$"

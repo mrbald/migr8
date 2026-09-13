@@ -8,20 +8,19 @@ use one short consistent metadata read.
 from __future__ import annotations
 
 from .adapters.base import Adapter
+from .checks import preflight, verify_bindings
 from .errors import (
     Exit,
-    Migr8Error,
     MetadataDamagedError,
+    Migr8Error,
     RecoveryRequiredError,
 )
-from .checks import preflight, verify_bindings
 from .model import Capture, MetadataState, Snapshot
 from .reporting import Report, status_from_row
 from .statevalidate import build_plan, require_no_recovery_needed
 
 
-def _base_report(command: str, adapter: Adapter, capture: Capture,
-                 state: MetadataState) -> Report:
+def _base_report(command: str, adapter: Adapter, capture: Capture, state: MetadataState) -> Report:
     return Report(
         command=command,
         adapter=adapter.name,
@@ -37,16 +36,21 @@ def _pending_only(report: Report, capture: Capture) -> Report:
     """Fill the migration list when no history can be read."""
     report.migrations = [
         status_from_row(
-            unit.position, unit.id, unit.mode.value, unit.language.value,
-            unit.fingerprint, None,
+            unit.position,
+            unit.id,
+            unit.mode.value,
+            unit.language.value,
+            unit.fingerprint,
+            None,
         )
         for unit in capture.units
     ]
     return report
 
 
-def _fill(report: Report, capture: Capture, snapshot: Snapshot, adapter: Adapter,
-          *, with_liveness: bool) -> None:
+def _fill(
+    report: Report, capture: Capture, snapshot: Snapshot, adapter: Adapter, *, with_liveness: bool
+) -> None:
     by_id = {row.migration_id: row for row in snapshot.history}
     entries = []
     success = 0
@@ -55,8 +59,12 @@ def _fill(report: Report, capture: Capture, snapshot: Snapshot, adapter: Adapter
     for unit in capture.units:
         row = by_id.get(unit.id)
         entry = status_from_row(
-            unit.position, unit.id, unit.mode.value, unit.language.value,
-            unit.fingerprint, row,
+            unit.position,
+            unit.id,
+            unit.mode.value,
+            unit.language.value,
+            unit.fingerprint,
+            row,
         )
         if row is None:
             pending += 1
@@ -108,8 +116,14 @@ def _prepare(command: str, adapter: Adapter, capture: Capture) -> tuple[Report, 
     return report, snapshot
 
 
-def _run(command: str, adapter: Adapter, capture: Capture, *, with_liveness: bool,
-         recovery_suffix: str = "") -> Report:
+def _run(
+    command: str,
+    adapter: Adapter,
+    capture: Capture,
+    *,
+    with_liveness: bool,
+    recovery_suffix: str = "",
+) -> Report:
     """The shared body of both read-only commands.
 
     They differ only in whether the active migration's session is probed and in
@@ -151,10 +165,12 @@ def run_status(adapter: Adapter, capture: Capture) -> Report:
 def run_validate(adapter: Adapter, capture: Capture) -> Report:
     """Check the manifest and history contracts.  Modifies nothing."""
     return _run(
-        "validate", adapter, capture, with_liveness=False,
+        "validate",
+        adapter,
+        capture,
+        with_liveness=False,
         recovery_suffix=(
-            " This is a recovery-required condition, not permission to modify the "
-            "active marker."
+            " This is a recovery-required condition, not permission to modify the active marker."
         ),
     )
 

@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
-
 import support
+
 from migr8.errors import Exit
 
 ENTRY = Path(__file__).resolve().parents[1] / "migr8"
@@ -19,17 +19,28 @@ ENTRY = Path(__file__).resolve().parents[1] / "migr8"
 def cli(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, capture_output=True, text=True, timeout=60,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
 
 
 @pytest.fixture
 def project(tmp_path):
     support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
-    support.manifest(tmp_path, [{
-        "id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-        "entry": "up.sql",
-    }])
+    support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            }
+        ],
+    )
     support.sqlite_config(tmp_path, db_path=tmp_path / "build" / "probe.db")
     return tmp_path
 
@@ -63,8 +74,13 @@ def test_explicit_paths_are_resolved_once(project, tmp_path):
     elsewhere = tmp_path.parent / "elsewhere"
     elsewhere.mkdir(exist_ok=True)
     result = cli(
-        ["migrate", "--config", str(project / "migr8.toml"),
-         "--manifest", str(project / "manifest.toml")],
+        [
+            "migrate",
+            "--config",
+            str(project / "migr8.toml"),
+            "--manifest",
+            str(project / "manifest.toml"),
+        ],
         elsewhere,
     )
     assert result.returncode == Exit.OK

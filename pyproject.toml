@@ -1,15 +1,42 @@
 [project]
 name = "migr8"
-version = "0.1.0"
-description = "migr8 - an experimental, inspectable database migration engine (Oracle primary target)"
+dynamic = ["version"]
+description = "An inspectable database migration engine: ordered manifest, immutable history, atomic and restartable migrations. Oracle primary target."
 readme = "README.md"
 requires-python = ">=3.14"
-license = { text = "Proprietary" }
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "LICENSING.md", "COMMERCIAL.md"]
+authors = [{ name = "migr8 authors", email = "mail@bobah.net" }]
+keywords = [
+  "database",
+  "migration",
+  "schema",
+  "oracle",
+  "postgresql",
+  "sql",
+  "devops",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Software Development :: Version Control",
+  "Topic :: System :: Systems Administration",
+  "Typing :: Typed",
+]
 dependencies = []
 
 [project.optional-dependencies]
 oracle = ["oracledb>=3.4.0"]
 postgres = ["psycopg[binary]>=3.2.0"]
+
+[project.urls]
+Repository = "https://github.com/mrbald/migr8"
+Issues = "https://github.com/mrbald/migr8/issues"
 
 [project.scripts]
 migr8 = "migr8.cli:main"
@@ -18,6 +45,14 @@ migr8 = "migr8.cli:main"
 dev = [
   "pytest>=8.4.0",
   "pytest-timeout>=2.4.0",
+  # branch coverage over the pure core, enforced at 100% ([tool.coverage.report]
+  # names the modules and argues the scope). `[toml]` extra so the config lives
+  # in this file with its reasoning beside it.
+  "coverage[toml]>=7.6",
+  "ruff>=0.15",
+  "mypy>=1.18",
+  # Both drivers, so the type gate and the live suites see the real modules
+  # rather than a missing-import stub.
   "oracledb>=3.4.0",
   "psycopg[binary]>=3.2.0",
 ]
@@ -26,8 +61,48 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# One source of truth for the version: `TOOL_VERSION` is written into every
+# durable history row, so the package version is read from it rather than
+# restated here where the two could drift.
+[tool.hatch.version]
+path = "src/migr8/version.py"
+pattern = 'TOOL_VERSION = "(?P<version>[^"]+)"'
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/migr8"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "examples", "testenv", "deploy", "migr8"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+  # `except ... as exc: raise X(...) from exc` is used where the cause adds
+  # something; the engine deliberately drops driver tracebacks from operator
+  # facing errors elsewhere, and B904 cannot tell the two apart.
+  "B904",
+  # Tests unpack whole fixture tuples (`root, config, schema = project`) and use
+  # a subset. Renaming the unused half to `_schema` per test would make the
+  # fixture's shape harder to read, not easier.
+  "RUF059",
+]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["src/migr8", "testenv"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# Neither driver ships type information. The adapters treat driver objects as
+# opaque handles, which is what the contract in adapters/base.py already says.
+module = ["oracledb.*", "psycopg.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -39,3 +114,38 @@ markers = [
   "slow: long-running acceptance scenarios",
 ]
 timeout = 300
+
+[tool.coverage.run]
+# BRANCH coverage, not line. The modules under the gate are almost entirely
+# decisions: a refusal whose false arm nothing takes is a rule the code states
+# and no test holds it to. Line coverage calls such a guard covered.
+branch = true
+source = ["src/migr8"]
+
+[tool.coverage.report]
+# The gate is scoped, and the scope is an argument rather than a convenience.
+# These are the modules that decide whether a database's recorded history may be
+# continued: the canonical fingerprint encoding, the pure state validator, the
+# durable-state model, the unknown-outcome latch, and the exit-code contract.
+# They take no database and no I/O, so every branch in them is reachable from a
+# unit test, and a missed one is a rule that nothing holds the code to.
+#
+# Deliberately NOT listed: the adapters, the engine and the CLI, whose branches
+# are reached through real databases and real subprocesses. In-process coverage
+# reads those far below what the live suites actually exercise, so a percentage
+# there would measure the harness rather than the tests.
+include = [
+  "src/migr8/errors.py",
+  "src/migr8/fingerprint.py",
+  "src/migr8/latch.py",
+  "src/migr8/model.py",
+  "src/migr8/statevalidate.py",
+]
+fail_under = 100
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  # A guard that fires only if this module's own invariants are already broken.
+  "raise AssertionError",
+]

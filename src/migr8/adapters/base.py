@@ -144,7 +144,7 @@ class Adapter(ABC):
     #: thing this engine raises rather than swallowing every exception.
     driver_error: ClassVar[type[Exception]] = Exception
 
-    # --- dialect: how engine-owned metadata SQL is written ---------------------
+    # --- dialect: how engine-owned metadata SQL is written ----------------------------------------
 
     #: ``"named"`` for ``:name`` placeholders, ``"pyformat"`` for ``%(name)s``.
     #: Shared metadata SQL is always written with ``:name`` and translated.
@@ -172,7 +172,7 @@ class Adapter(ABC):
         self.metadata_schema: str | None = None
         self._engine_transaction = False
 
-    # --- engine-owned durable commit ------------------------------------------
+    # --- engine-owned durable commit --------------------------------------------------------------
 
     def durable_commit(self, boundary: Boundary, *, migration_id: str | None = None) -> None:
         """Commit an engine-owned transition, classifying the outcome honestly.
@@ -188,12 +188,13 @@ class Adapter(ABC):
             # An interruption while a commit is in flight is as unknown as a lost
             # acknowledgement: the request may already be durable. Only a
             # positively identified definite failure escapes as itself.
-            if isinstance(exc, Exception) and \
-                    self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION:
+            if (
+                isinstance(exc, Exception)
+                and self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION
+            ):
                 raise
             error = UnknownOutcomeError(
-                f"{type(exc).__name__}: {exc}" if not isinstance(exc, Exception)
-                else str(exc),
+                f"{type(exc).__name__}: {exc}" if not isinstance(exc, Exception) else str(exc),
                 operation=f"{boundary.value} commit",
                 phase=boundary.value,
                 migration_id=migration_id,
@@ -203,11 +204,10 @@ class Adapter(ABC):
             raise error from exc
         hooks.fire(boundary, hooks.AFTER_COMMIT)
 
-    # --- capability reporting -------------------------------------------------
+    # --- capability reporting ---------------------------------------------------------------------
 
     @abstractmethod
-    def capabilities(self) -> Capabilities:
-        ...
+    def capabilities(self) -> Capabilities: ...
 
     @abstractmethod
     def server_description(self) -> str:
@@ -235,7 +235,7 @@ class Adapter(ABC):
         """
         return ("unknown", f"the {self.name} adapter provides no session-liveness diagnostic")
 
-    # --- lifecycle -------------------------------------------------------------
+    # --- lifecycle --------------------------------------------------------------------------------
 
     @abstractmethod
     def connect(self) -> None:
@@ -261,17 +261,16 @@ class Adapter(ABC):
         cleanup statements.
         """
 
-    # --- namespace lock --------------------------------------------------------
+    # --- namespace lock ---------------------------------------------------------------------------
 
     @abstractmethod
     def acquire_lock(self) -> None:
         """Acquire the namespace lock, held across every commit until the run ends."""
 
     @abstractmethod
-    def release_lock(self) -> None:
-        ...
+    def release_lock(self) -> None: ...
 
-    # --- metadata --------------------------------------------------------------
+    # --- metadata ---------------------------------------------------------------------------------
 
     def inspect_metadata(self) -> MetadataReport:
         """Inspect the namespace without creating or altering anything.
@@ -291,9 +290,7 @@ class Adapter(ABC):
                 problems.append(f"{META_TABLE} cannot be read: {exc}")
             else:
                 if meta is not None and rows != 1:
-                    problems.append(
-                        f"{META_TABLE} holds {rows} rows; exactly one is expected"
-                    )
+                    problems.append(f"{META_TABLE} holds {rows} rows; exactly one is expected")
         return md.classify(
             present=present,
             problems=problems,
@@ -385,7 +382,7 @@ class Adapter(ABC):
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         """Read history, progress and the marker as one consistent view."""
 
-    # --- engine-owned SQL path -------------------------------------------------
+    # --- engine-owned SQL path --------------------------------------------------------------------
 
     @abstractmethod
     def _metadata_execute(self, sql: str, params: Mapping[str, object]) -> int:
@@ -400,7 +397,7 @@ class Adapter(ABC):
     def _metadata_query(self, sql: str, params: Mapping[str, object]) -> list[tuple]:
         """Run one engine-owned metadata query."""
 
-    # --- identifier and placeholder rendering ----------------------------------
+    # --- identifier and placeholder rendering -----------------------------------------------------
 
     def quoted(self, identifier: str) -> str:
         quote = self.quote_char
@@ -467,9 +464,7 @@ class Adapter(ABC):
         names = set(re.findall(r":([a-z_][a-z0-9_]*)", sql))
         missing = sorted(names - set(params))
         if missing:
-            raise UsageError(
-                f"engine-owned SQL is missing bind values for: {', '.join(missing)}"
-            )
+            raise UsageError(f"engine-owned SQL is missing bind values for: {', '.join(missing)}")
         return {name: params[name] for name in names}
 
     def _exec(self, sql: str, params: Mapping[str, object]) -> int:
@@ -480,12 +475,24 @@ class Adapter(ABC):
         """Render and run one engine-owned metadata query."""
         return self._metadata_query(self._render(sql), self._binds(sql, params))
 
-    # --- history transitions (shared; spec Sections 8.2, 8.5 and 10.1) ---------
+    # --- history transitions (shared; spec Sections 8.2, 8.5 and 10.1) ----------------------------
 
     _HISTORY_INSERT_COLUMNS = (
-        "seq", "migration_id", "fingerprint", "first_fingerprint", "language",
-        "mode", "status", "attempt", "started_at", "last_attempt_at",
-        "finished_at", "runner_host", "runner_user", "runner_pid", "db_session",
+        "seq",
+        "migration_id",
+        "fingerprint",
+        "first_fingerprint",
+        "language",
+        "mode",
+        "status",
+        "attempt",
+        "started_at",
+        "last_attempt_at",
+        "finished_at",
+        "runner_host",
+        "runner_user",
+        "runner_pid",
+        "db_session",
         "tool_version",
     )
 
@@ -508,8 +515,9 @@ class Adapter(ABC):
             f":runner_host, :runner_user, :runner_pid, :db_session, :tool_version)"
         )
 
-    def insert_success_row(self, *, seq: int, migration_id: str, fingerprint: str,
-                           language: Language, mode: Mode) -> None:
+    def insert_success_row(
+        self, *, seq: int, migration_id: str, fingerprint: str, language: Language, mode: Mode
+    ) -> None:
         """Insert a SUCCESS row inside the caller's already-open transaction.
 
         Atomic attempts are not counted, so ``attempt`` is NULL.
@@ -517,14 +525,18 @@ class Adapter(ABC):
         self._exec(
             self._insert_history_sql(status="SUCCESS", attempt="NULL", finished="{now}"),
             {
-                "seq": seq, "migration_id": migration_id, "fingerprint": fingerprint,
-                "language": language.value, "exec_mode": mode.value,
+                "seq": seq,
+                "migration_id": migration_id,
+                "fingerprint": fingerprint,
+                "language": language.value,
+                "exec_mode": mode.value,
                 **self._runner_binds(),
             },
         )
 
-    def insert_active_row(self, *, seq: int, migration_id: str, fingerprint: str,
-                          language: Language) -> None:
+    def insert_active_row(
+        self, *, seq: int, migration_id: str, fingerprint: str, language: Language
+    ) -> None:
         """Insert the first ACTIVE row and commit it as attempt 1.
 
         Both fingerprints are set to the admitted value; no migration code runs
@@ -534,15 +546,19 @@ class Adapter(ABC):
         self._exec(
             self._insert_history_sql(status="ACTIVE", attempt="1", finished="NULL"),
             {
-                "seq": seq, "migration_id": migration_id, "fingerprint": fingerprint,
-                "language": language.value, "exec_mode": Mode.RESTARTABLE.value,
+                "seq": seq,
+                "migration_id": migration_id,
+                "fingerprint": fingerprint,
+                "language": language.value,
+                "exec_mode": Mode.RESTARTABLE.value,
                 **self._runner_binds(),
             },
         )
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
 
-    def update_active_attempt(self, *, migration_id: str, fingerprint: str,
-                              language: Language) -> None:
+    def update_active_attempt(
+        self, *, migration_id: str, fingerprint: str, language: Language
+    ) -> None:
         """Increment the attempt counter for the matching ACTIVE row and commit.
 
         Position, identity, mode, the original start time and the first
@@ -567,8 +583,12 @@ class Adapter(ABC):
             f"{self.metadata_column('tool_version')} = :tool_version "
             f"WHERE {self.metadata_column('migration_id')} = :migration_id "
             f"AND {self.metadata_column('status')} = 'ACTIVE'",
-            {"fingerprint": fingerprint, "language": language.value,
-             "migration_id": migration_id, **self._runner_binds()},
+            {
+                "fingerprint": fingerprint,
+                "language": language.value,
+                "migration_id": migration_id,
+                **self._runner_binds(),
+            },
             what=f"admitting a new attempt for {migration_id!r}",
         )
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
@@ -582,8 +602,7 @@ class Adapter(ABC):
             f"{self.metadata_column('tool_version')} = :tool_version "
             f"WHERE {self.metadata_column('migration_id')} = :migration_id "
             f"AND {self.metadata_column('status')} = 'ACTIVE'",
-            {"tool_version": self._runner_binds()["tool_version"],
-             "migration_id": migration_id},
+            {"tool_version": self._runner_binds()["tool_version"], "migration_id": migration_id},
             what=f"completing {migration_id!r}",
         )
         self._exec(
@@ -593,8 +612,9 @@ class Adapter(ABC):
         )
         self.durable_commit(Boundary.RESTARTABLE_COMPLETION, migration_id=migration_id)
 
-    def _metadata_execute_in_transaction(self, sql: str, params: Mapping[str, object],
-                                         *, what: str) -> None:
+    def _metadata_execute_in_transaction(
+        self, sql: str, params: Mapping[str, object], *, what: str
+    ) -> None:
         """Open a transaction, run one update, and require exactly one affected row.
 
         Returns normally only when exactly one row was affected, so callers need
@@ -608,7 +628,7 @@ class Adapter(ABC):
                 f"{what} affected {affected} rows; exactly one ACTIVE row was expected"
             )
 
-    # --- progress store (shared; spec Sections 8.2 and 9.2) --------------------
+    # --- progress store (shared; spec Sections 8.2 and 9.2) ---------------------------------------
 
     def progress_get(self, migration_id: str, key: str) -> str | None:
         rows = self._fetch(
@@ -642,10 +662,7 @@ class Adapter(ABC):
         else:
             mid = self.metadata_column("migration_id")
             pkey = self.metadata_column("prog_key")
-            source = (
-                f"SELECT :migration_id AS {mid}, :prog_key AS {pkey} "
-                f"FROM {self.one_row_table}"
-            )
+            source = f"SELECT :migration_id AS {mid}, :prog_key AS {pkey} FROM {self.one_row_table}"
             sql = (
                 f"MERGE INTO {progress} target USING ({source}) source "
                 f"ON (target.{mid} = source.{mid} AND target.{pkey} = source.{pkey}) "
@@ -655,11 +672,9 @@ class Adapter(ABC):
                 f"WHEN NOT MATCHED THEN INSERT ({columns}) "
                 f"VALUES (:migration_id, :prog_key, :prog_value, {{now}})"
             )
-        self._exec(
-            sql, {"migration_id": migration_id, "prog_key": key, "prog_value": value}
-        )
+        self._exec(sql, {"migration_id": migration_id, "prog_key": key, "prog_value": value})
 
-    # --- transaction control (engine-owned) ------------------------------------
+    # --- transaction control (engine-owned) -------------------------------------------------------
 
     @property
     def in_engine_transaction(self) -> bool:
@@ -694,18 +709,16 @@ class Adapter(ABC):
         """Start a transaction, or verify the engine will start one implicitly."""
 
     @abstractmethod
-    def _do_commit(self) -> None:
-        ...
+    def _do_commit(self) -> None: ...
 
     @abstractmethod
-    def _do_rollback(self) -> None:
-        ...
+    def _do_rollback(self) -> None: ...
 
     @abstractmethod
     def has_open_transaction(self) -> bool:
         """True when a writable transaction is open, by actual driver/server state."""
 
-    # --- atomic transaction identity ------------------------------------------
+    # --- atomic transaction identity --------------------------------------------------------------
 
     @abstractmethod
     def establish_transaction_identity(self) -> str | None:
@@ -719,7 +732,7 @@ class Adapter(ABC):
     def read_transaction_identity(self) -> str | None:
         """Read the current identity without creating a transaction."""
 
-    # --- statement admission (shared; spec Section 5.3) -----------------------
+    # --- statement admission (shared; spec Section 5.3) -------------------------------------------
 
     @property
     @abstractmethod
@@ -806,8 +819,7 @@ class Adapter(ABC):
         self._extra_statement_checks(statement, mode=Mode.RESTARTABLE, in_batch=False)
         self._reject_reserved(statement)
 
-    def _extra_statement_checks(self, statement: Statement, *, mode: Mode,
-                               in_batch: bool) -> None:
+    def _extra_statement_checks(self, statement: Statement, *, mode: Mode, in_batch: bool) -> None:
         """Engine-specific refusals a token set cannot express."""
         return
 
@@ -826,7 +838,7 @@ class Adapter(ABC):
                     f"{reserved}; use the supplied progress API"
                 )
 
-    # --- execution -------------------------------------------------------------
+    # --- execution --------------------------------------------------------------------------------
 
     @abstractmethod
     def _run(self, text: str, params: object | None) -> Any:
@@ -861,7 +873,7 @@ class Adapter(ABC):
             raise
         self.durable_commit(Boundary.RESTARTABLE_DDL)
 
-    # --- final validity --------------------------------------------------------
+    # --- final validity ---------------------------------------------------------------------------
 
     def check_required_objects(self, required: tuple[RequiredObject, ...]) -> ValidityResult:
         """Read-only check of every declaration.  No compilation is performed.
@@ -870,12 +882,12 @@ class Adapter(ABC):
         :meth:`admit_required_objects`; preflight should already have refused it.
         """
         if required:
-            return ValidityResult(failures=(
-                f"the {self.name} adapter cannot check required-object declarations",
-            ))
+            return ValidityResult(
+                failures=(f"the {self.name} adapter cannot check required-object declarations",)
+            )
         return ValidityResult()
 
-    # --- error classification --------------------------------------------------
+    # --- error classification ---------------------------------------------------------------------
 
     @abstractmethod
     def classify_exception(self, exc: BaseException) -> OutcomeClass:

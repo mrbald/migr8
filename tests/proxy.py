@@ -16,6 +16,7 @@ through ``migr8.testing.hooks``; this module only controls the bytes.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import socket
 import struct
@@ -30,7 +31,7 @@ _CHUNK = 65536
 class _Pair:
     """One accepted client connection and its matching upstream connection."""
 
-    __slots__ = ("client", "server", "proxy", "threads", "closed")
+    __slots__ = ("client", "closed", "proxy", "server", "threads")
 
     def __init__(self, client: socket.socket, server: socket.socket, proxy: DirectionalProxy):
         self.client = client
@@ -45,7 +46,9 @@ class _Pair:
             ("s2c", self.server, self.client, "to_client"),
         ):
             thread = threading.Thread(
-                target=self._pump, args=(source, sink, direction), name=f"proxy-{name}",
+                target=self._pump,
+                args=(source, sink, direction),
+                name=f"proxy-{name}",
                 daemon=True,
             )
             thread.start()
@@ -59,7 +62,7 @@ class _Pair:
                 source.settimeout(0.05)
                 try:
                     chunk = source.recv(_CHUNK)
-                except socket.timeout:
+                except TimeoutError:
                     chunk = b""
                 except OSError:
                     break
@@ -103,23 +106,15 @@ class _Pair:
             return
         self.closed = True
         for sock in (self.client, self.server):
-            try:
+            with contextlib.suppress(OSError):
                 sock.close()
-            except OSError:
-                pass
 
     def reset_client(self) -> None:
         """Abruptly close the client-facing socket so the client sees a hard error."""
-        try:
-            self.client.setsockopt(
-                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
-            )
-        except OSError:
-            pass
-        try:
+        with contextlib.suppress(OSError):
+            self.client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        with contextlib.suppress(OSError):
             self.client.close()
-        except OSError:
-            pass
 
 
 class DirectionalProxy:
@@ -161,7 +156,7 @@ class DirectionalProxy:
         while not self.stopping:
             try:
                 client, _address = self._listener.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -181,10 +176,8 @@ class DirectionalProxy:
     def stop(self) -> None:
         self.stopping = True
         if self._listener is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._listener.close()
-            except OSError:
-                pass
         with self._lock:
             pairs = list(self._pairs)
             self._pairs.clear()

@@ -141,9 +141,7 @@ def _build_lock(section: object, path: Path) -> LockConfig:
     if lock_id is not None:
         lock_id = _require_int(lock_id, "lock.id")
         if not LOCK_ID_MIN <= lock_id <= LOCK_ID_MAX:
-            raise ConfigError(
-                f"lock.id must be in {LOCK_ID_MIN}..{LOCK_ID_MAX}, got {lock_id}"
-            )
+            raise ConfigError(f"lock.id must be in {LOCK_ID_MIN}..{LOCK_ID_MAX}, got {lock_id}")
     package = section.get("package")
     if package is not None:
         package = _require_str(package, "lock.package")

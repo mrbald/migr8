@@ -16,6 +16,7 @@ Two behaviours here exist for operations rather than for the specification:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import signal
 import sys
@@ -53,20 +54,35 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(target: argparse.ArgumentParser) -> None:
-        target.add_argument("--config", type=Path, default=None,
-                            help=f"configuration file (default ./{DEFAULT_CONFIG_NAME})")
-        target.add_argument("--manifest", type=Path, default=None,
-                            help=f"manifest file (default ./{DEFAULT_MANIFEST_NAME})")
-        target.add_argument("--log-file", type=Path, default=None, metavar="PATH",
-                            help="append a JSON event log for diagnosis "
-                                 "(or set MIGR8_LOG_FILE)")
-        target.add_argument("--json", action="store_true",
-                            help="emit a machine-readable report on stdout")
+        target.add_argument(
+            "--config",
+            type=Path,
+            default=None,
+            help=f"configuration file (default ./{DEFAULT_CONFIG_NAME})",
+        )
+        target.add_argument(
+            "--manifest",
+            type=Path,
+            default=None,
+            help=f"manifest file (default ./{DEFAULT_MANIFEST_NAME})",
+        )
+        target.add_argument(
+            "--log-file",
+            type=Path,
+            default=None,
+            metavar="PATH",
+            help="append a JSON event log for diagnosis (or set MIGR8_LOG_FILE)",
+        )
+        target.add_argument(
+            "--json", action="store_true", help="emit a machine-readable report on stdout"
+        )
 
     migrate = sub.add_parser("migrate", help="execute the pending migration suffix")
     common(migrate)
     migrate.add_argument(
-        "--recover", metavar="ID", default=None,
+        "--recover",
+        metavar="ID",
+        default=None,
         help="admit amended source for the existing ACTIVE restartable migration",
     )
 
@@ -97,16 +113,16 @@ def _install_signal_handlers() -> None:
     all: a commit in flight would be abandoned with nothing written to the log
     and no exit code an operator could act on.
     """
+
     def handler(signum: int, _frame: object) -> None:
         raise KeyboardInterrupt(f"signal {signal.Signals(signum).name}")
 
     for name in ("SIGTERM", "SIGHUP"):
         sig = getattr(signal, name, None)
         if sig is not None:
-            try:
+            # Not the main thread, or a platform without the signal.
+            with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, handler)
-            except (ValueError, OSError):  # pragma: no cover - not the main thread
-                pass
 
 
 def _do_migrate(args: argparse.Namespace, log: RunLog) -> int:
@@ -117,8 +133,11 @@ def _do_migrate(args: argparse.Namespace, log: RunLog) -> int:
     try:
         capture = stage(manifest)
         engine = Engine(
-            config=config, adapter=adapter, capture=capture,
-            recover_id=args.recover, log=log,
+            config=config,
+            adapter=adapter,
+            capture=capture,
+            recover_id=args.recover,
+            log=log,
         )
         report = engine.run()
     finally:
@@ -150,13 +169,17 @@ def _do_readonly(args: argparse.Namespace, command: str, log: RunLog) -> int:
     manifest = load_manifest(manifest_path)
     capture = capture_in_place(manifest)
     adapter = adapters.create(config)
-    log.event("run_start", command=command, adapter=adapter.name,
-              manifest=str(manifest_path), units=len(capture.units))
+    log.event(
+        "run_start",
+        command=command,
+        adapter=adapter.name,
+        manifest=str(manifest_path),
+        units=len(capture.units),
+    )
     runner = run_status if command == "status" else run_validate
     report = runner(adapter, capture)
     report.run_id = log.run_id
-    log.event("run_end", command=command, exit_code=report.exit_code,
-              problem=report.problem_kind)
+    log.event("run_end", command=command, exit_code=report.exit_code, problem=report.problem_kind)
     print(report.to_json() if args.json else report.to_text())
     return report.exit_code
 
@@ -176,8 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             return _do_migrate(args, log)
         return _do_readonly(args, args.command, log)
     except Migr8Error as exc:
-        log.event("run_end", exit_code=int(exc.exit_code), detail=exc.message,
-                  phase=exc.phase)
+        log.event("run_end", exit_code=int(exc.exit_code), detail=exc.message, phase=exc.phase)
         print(f"error: {exc.report()}", file=sys.stderr)
         return int(exc.exit_code)
     except KeyboardInterrupt:

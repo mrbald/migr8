@@ -77,9 +77,7 @@ class Report:
             )
         if self.migrations:
             lines.append("")
-            lines.append(
-                f"{'pos':>4}  {'state':<8} {'mode':<12} {'lang':<7} {'fp':<5} id"
-            )
+            lines.append(f"{'pos':>4}  {'state':<8} {'mode':<12} {'lang':<7} {'fp':<5} id")
             for item in self.migrations:
                 if item.recorded_matches_current is None:
                     mark = "-"
@@ -96,20 +94,15 @@ class Report:
                         f"        attempt={item.attempt} started={item.started_at} "
                         f"last_attempt={item.last_attempt_at}"
                     )
-                    lines.append(
-                        f"        recorded={item.recorded_fingerprint}"
-                    )
-                    lines.append(
-                        f"        current ={item.current_fingerprint}"
-                    )
+                    lines.append(f"        recorded={item.recorded_fingerprint}")
+                    lines.append(f"        current ={item.current_fingerprint}")
                     lines.append(
                         f"        first={item.first_fingerprint} "
                         f"first_matches_latest={item.first_matches_latest}"
                     )
                     if item.db_session:
                         lines.append(
-                            f"        session={item.db_session} "
-                            f"liveness={item.session_liveness}"
+                            f"        session={item.db_session} liveness={item.session_liveness}"
                         )
                         if item.session_liveness_detail:
                             lines.append(f"        note: {item.session_liveness_detail}")
@@ -125,8 +118,9 @@ class Report:
         return "\n".join(lines)
 
 
-def status_from_row(position: int, unit_id: str, mode: str, language: str,
-                    current_fingerprint: str, row) -> MigrationStatus:
+def status_from_row(
+    position: int, unit_id: str, mode: str, language: str, current_fingerprint: str, row
+) -> MigrationStatus:
     """Build one status entry from a capture position and its history row."""
     if row is None:
         return MigrationStatus(

@@ -83,23 +83,16 @@ def validate_snapshot_shape(snapshot: Snapshot) -> None:
     if actives:
         active = actives[0]
         successes = [row for row in rows if row.is_success]
+        # This one comparison is the whole rule. Positions are already known to
+        # be consecutive from 1, every status is already known to be ACTIVE or
+        # SUCCESS, and there is already known to be exactly one ACTIVE row, so
+        # "the ACTIVE row sits immediately after the successful prefix" implies
+        # both "everything before it is SUCCESS" and "nothing follows it".
         if active.seq != len(successes) + 1:
             raise MetadataDamagedError(
                 f"ACTIVE migration {active.migration_id!r} is at position {active.seq} but the "
                 f"successful prefix has length {len(successes)}; ACTIVE must be the next position"
             )
-        # Everything before the ACTIVE row must be SUCCESS.
-        for row in rows:
-            if row.seq < active.seq and not row.is_success:
-                raise MetadataDamagedError(
-                    f"history row {row.migration_id!r} at position {row.seq} precedes the "
-                    f"ACTIVE row but is not SUCCESS"
-                )
-            if row.seq > active.seq:
-                raise MetadataDamagedError(
-                    f"history row {row.migration_id!r} at position {row.seq} follows the "
-                    f"ACTIVE row at position {active.seq}"
-                )
 
     _validate_progress(snapshot, rows)
 
@@ -117,12 +110,12 @@ def _validate_row(row: HistoryRow) -> None:
         raise MetadataDamagedError(
             f"history row {row.migration_id!r} has unsupported mode {row.mode!r}"
         )
-    for label, value in (("fingerprint", row.fingerprint),
-                         ("first_fingerprint", row.first_fingerprint)):
+    for label, value in (
+        ("fingerprint", row.fingerprint),
+        ("first_fingerprint", row.first_fingerprint),
+    ):
         if not value:
-            raise MetadataDamagedError(
-                f"history row {row.migration_id!r} has an empty {label}"
-            )
+            raise MetadataDamagedError(f"history row {row.migration_id!r} has an empty {label}")
         if not is_supported_fingerprint(value):
             raise MetadataDamagedError(
                 f"history row {row.migration_id!r} {label} {value!r} uses an unsupported "
@@ -143,9 +136,7 @@ def _validate_row(row: HistoryRow) -> None:
                 f"ACTIVE history row {row.migration_id!r} has a completion time"
             )
         if row.started_at is None:
-            raise MetadataDamagedError(
-                f"ACTIVE history row {row.migration_id!r} has no start time"
-            )
+            raise MetadataDamagedError(f"ACTIVE history row {row.migration_id!r} has no start time")
     else:
         if row.finished_at is None:
             raise MetadataDamagedError(
@@ -158,14 +149,12 @@ def _validate_row(row: HistoryRow) -> None:
             )
         if row.mode == Mode.RESTARTABLE and (row.attempt is None or row.attempt < 1):
             raise MetadataDamagedError(
-                f"restartable history row {row.migration_id!r} has invalid attempt "
-                f"{row.attempt!r}"
+                f"restartable history row {row.migration_id!r} has invalid attempt {row.attempt!r}"
             )
 
 
 def _validate_progress(snapshot: Snapshot, rows: list[HistoryRow]) -> None:
     by_id = {row.migration_id: row for row in rows}
-    active = next((row for row in rows if row.is_active), None)
     seen: set[tuple[str, str]] = set()
     for entry in snapshot.progress:
         key = (entry.migration_id, entry.prog_key)
@@ -180,15 +169,13 @@ def _validate_progress(snapshot: Snapshot, rows: list[HistoryRow]) -> None:
                 f"progress row {entry.prog_key!r} references unknown migration "
                 f"{entry.migration_id!r}"
             )
+        # These two refusals are the whole rule. Every history row is already
+        # known to be ACTIVE or SUCCESS and at most one is ACTIVE, so a progress
+        # row that names a known, unfinished migration names the ACTIVE one.
         if owner.is_success:
             raise MetadataDamagedError(
                 f"progress row {entry.prog_key!r} is attached to successful migration "
                 f"{entry.migration_id!r}; restartable completion deletes progress"
-            )
-        if active is None or entry.migration_id != active.migration_id:
-            raise MetadataDamagedError(
-                f"progress row {entry.prog_key!r} belongs to {entry.migration_id!r}, which is "
-                "not the current ACTIVE migration"
             )
         if not entry.prog_value:
             raise MetadataDamagedError(

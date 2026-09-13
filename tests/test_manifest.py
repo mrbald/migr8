@@ -6,8 +6,8 @@ import os
 import sys
 
 import pytest
-
 import support
+
 from migr8.errors import ManifestError, UnitError
 from migr8.manifest import Language, Mode, load
 from migr8.paths import scan_unit
@@ -40,11 +40,14 @@ def test_loads_a_minimal_manifest(project):
 def test_array_order_is_execution_order(tmp_path):
     for name in ("zzz", "aaa", "mmm"):
         support.unit(tmp_path, name, {"up.sql": "SELECT 1;\n"})
-    path = support.manifest(tmp_path, [
-        _ok_entry(id="third", path="zzz"),
-        _ok_entry(id="first", path="aaa"),
-        _ok_entry(id="second", path="mmm"),
-    ])
+    path = support.manifest(
+        tmp_path,
+        [
+            _ok_entry(id="third", path="zzz"),
+            _ok_entry(id="first", path="aaa"),
+            _ok_entry(id="second", path="mmm"),
+        ],
+    )
     manifest = load(path)
     assert [m.id for m in manifest.migrations] == ["third", "first", "second"]
     assert [m.position for m in manifest.migrations] == [1, 2, 3]
@@ -86,17 +89,25 @@ def test_every_required_field_is_required(project, missing):
 def test_duplicate_ids_are_rejected(tmp_path):
     support.unit(tmp_path, "u1", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "u2", {"up.sql": "SELECT 2;\n"})
-    path = support.manifest(tmp_path, [
-        _ok_entry(id="same", path="u1"), _ok_entry(id="same", path="u2"),
-    ])
+    path = support.manifest(
+        tmp_path,
+        [
+            _ok_entry(id="same", path="u1"),
+            _ok_entry(id="same", path="u2"),
+        ],
+    )
     with pytest.raises(ManifestError, match="duplicate migration id 'same'"):
         load(path)
 
 
 def test_duplicate_unit_paths_are_rejected(project):
-    path = support.manifest(project, [
-        _ok_entry(id="a", path="u"), _ok_entry(id="b", path="u"),
-    ])
+    path = support.manifest(
+        project,
+        [
+            _ok_entry(id="a", path="u"),
+            _ok_entry(id="b", path="u"),
+        ],
+    )
     with pytest.raises(ManifestError, match="same unit directory"):
         load(path)
 
@@ -104,17 +115,31 @@ def test_duplicate_unit_paths_are_rejected(project):
 def test_nested_units_are_rejected(tmp_path):
     support.unit(tmp_path, "outer", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "outer/inner", {"up.sql": "SELECT 2;\n"})
-    path = support.manifest(tmp_path, [
-        _ok_entry(id="a", path="outer"), _ok_entry(id="b", path="outer/inner"),
-    ])
+    path = support.manifest(
+        tmp_path,
+        [
+            _ok_entry(id="a", path="outer"),
+            _ok_entry(id="b", path="outer/inner"),
+        ],
+    )
     with pytest.raises(ManifestError, match="contained in the unit"):
         load(path)
 
 
-@pytest.mark.parametrize("bad_id", [
-    "", "_leading", ".leading", "-leading", "has space", "has/slash", "é",
-    "x" * 201, "tab\there",
-])
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "",
+        "_leading",
+        ".leading",
+        "-leading",
+        "has space",
+        "has/slash",
+        "é",
+        "x" * 201,
+        "tab\there",
+    ],
+)
 def test_invalid_ids_are_rejected(project, bad_id):
     path = support.manifest(project, [_ok_entry(id=bad_id)])
     with pytest.raises(ManifestError):
@@ -124,9 +149,13 @@ def test_invalid_ids_are_rejected(project, bad_id):
 def test_ids_are_case_sensitive(tmp_path):
     support.unit(tmp_path, "u1", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "u2", {"up.sql": "SELECT 2;\n"})
-    path = support.manifest(tmp_path, [
-        _ok_entry(id="Orders", path="u1"), _ok_entry(id="orders", path="u2"),
-    ])
+    path = support.manifest(
+        tmp_path,
+        [
+            _ok_entry(id="Orders", path="u1"),
+            _ok_entry(id="orders", path="u2"),
+        ],
+    )
     assert [m.id for m in load(path).migrations] == ["Orders", "orders"]
 
 
@@ -181,10 +210,15 @@ def test_special_file_inside_a_unit_is_rejected(tmp_path):
         scan_unit(unit_dir, migration_id="m")
 
 
-@pytest.mark.parametrize("artefact", [
-    "__pycache__/mod.cpython-314.pyc", "helper.pyc", ".pytest_cache/v/cache/lastfailed",
-    ".mypy_cache/3.14/x.json",
-])
+@pytest.mark.parametrize(
+    "artefact",
+    [
+        "__pycache__/mod.cpython-314.pyc",
+        "helper.pyc",
+        ".pytest_cache/v/cache/lastfailed",
+        ".mypy_cache/3.14/x.json",
+    ],
+)
 def test_bytecode_and_tool_caches_inside_units_are_errors(tmp_path, artefact):
     unit_dir = support.unit(tmp_path, "u", {"up.sql": "SELECT 1;\n", artefact: "x"})
     with pytest.raises(UnitError, match="forbidden"):
@@ -207,30 +241,56 @@ def test_case_folding_collision_within_a_unit_is_rejected(tmp_path, monkeypatch)
 
 
 def test_duplicate_required_object_is_rejected(project):
-    path = support.manifest(project, [_ok_entry(require_valid=[
-        {"name": "PKG", "type": "PACKAGE"}, {"name": "PKG", "type": "PACKAGE"},
-    ])])
+    path = support.manifest(
+        project,
+        [
+            _ok_entry(
+                require_valid=[
+                    {"name": "PKG", "type": "PACKAGE"},
+                    {"name": "PKG", "type": "PACKAGE"},
+                ]
+            )
+        ],
+    )
     with pytest.raises(ManifestError, match="duplicate required object"):
         load(path)
 
 
 def test_required_objects_are_stored_in_canonical_order(project):
-    path = support.manifest(project, [_ok_entry(require_valid=[
-        {"name": "V", "type": "VIEW"},
-        {"name": "B", "type": "PACKAGE BODY"},
-        {"name": "A", "type": "PACKAGE"},
-    ])])
+    path = support.manifest(
+        project,
+        [
+            _ok_entry(
+                require_valid=[
+                    {"name": "V", "type": "VIEW"},
+                    {"name": "B", "type": "PACKAGE BODY"},
+                    {"name": "A", "type": "PACKAGE"},
+                ]
+            )
+        ],
+    )
     required = load(path).migrations[0].required
     assert [(o.type, o.name) for o in required] == [
-        ("PACKAGE", "A"), ("PACKAGE BODY", "B"), ("VIEW", "V"),
+        ("PACKAGE", "A"),
+        ("PACKAGE BODY", "B"),
+        ("VIEW", "V"),
     ]
 
 
 def test_required_object_needs_both_fields(project):
-    path = support.manifest(project, [{
-        "id": "m", "path": "u", "language": "sql", "mode": "atomic", "entry": "up.sql",
-        "require_valid": [{"name": "PKG", "type": ""}],
-    }])
+    path = support.manifest(
+        project,
+        [
+            {
+                "id": "m",
+                "path": "u",
+                "language": "sql",
+                "mode": "atomic",
+                "entry": "up.sql",
+                "require_valid": [{"name": "PKG", "type": ""}],
+            }
+        ],
+    )
     with pytest.raises(ManifestError, match="empty name or type"):
         load(path)
 
@@ -256,8 +316,25 @@ def test_unit_location_is_not_part_of_the_fingerprint(tmp_path):
 def test_manifest_position_is_not_part_of_the_fingerprint(tmp_path):
     support.unit(tmp_path, "a", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "b", {"up.sql": "SELECT 1;\n"})
-    capture = capture_in_place(load(support.manifest(tmp_path, [
-        _ok_entry(id="first", path="a"), _ok_entry(id="second", path="b"),
-    ])))
+    capture = capture_in_place(
+        load(
+            support.manifest(
+                tmp_path,
+                [
+                    _ok_entry(id="first", path="a"),
+                    _ok_entry(id="second", path="b"),
+                ],
+            )
+        )
+    )
     assert capture.units[0].fingerprint == capture.units[1].fingerprint
     assert capture.units[0].id != capture.units[1].id
+
+
+def test_at_position_is_none_outside_the_capture():
+    """The plan asks for the active row's position, which a shortened manifest
+    may no longer reach."""
+    from migr8.model import Capture
+
+    empty = Capture(manifest=None, units=(), staged=False)
+    assert empty.at_position(1) is None

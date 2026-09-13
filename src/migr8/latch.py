@@ -22,7 +22,7 @@ class LatchState(StrEnum):
 class RunLatch:
     """Single-shot, non-clearable."""
 
-    __slots__ = ("_state", "_error")
+    __slots__ = ("_error", "_state")
 
     def __init__(self) -> None:
         self._state = LatchState.OPEN

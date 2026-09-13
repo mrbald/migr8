@@ -41,4 +41,4 @@ def create(config: Config) -> Adapter:
     )
 
 
-__all__ = ["Adapter", "create", "SUPPORTED"]
+__all__ = ["SUPPORTED", "Adapter", "create"]
