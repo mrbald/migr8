@@ -1,4 +1,4 @@
-# migr8 - Specification v6.1
+# migr8 - Specification v6.2
 
 The maintained specification, kept in step with the implementation in
 `src/migr8/`. No database version is certified by this document alone.
@@ -6,7 +6,7 @@ The maintained specification, kept in step with the implementation in
 Acceptance evidence, including which gates are open, is in
 [`ACCEPTANCE.md`](ACCEPTANCE.md).
 
-The primary target is Oracle. PostgreSQL is the second database adapter and a useful comparison target. SQLite is an explicitly limited local probe adapter. Their different roles are specified in §13.
+The primary target is Oracle. PostgreSQL is the second database adapter and a useful comparison target. SQLite is a supported local-file adapter within a stated profile. Their different roles are specified in §13.
 
 MUST and MUST NOT are requirements; SHOULD permits a documented reason to choose otherwise; MAY is optional. The runner is the migration process. The author writes trusted migration code. The operator chooses the target database and runs the tool.
 
@@ -57,7 +57,7 @@ A SUCCESS row does not imply that the runner received its commit acknowledgement
 3. There is at most one ACTIVE row. Its position is the successful-prefix length plus 1, its identity matches that manifest entry, and its stored and requested modes are both restartable.
 4. An active identity and its position cannot change. Its source definition may change only through the recovery admission rules in §10.
 5. Every engine-owned durable transition has defined contents and an explicit recovery rule (§7). Atomic completion includes migration work; restartable completion includes progress deletion. Initialization uses its own completion marker.
-6. Oracle and PostgreSQL execution use one physical database session holding the namespace lock for all migration execution and metadata writes. SQLite's local probe exception is explicit in §13.3.
+6. Oracle and PostgreSQL execution use one physical database session holding the namespace lock for all migration execution and metadata writes. SQLite's file-lock exception is explicit in §13.3.
 7. All migration-local files executed or read during an attempt come from the same staged unit whose fingerprint was admitted for that attempt.
 8. No later migration executes until the preceding migration is durably successful. A failure stops the run.
 
@@ -122,7 +122,7 @@ For the Oracle MVP, supported types are `PROCEDURE`, `FUNCTION`, `PACKAGE`, `PAC
 
 Every compiled object whose usability is necessary for the migration's intended final state must be declared. Authors remain responsible for declarations made necessary by dynamically generated DDL or indirect database calls. The engine does not infer completeness from the first SQL token.
 
-The PostgreSQL and SQLite probe adapters initially reject nonempty Oracle-style required-object lists. Their migration fixtures may use language-native assertions instead. Future adapter-specific validity contracts must remain explicit and fingerprinted.
+The PostgreSQL and SQLite adapters reject nonempty Oracle-style required-object lists. Their migration fixtures may use language-native assertions instead. Future adapter-specific validity contracts must remain explicit and fingerprinted.
 
 ## 4. Fingerprints and staged execution
 
@@ -200,7 +200,7 @@ Other adapters must either provide an appropriate guard or state their supported
 The other two adapters' boundaries are:
 
 - **PostgreSQL** has a real transaction-identity tripwire. `pg_current_xact_id()` assigns and returns the identity; `pg_current_xact_id_if_assigned()` reads it without assigning one. A commit inside the migration leaves a transaction with no assigned identity, which the check detects. PostgreSQL additionally refuses `COMMIT` inside a `DO` block running in an explicit transaction, so most violations never reach the tripwire at all.
-- **The SQLite probe** has no server transaction identity. Its stated enforcement boundary is facade statement admission plus SQLite's native `in_transaction` state and an adapter-owned transaction epoch, incremented on every begin, commit, and rollback the adapter performs. A commit reachable only through the facade therefore changes the epoch and is detected; effects reachable some other way are not claimed to be detectable.
+- **The SQLite adapter** has no server transaction identity. Its stated enforcement boundary is facade statement admission plus SQLite's native `in_transaction` state and an adapter-owned transaction epoch, incremented on every begin, commit, and rollback the adapter performs. A commit reachable only through the facade therefore changes the epoch and is detected; effects reachable some other way are not claimed to be detectable.
 
 ### 5.2 Restartable
 
@@ -270,7 +270,7 @@ Existence alone also does not establish intended columns, indexes, constraints, 
 
 Oracle metadata-object creation and migration DDL can commit independently. They are governed by recoverable initialization and restartable execution, respectively, not disguised as history-only transactions.
 
-The two initialization transitions are named separately because they recover differently and because an acceptance harness must be able to target each one. Object creation is `metadata_object_created`; the marker is `initialization_complete`. On Oracle each object's `CREATE` commits implicitly, so only the marker carries an engine-issued commit. On PostgreSQL and the SQLite probe each object is created in its own explicit transaction.
+The two initialization transitions are named separately because they recover differently and because an acceptance harness must be able to target each one. Object creation is `metadata_object_created`; the marker is `initialization_complete`. On Oracle each object's `CREATE` commits implicitly, so only the marker carries an engine-issued commit. On PostgreSQL and SQLite each object is created in its own explicit transaction.
 
 ### 7.2 Failure handling
 
@@ -286,7 +286,7 @@ A driver-side refusal raised *before* anything is submitted is as definite as a 
 
 - **Oracle:** an `ORA-` error number returned by the server that is not in the adapter's transport-failure list, or a driver code in the adapter's enumerated client-side list. An unlisted `DPY-` code stays unknown on purpose.
 - **PostgreSQL:** a SQLSTATE outside class `08`, the connection-exception class, and other than `40003` `statement_completion_unknown`, which is the server reporting that it does not know whether the statement completed. A `psycopg` error with no SQLSTATE is unknown unless it is a `ProgrammingError` or `NotSupportedError`, which are raised client-side.
-- **The SQLite probe:** every `sqlite3.Error` is definite, because the library runs in-process and there is no transport to lose. The probe therefore produces no unknown outcomes and is not evidence for this contract.
+- **The SQLite adapter:** a `sqlite3.Error` is definite, because the library runs in-process and there is no transport to lose. The exception is a commit that fails on storage, where SQLite's own recovery at the next open decides whether the transaction is durable; §13.3 states which codes settle a commit and which do not. SQLite is not evidence for the lost-acknowledgement branches of this contract, which belong to the two transports.
 
 An unknown batch outcome may be caught by user code accidentally. The facade must latch the run as unusable and refuse further calls or successful completion. Batch context cleanup must not issue a rollback after an unknown commit outcome. This prevents a caught exception from allowing execution to continue.
 
@@ -353,9 +353,13 @@ The one-active index needs its exact supported form, not a resemblance to it. Or
 
 Check constraints are compared the same way, and the comparison is exact in both directions. Each supported condition is matched against the canonical rendering the server stores for it, and the set is closed: a condition that is missing, altered or added is damage. Containment of a required fragment is not a comparison — appending `OR 1=1` to every declared condition leaves each fragment present while the constraints enforce nothing. Fold whitespace and identifier spelling, an unquoted identifier by the engine's own case folding and a quoted one by its exact content; keep string literals exactly, because `'ACTIVE'` and `'active'` are different values. Refuse a condition the comparison does not recognise rather than deciding SQL equivalence by inspection. Take the supported renderings from the supported server releases and record which release they came from.
 
+One condition can have more than one supported rendering on the same engine. A logical restore re-parses each stored definition, and the server may spell the result differently from the statement the engine issued: PostgreSQL 17.5 renders a restored `IN (...)` with the cast inside the array elements. A namespace restored from a backup is the same namespace, so each such rendering is recorded as an accepted alternative for the condition it stands for, with the release it was observed on. Record observations; do not derive equivalences at run time.
+
 A foreign key's target is the fully qualified object and its key columns in order. A same-named history table in another schema is a different table, and accepting it would link this namespace's progress to another namespace's history.
 
 Valid existing rows are not evidence about the definition. Every row the runner wrote satisfies a constraint that enforces nothing, so only the definition says what the next write will be held to.
+
+Where the engine stores the statement that created an object rather than a dictionary rendering of it, as SQLite does, the closing comparison is against that stored text, canonicalised the same way: identifiers and whitespace folded, string literals kept exactly. It refuses what the structural checks do not name -- a storage option, a default, a collation, a generated column -- instead of accepting a layout this engine has never written to. A definition the comparison cannot read is damage.
 
 For Oracle, use `ALL_*` views filtered by exact target owner, even when the connection user differs. Probe inaccessible objects as an error, not as absent. Reserve metadata names and prohibit migration code from modifying them outside the supplied progress API.
 
@@ -498,7 +502,7 @@ There is no supported abandonment, marker deletion, manual success insertion, or
 migr8 migrate [--config PATH] [--manifest PATH] [--recover ID]
 ```
 
-1. Load and structurally validate configuration and manifest. Validate supported modes, required-object declarations, paths, and lexical rules that can be checked without executing code.
+1. Load and structurally validate configuration and manifest. Validate supported modes, required-object declarations, paths, lexical rules for SQL units, and compilation of every Python source in every Python unit. Compilation here is the language's own parse of the source; nothing is imported, executed, or written as bytecode, and no database object is compiled. A unit that does not parse is a property of the source, so it fails before the migration is admitted rather than at the import that follows admission.
 2. Capture the manifest, stage all units, and fingerprint them. No migration code runs.
 3. Connect, establish adapter session settings, and acquire the namespace lock.
 4. Inspect the namespace. Refuse `--recover` here if no completed metadata exists, before anything is created. Otherwise complete allowed initialization, then verify namespace and lock binding.
@@ -515,13 +519,13 @@ A waiting runner may acquire the lock after another runner has finished, validat
 ### 11.2 validate and status
 
 ```text
-migr8 validate [--config PATH] [--manifest PATH] [--json]
+migr8 validate [--config PATH] [--manifest PATH] [--json] [--offline] [--baseline PATH]
 migr8 status   [--config PATH] [--manifest PATH] [--json]
 ```
 
 Both are read-only application operations: no metadata creation, staging, imports, migration SQL, recompilation, or migration lock. Use a short consistent metadata read; a single query where feasible, otherwise a read-only/snapshot transaction implemented by the adapter. Do not hold it open while waiting for user input.
 
-For Oracle the single query is not merely preferred, it is required. A `SET TRANSACTION READ ONLY` snapshot that reads a table whose definition changed in the same second raises ORA-01466. That happens on every run which has just created metadata or executed migration DDL, which is exactly the long migration `status` exists to observe. The Oracle adapter therefore reads history, progress, and the marker in one `UNION ALL` statement, which is read-consistent in Oracle without a transaction. PostgreSQL uses `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` and the SQLite probe uses `BEGIN DEFERRED`; neither has that restriction.
+For Oracle the single query is not merely preferred, it is required. A `SET TRANSACTION READ ONLY` snapshot that reads a table whose definition changed in the same second raises ORA-01466. That happens on every run which has just created metadata or executed migration DDL, which is exactly the long migration `status` exists to observe. The Oracle adapter therefore reads history, progress, and the marker in one `UNION ALL` statement, which is read-consistent in Oracle without a transaction. PostgreSQL uses `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` and SQLite uses `BEGIN DEFERRED`; neither has that restriction.
 
 An uninitialized compatible namespace is reported distinctly. Missing objects after completed initialization, incompatible definitions, orphaned rows, or invalid history are damage/validation failures. Missing access privileges are not evidence of uninitialized state.
 
@@ -530,6 +534,10 @@ An uninitialized compatible namespace is reported distinctly. Missing objects af
 `status` reports id, position, state, mode, language, admitted/current fingerprint comparison, first/latest fingerprint comparison, available timestamps, admission count, and optional latest-attempt diagnostics. It reports pending units even when it can also identify a validation failure. Its exit code reflects that failure rather than silently returning a clean result.
 
 Status remains useful during a long migration. Oracle and PostgreSQL should return committed metadata promptly without waiting for the migration lock. Server availability and ordinary database resource contention still apply; this is not an absolute no-blocking guarantee.
+
+`validate --offline` makes no connection, reads no secret and names no namespace. It performs the checks that need only the plan and the selected backend: manifest order, identity, paths and fingerprints; supported language and mode combinations; required-object declarations; statement admission for every SQL unit; and compilation of every Python source in every Python unit. The report lists the checks it performed, because exit 0 from it is a statement about the plan and not about any target. It cannot establish that the SQL is valid on the server, that the privileges exist, or that a restartable migration converges. It is the first of three gates, the others being a rehearsal against a disposable database of the same engine and `validate` against the actual target; the engine's own check under the namespace lock remains authoritative.
+
+`--baseline PATH` compares the plan against a previously approved `--json` plan artifact. A manifest alone cannot show that a published migration was edited, because the unit and its fingerprint change together and the result is internally consistent; the approved artifact is the other side of that comparison. Every entry it records must appear at the same position with the same id and fingerprint, and entries after them are new work. It is a source-to-source comparison and says nothing about what a database has recorded. It applies to `validate` with or without `--offline`, and it is checked before the connection either way.
 
 Session-liveness diagnostics are optional and separate from the consistent history snapshot. A session match requires a full usable identity, not a reusable SID alone; include Oracle instance/SID/serial information where available. Without adequate privileges, report unknown. Session existence is not proof that the migration is currently executing or holding the lock.
 
@@ -571,6 +579,23 @@ ddl_lock_timeout_seconds = 30
 provider = "dbms_lock"
 package = "SYS.DBMS_LOCK"
 id = 4711
+timeout_seconds = 60
+```
+
+A SQLite configuration names the file and the durability settings it requires:
+
+```toml
+[database]
+adapter = "sqlite"
+path = "/srv/orders/orders.db"
+
+[sqlite]
+journal_mode = "wal"        # or "delete"
+synchronous = "full"        # or "extra"
+busy_timeout_ms = 5000
+
+[lock]
+provider = "file"
 timeout_seconds = 60
 ```
 
@@ -618,7 +643,9 @@ itself.
 
 ## 12. Oracle adapter requirements
 
-The MVP uses `python-oracledb`, initially Thin mode where compatible with the tested server and authentication configuration. Thick mode and additional authentication combinations are supported only after appropriate tests. Record actual Python, driver, database release/update, operating system, and architecture in test evidence.
+The MVP uses `python-oracledb`. The driver mode is configured, not inherited: Thin is the default, and `oracle.allow_thick_mode` selects Thick, in which case the adapter loads the Oracle Client libraries itself -- python-oracledb is Thin unless something calls `init_oracle_client`, and a runner that is configured for Thick has to make that call before it connects. Loading is process-wide and cannot be undone, so a second attempt with different directories is a configuration error. The mode in force is read back from the connection: a run that asked for Thick and got Thin, or the reverse, fails rather than proceeding with different libraries, a different network stack and different authentication paths. `oracle.client_lib_dir` names the client directory; the client resolves its own libraries through the dynamic loader, so that directory must also be on the loader's search path. `oracle.config_dir` names where the driver reads `tnsnames.ora`, `sqlnet.ora` and a wallet, in both modes, which is what lets `database.dsn` be a TNS alias. Record actual Python, driver, client library, database release/update, operating system, and architecture in test evidence.
+
+`database.user` may name a proxy-authenticated connect string: `RUNNER[APP_DBA]` authenticates as RUNNER and runs as APP_DBA, and `[APP_DBA]` does the same with external authentication and no connecting user named. After proxy authentication the session user is the *target*, so the target schema defaults to it and `CURRENT_SCHEMA` is compared against it; both halves are held to the identifier rule below. The absence of a password selects external authentication, which python-oracledb provides in Thick mode only, so a run without one requires `oracle.allow_thick_mode`; a password supplied for a connect string that names no connecting user is a contradiction and is refused. Authentication combinations are claimed only where evidence exists: a proxy connect string with a password is covered against a real server, a wallet is not.
 
 Use one physical connection for the run with `autocommit = False`. Establish `COMMIT_WAIT = FORCE_WAIT` before acquiring the migration lock or writing metadata. If the setting fails, fail setup. Read it back when the required view privilege is available; lack of optional read-back must be reported and must not be described as a successful verification.
 
@@ -638,7 +665,7 @@ Bulk DML must default to raising on error rather than silently collecting partia
 
 One more Oracle detail shapes the adapter. Oracle assigns a local transaction id only once a write happens, so `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot answer "am I inside an engine-opened batch": the first write in a batch is often the progress checkpoint itself. The adapter tracks batch state explicitly and keeps `LOCAL_TRANSACTION_ID` for what it does answer correctly, namely whether uncommitted work exists, which is what `ctx.ddl()`'s precondition and the post-return state check need.
 
-## 13. Probe adapters and practical test databases
+## 13. Adapters and practical test databases
 
 ### 13.1 Oracle: primary acceptance target
 
@@ -666,21 +693,25 @@ PostgreSQL tests validate the state machine and PostgreSQL behavior. They do not
 
 Sources: [Official PostgreSQL image](https://hub.docker.com/_/postgres), [PostgreSQL advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS).
 
-### 13.3 SQLite: explicitly limited local probe
+### 13.3 SQLite: supported local-file adapter
 
-Use Python's built-in `sqlite3` and a temporary file per test. This needs no database service and is useful for fingerprints, state validation, CLI behavior, atomic work/history coupling, restartable batching, and progress recovery.
+Use Python's built-in `sqlite3`. This needs no database service, and it is both the fast gate for shared engine behavior -- fingerprints, state validation, CLI behavior, atomic work/history coupling, restartable batching, progress recovery -- and a supported target in its own right.
 
-The adapter name is `sqlite-probe`. It is test/development support, not an Oracle emulator or a production-compatibility claim. Use real SQLite transaction behavior. Do not invent implicit DDL commits to make Oracle tests pass.
+The adapter name is `sqlite`. It is not an Oracle emulator: SQLite success says nothing about Oracle DDL commits, server session locks, or transport failures, and those keep their own gates. Use real SQLite transaction behavior. Do not invent implicit DDL commits to make Oracle tests pass.
 
-To keep exclusion across batch commits, the local POSIX probe may use a process-held advisory file lock associated with the canonical database path. This is an explicit exception to the production adapters' database-backed lock requirement. Hold it for the entire run and never unlink/recreate a live lock file. Only cooperating local processes using the same canonical database file/path convention are supported; network filesystems, aliases/hard-link access, shared in-memory databases, and Windows locking are outside the first probe profile.
+**Supported profile.** One database file on a local filesystem, opened by cooperating processes under the same canonical path, on a POSIX host. Outside it: network filesystems, hard-link or symlink aliases reached under a different canonical path, shared in-memory databases, and Windows locking. State the profile in the capability report and record the tested Python and SQLite library versions, because driver transaction defaults vary by version.
 
-The SQLite connection and lock are owned by the same synchronous process; no background database execution may outlive it. `status` does not take the migration file lock. Use committed reads, a short busy timeout, and optionally WAL for read/write coexistence. WAL setup is a controlled probe-initialization operation, not a side effect of `status` or `validate`.
+**Durability.** The adapter selects the settings rather than inheriting whatever a build or an existing file defaults to, and reads each one back: `journal_mode` is `wal` or `delete` as configured, `synchronous` is `full` or `extra`, foreign keys are enforced, and check constraints are not ignored. FULL is what SQLite documents for a durable WAL commit; EXTRA additionally syncs the directory when a DELETE-mode journal is removed. A setting that does not read back as requested fails the run: proceeding at an unknown durability is what the engine's durable transitions are defined against. There is no setting that weakens this, consistent with §11.4. The journal mode lives in the file, so it is established only by `migrate`, never as a side effect of `status` or `validate`; the connection-level settings are established on every connection.
 
-Do not use `sqlite3.executescript()` as a generic atomic SQL executor; use explicit transaction handling and one-statement execution with tested driver semantics. Record Python and SQLite versions because Python driver transaction defaults vary by configuration/version.
+**Commit outcomes.** An error SQLite raises is a definite rejection: the statement left the transaction open with nothing durable. The exception is a commit that fails on storage. The commit point is the removal of the rollback journal, or the sync of the WAL commit record, and a write, sync or unlink error can be reported either side of it, so the outcome is unknown and the run latches. A busy or locked commit, a deferred constraint, and a refusal made before anything was written do settle it and stay definite.
 
-SQLite success is fast probe evidence. Live Oracle and PostgreSQL suites remain separately reported gates.
+**Exclusion.** To keep exclusion across batch commits, the adapter uses a process-held POSIX advisory file lock associated with the canonical database path. This is an explicit exception to the Oracle and PostgreSQL database-backed lock requirement, and it is why the profile above is limited. Hold it for the entire run and never unlink or recreate a live lock file. The connection and the lock are owned by the same synchronous process; no background database execution may outlive it. `status` does not take the migration file lock. Use committed reads and a short busy timeout.
 
-Source: [SQLite isolation documentation](https://www.sqlite.org/isolation.html).
+Do not use `sqlite3.executescript()` as a generic atomic SQL executor; use explicit transaction handling and one-statement execution with tested driver semantics.
+
+SQLite runs are fast evidence for shared engine behavior. Live Oracle and PostgreSQL suites remain separately reported gates.
+
+Sources: [isolation](https://www.sqlite.org/isolation.html), [synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous), [atomic commit](https://www.sqlite.org/atomiccommit.html), [transaction errors](https://www.sqlite.org/lang_transaction.html), [backup API](https://www.sqlite.org/backup.html).
 
 ## 14. Acceptance evidence
 
@@ -691,7 +722,7 @@ Maintain a checked-in test matrix and an execution report with actual commands, 
 | Level | Purpose | Required evidence |
 |---|---|---|
 | Pure/unit | Manifest validation, canonical fingerprints, paths, lexer, state validation | Deterministic fixtures, including malformed and colliding definitions. |
-| SQLite probe | Fast real transactional and CLI feedback | Actual SQLite files and processes; identified probe limitations. |
+| SQLite | Fast real transactional and CLI feedback, and the SQLite profile itself | Actual SQLite files and processes, in both supported journal modes; real process death at each durable boundary; stated profile limits. |
 | PostgreSQL integration | Session locking and PostgreSQL execution contracts | Real pinned server, driver, concurrent sessions and process failures. |
 | Oracle integration | Primary execution and recovery contract | Real Oracle server, metadata/DDL/PLSQL behavior, lock and commit-failure evidence. |
 | Oracle 19c release gate | Claimed 19c compatibility | Full applicable suite on recorded real 19.x update. |
@@ -707,7 +738,8 @@ Maintain a checked-in test matrix and an execution report with actual commands, 
 7. **Recovery admission:** unchanged retry; changed ACTIVE without flag; wrong/no active id; changed mode rejected even with flag; SQL-to-Python recovery records consistent metadata; original position/first fingerprint preserved; recovery handles states/checkpoints from more than one earlier source version; SUCCESS edits never admitted.
 8. **Concurrency:** deterministic lock contention with zero timeout; a waiter that subsequently succeeds; lock held across DDL and batch commits; dead client with live server session; lock released only after the old session ends; read-only status during a long migration.
 9. **Oracle and SQL details:** correct PL/SQL transaction-id invocation; multiline UPDATE/SET and EXIT WHEN; literals/comments containing slashes and semicolons; correct stored-PLSQL terminators; SQL*Plus unsupported without rejecting valid internal tokens; direct DDL restrictions; synchronous commit session setup; native driver parameter handling; realistic bounded backfill example.
-10. **Inspection:** `validate` and `status` perform no initialization, code import, migration execution, compilation, or SQLite WAL changes; consistent history snapshots; precise uninitialized/damaged distinction; honest optional diagnostics.
+10. **Inspection:** `validate` and `status` perform no initialization, code import, migration execution, database-object recompilation, or SQLite journal-mode changes; consistent history snapshots; precise uninitialized/damaged distinction; honest optional diagnostics.
+11. **Plan lint:** a Python unit that does not compile, in the entry or in a helper, fails `migrate`, `validate` and `validate --offline` before any connection and leaves no metadata; the offline mode connects to nothing, imports nothing, executes nothing and writes no bytecode; a backend refuses a statement it does not admit; an approved plan artifact refuses an edited, reordered or removed published entry and admits appended work.
 
 ### 14.3 Deterministic commit-acknowledgement failures
 
@@ -758,7 +790,7 @@ writing a fourth set of tests that may not cover the same ground.
 
 For each adapter, implemented capabilities and tested capabilities are reported
 separately. An unavailable database environment is a blocked acceptance gate, not
-a reason to certify the engine from the SQLite probe.
+a reason to certify the engine from SQLite alone.
 
 ## 16. Primary technical references
 

@@ -11,21 +11,68 @@ the thing.
 [Write a migration](#write-a-migration) · [Run it](#run-it) ·
 [Read the status](#read-the-status) · [When something fails](#when-something-fails) ·
 [Recovery](#recovery) · [Diagnose](#diagnose-a-failure) ·
-[Teams](#working-in-a-team) · [Deployment](#deployment) · [Reference](#reference)
+[Teams](#working-in-a-team) · [Deployment](#deployment) · [Runbooks](#runbooks) ·
+[Reference](#reference)
 
 ---
 
 ## Install
 
-Requires Python 3.14 or later.
+Requires Python 3.14 or later on a POSIX host. One wheel carries every adapter;
+the extras decide which driver is installed with it.
+
+**On a server.** Install into a virtual environment of its own, from your index
+or proxy, and pin the version:
 
 ```bash
-uv sync --all-extras          # or: pip install '.[oracle,postgres]'
-uv run migr8 --version
+export PIP_INDEX_URL=https://proxy.internal/simple     # your index or proxy
+python3.14 -m venv /opt/migr8
+/opt/migr8/bin/pip install 'migr8[oracle]==<approved-version>'   # Oracle
+/opt/migr8/bin/pip install 'migr8==<approved-version>'           # SQLite only
+/opt/migr8/bin/migr8 --version                                   # self-check
+/opt/migr8/bin/migr8 validate --offline                          # self-check, with a plan
 ```
 
-Drivers are optional extras. `oracle` pulls `python-oracledb`, `postgres` pulls
-`psycopg`, and the SQLite probe needs nothing.
+Give the environment to an account that owns it and let the account that runs
+migrations read and execute it. The runner writes nothing there.
+
+`postgres` is the third extra and pulls `psycopg`. The SQLite adapter needs no
+driver: it uses the standard library. Nothing else is required at run time — no
+checkout, no `uv`, no compiler, no test framework, no linter, and no driver for
+a database you do not use.
+
+Pinning `migr8` alone does not pin what the driver resolves to, so install from
+a dependency set with versions and hashes. Each release publishes one per
+profile, `runtime-base.txt` and `runtime-oracle.txt`, built from the same
+`pyproject.toml` the wheel was:
+
+```bash
+/opt/migr8/bin/pip install --require-hashes -r runtime-oracle.txt
+/opt/migr8/bin/pip install --no-deps 'migr8[oracle]==<approved-version>'
+```
+
+Prefer a wheel. If the index has no wheel for the host architecture, `pip` will
+try to build the driver from source and need a toolchain; treat that as a
+failure of the index rather than a reason to install build tools on the server.
+
+What the runner needs beyond the package: a writable temporary directory (it
+stages every migration there before executing anything), a directory for the
+event log if you enable one, the configuration and manifest, and the database
+password in `MIGR8_PASSWORD`. It never writes inside its own installation.
+
+What the DBA provides, separately and before the first run: the database itself,
+the migration identity, the target schema, its quota, the privileges to create
+the metadata and migration objects, and — on Oracle — `EXECUTE` on the lock
+package plus the agreed lock id. `testenv/` provisions disposable *test*
+databases only; its README excludes shared and production targets, and nothing
+in it belongs in a production installer.
+
+**In a checkout**, for development:
+
+```bash
+uv sync --all-extras
+uv run migr8 --version
+```
 
 ## Configure
 
@@ -35,7 +82,7 @@ migrations, in what order. Neither ever contains a password.
 ```toml
 # migr8.toml
 [database]
-adapter = "oracle"                     # oracle | postgres | sqlite-probe
+adapter = "oracle"                     # oracle | postgres | sqlite
 dsn = "db.internal:1521/ORDERS"
 user = "ORDERS_MIGRATOR"
 target_schema = "ORDERS"               # defaults to the connect user
@@ -44,7 +91,7 @@ target_schema = "ORDERS"               # defaults to the connect user
 ddl_lock_timeout_seconds = 30
 
 [lock]
-provider = "dbms_lock"                 # advisory for PostgreSQL, file for the probe
+provider = "dbms_lock"                 # advisory on PostgreSQL, file on SQLite
 package = "SYS.DBMS_LOCK"
 id = 4711                              # every cooperating runner must use this id
 timeout_seconds = 60
@@ -55,6 +102,32 @@ The password comes from `MIGR8_PASSWORD`, nowhere else:
 ```bash
 export MIGR8_PASSWORD="$(read-from-your-secret-store)"
 ```
+
+On Oracle the `[oracle]` table also selects the driver mode and where the driver
+reads its own configuration:
+
+```toml
+[oracle]
+ddl_lock_timeout_seconds = 30
+allow_thick_mode = false               # Thin is the default
+client_lib_dir = "/opt/oracle/instantclient_23_9"   # Thick only
+config_dir = "/etc/oracle"             # tnsnames.ora, sqlnet.ora, wallet
+```
+
+**Thin or thick.** Thin needs no Oracle client at all. Thick loads the Oracle
+Client libraries, and the runner loads them itself when you ask for it, before it
+connects; the mode is then read back from the connection, so a run configured for
+one and given the other fails instead of quietly using the wrong stack. The
+client resolves its own libraries through the dynamic loader, so the directory in
+`client_lib_dir` must also be on the loader's path — `ldconfig`, or
+`LD_LIBRARY_PATH` in whatever starts the runner. Loading is per process and
+cannot be undone.
+
+**`config_dir`** is `TNS_ADMIN` by another name, and it works in both modes. With
+it, `database.dsn` may be a TNS alias from `tnsnames.ora` rather than
+`host:port/service`. The namespace binding records the schema and the lock id,
+not how you spelled the address, so the same namespace can be reached through an
+alias in one environment and a host and port in another.
 
 Three settings deserve thought:
 
@@ -67,8 +140,44 @@ migration.
 differ from the connect user; the engine sets `CURRENT_SCHEMA` and still qualifies
 its own writes, so migration code cannot redirect them.
 
+**`user`** on Oracle may also be a proxy connect string, which is how a deployment
+separates the identity that proves who is running from the schema that owns the
+objects:
+
+| `database.user` | Authenticates as | Runs as | Password |
+|---|---|---|---|
+| `APP_DBA` | `APP_DBA` | `APP_DBA` | `MIGR8_PASSWORD` |
+| `RUNNER[APP_DBA]` | `RUNNER` | `APP_DBA` | `MIGR8_PASSWORD`, the runner's |
+| `[APP_DBA]` | a wallet | `APP_DBA` | none; needs `allow_thick_mode` |
+
+The target in brackets becomes the session user, so `target_schema` defaults to it
+and nothing sets `CURRENT_SCHEMA`. The database has to permit it:
+`ALTER USER APP_DBA GRANT CONNECT THROUGH RUNNER`. Without a password the run
+authenticates externally through a wallet, which the thin driver cannot do.
+
 **`lock.timeout_seconds`** is how long to wait for another runner to finish. It is
 an operator policy, unrelated to how long a statement may take.
+
+On SQLite the configuration names the file and the durability it requires:
+
+```toml
+[database]
+adapter = "sqlite"
+path = "/srv/orders/orders.db"         # the canonical path every runner opens
+
+[sqlite]
+journal_mode = "wal"                   # or "delete"
+synchronous = "full"                   # or "extra"
+busy_timeout_ms = 5000
+
+[lock]
+provider = "file"                      # <database>.m8lock, held for the whole run
+timeout_seconds = 60
+```
+
+The adapter sets these on the database and reads them back, and refuses to run if
+one does not take effect. `synchronous` has no weaker setting: `off` and `normal`
+do not survive the power loss the durable commits are defined against.
 
 Full examples per engine: [`../examples/`](../examples/).
 
@@ -221,10 +330,11 @@ still defeat them.
 migr8 migrate                      # apply everything pending
 migr8 status                       # what is applied, what is not
 migr8 validate                     # are source and history still consistent
+migr8 validate --offline           # is the plan itself well formed, no database
 ```
 
 Each takes `--config`, `--manifest`, `--log-file` and `--json`; `migrate` also
-takes `--recover ID`.
+takes `--recover ID`, and `validate` takes `--offline` and `--baseline PATH`.
 
 `migrate` does this, in order: load and validate both files; stage every unit into
 a private directory and fingerprint the copies; connect, set up the session and
@@ -235,6 +345,50 @@ Staging means an edit to your working tree after `migrate` starts cannot change
 what runs. Exactly one runner executes at a time, enforced by the database lock —
 a second runner waits, and if it finds nothing left to do it exits 0, which is
 correct and not an error.
+
+### Checking a plan in CI, before any database
+
+`migr8 validate --offline` connects to nothing, reads no password and touches no
+namespace. It checks what the plan can be held to on its own: manifest order,
+identities, paths and fingerprints; the language and mode combinations this
+backend supports; required-object declarations; the statement rules for every SQL
+unit; and that every Python source in every Python unit compiles. It imports
+nothing, executes nothing and writes no bytecode. The report lists what it
+checked, because exit 0 from it is a statement about the plan, not about your
+database.
+
+```bash
+migr8 validate --offline --json > plan.json
+```
+
+Keep the approved `plan.json` as the published plan, and check the next one
+against it:
+
+```bash
+migr8 validate --offline --baseline plan.json
+```
+
+Every entry the approved artifact records must still be at the same position with
+the same id and fingerprint; anything after them is new work. A manifest on its
+own cannot show that a published migration was edited — the unit and its
+fingerprint change together — so this comparison is what holds published identity
+and order in a pipeline. `--baseline` works with plain `validate` too, and is
+checked before it connects.
+
+Three gates, in order, and none replaces another:
+
+| Gate | Command | Answers |
+|---|---|---|
+| Plan lint | `migr8 validate --offline --baseline plan.json` | Is the plan well formed, admissible, and unchanged where it was published? |
+| Rehearsal | `migr8 migrate` against a disposable database of the same engine, from the starting state you expect | Does it actually run? |
+| Target check | `migr8 validate` against the real namespace | Does this database agree with this plan? |
+
+The lint cannot tell you that the SQL is valid on the server, that the privileges
+are there, that the data is what the migration assumes, or that a restartable
+migration converges. An uninitialized target returns exit 6 from `validate`,
+which is the expected answer before the first install, not a failure to suppress.
+Never blanket-ignore a validation failure: the engine's own check, under the
+namespace lock, is the one that decides whether a migration runs.
 
 ## Read the status
 
@@ -429,8 +583,141 @@ Operational notes:
 * There is no client-side statement timeout. Bound long statements with database
   policy: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout`
   on PostgreSQL.
-* Back up the migration metadata with the application data. Total metadata loss is
-  outside automatic recovery, by design.
+* Back up the migration metadata with the application data, and restore them
+  together: they are one consistent pair, and history restored without the
+  objects it describes is worse than neither. On PostgreSQL, `pg_dump -n <schema>`
+  covers both; a namespace restored that way validates and takes the next
+  migration. Total metadata loss is outside automatic recovery, by design.
+
+### Running on SQLite
+
+The supported profile is one database file on a local filesystem, opened by
+cooperating processes under the same canonical path, on a POSIX host. Outside it:
+network filesystems, a symlink or hard link that reaches the same database under
+a different path, shared in-memory databases, and Windows.
+
+* Every runner and every application process must name the **same canonical
+  path**. The namespace lock is a POSIX advisory lock on `<database>.m8lock`
+  beside it, and two paths to one file are two namespaces to this lock.
+* The lock is held by the process for the whole run and released by the kernel
+  when it ends, including when it is killed. A stale lock file is not a held
+  lock, and it is never unlinked while a runner may hold it.
+* `journal_mode` is `wal` or `delete`, and only `migrate` sets it; `status` and
+  `validate` never change the file's mode. Switching mode needs exclusive access,
+  so a run that cannot get it fails rather than proceeding in the other mode.
+* The application can read during a migration in both modes, though a
+  DELETE-mode commit blocks readers for the moment it takes. It cannot write
+  while a batch is open: its writes wait on the migration's lock and fail when
+  its own busy timeout expires. The reverse holds too — an application
+  transaction holding the database fails the migration once `busy_timeout_ms`
+  expires, writing no history, and the next run applies the same migration.
+* **Back up with the database quiesced or through SQLite's backup API**, not by
+  copying the file under a running writer. In WAL mode the `-wal` and `-shm`
+  files are part of the database: a copy of the main file alone can be an old
+  state. Restore the application data and `m8_*` metadata together — they are one
+  consistent pair — and restore to the same canonical path the configuration
+  names.
+
+```bash
+# a consistent copy, taken through SQLite itself
+sqlite3 /srv/orders/orders.db ".backup '/backup/orders-$(date +%F).db'"
+```
+
+## Runbooks
+
+Three procedures, each with the commands, the exits to expect, and what is true
+when it is over. Rehearse them against a disposable database of the same engine
+before using them on anything you care about.
+
+### Initial schema creation
+
+The database and its migration identity already exist; this creates the
+application objects in an empty target namespace. **Owner: the operator running
+the release, with the DBA available.**
+
+1. Confirm the starting state: the target namespace has no application objects
+   this plan creates, and `migr8 status` reports exit 6, "not initialized".
+   Absence of metadata is not proof that nothing was ever migrated — on an
+   existing schema, see below.
+2. Confirm the prerequisites the DBA provides: identity, target schema, quota,
+   privileges, and the lock package and id (Oracle).
+3. Install the approved version into its own environment and record what was
+   installed: `migr8 --version`, and the dependency set you installed from.
+4. Review the configuration: adapter, DSN, target schema, `lock.id`, log path.
+   `lock.id` is recorded on this first run and every later runner must match it.
+5. Lint the plan: `migr8 validate --offline --baseline plan.json` — expect exit 0.
+6. Apply: `MIGR8_PASSWORD=... migr8 migrate --log-file /var/log/migr8/run.jsonl`
+   — expect exit 0 and one `applied <id>` line per migration.
+7. Confirm: `migr8 status` reports every migration SUCCESS, no ACTIVE row, and
+   `migr8 validate` exits 0. Run the application's own checks.
+
+Afterwards: the namespace holds `m8_history`, `m8_progress` and `m8_meta`; the
+binding of adapter, namespace and lock id is recorded and will be enforced; the
+report, the exit code and the event log are retained with the release record.
+
+**Adopting an existing schema** needs a decision before step 1, taken with the
+DBA. There is no baseline and no history repair, so either the first migration is
+written to converge on what is already there, or the schema is rebuilt from the
+plan.
+
+### Routine migration
+
+New migrations, appended after a published prefix that is already applied.
+**Owner: the operator running the release.**
+
+1. The published prefix is unchanged: `migr8 validate --offline --baseline plan.json`
+   passes in CI, on the same artifact you are about to deploy.
+2. The artifact is the reviewed one: the tool and the migrations travel together
+   and cannot change after the build.
+3. Check the target: `migr8 validate` — exit 0. Exit 2 means source and history
+   disagree; exit 6 means this namespace was never initialized and you are on the
+   wrong target or on an initial install; exit 7 means damaged metadata, and
+   nothing should run.
+4. Decide the window: state whether the application may run during this release.
+   The engine does not stop it, and a long backfill contends with it.
+5. Apply, as exactly one supervised job: `migr8 migrate --log-file ...`. A second
+   runner waits for the lock, and exits 0 having found nothing to do; that is
+   correct, not a failure.
+6. Retain the report, the exit code, the run id and the event log.
+7. Confirm: `migr8 status` shows the new migrations SUCCESS and no ACTIVE row.
+
+Afterwards: history is the old prefix plus the new migrations, in order, with no
+ACTIVE row; the approved plan artifact is updated to this plan and re-approved.
+
+### Failure or interruption
+
+**Owner: the operator, escalating to the engineer who wrote the migration and to
+the DBA for anything under exit 7 or 8.**
+
+1. Read the exit code first; [When something fails](#when-something-fails) says
+   what each one means. Collect the report, the run id and the event log lines
+   for that run before anything else touches the database.
+2. **Exit 3**, ordinary failure: an atomic migration rolled back and left no row;
+   a restartable one stayed ACTIVE and resumes from its entry point. Fix the
+   external cause and rerun the same artifact. No flag is needed for an unchanged
+   rerun.
+3. **Exit 4**, unknown outcome: do not rerun blindly and do not retry in the same
+   run — the engine already refused to. Run `migr8 status` and read the durable
+   state; the next ordinary run reconciles from it.
+4. **Exit 5**, lock not acquired: another runner holds the namespace. Contention
+   is not evidence that it has stopped. Find it before doing anything else.
+5. **Exit 7 or 8**, damaged metadata or a contract violation: stop. Neither has an
+   automatic repair, and durable effects may need manual remediation. Escalate.
+6. **A killed or crashed runner** leaves either an ACTIVE restartable migration
+   with its checkpoint, or nothing. On Oracle and PostgreSQL, `status` also
+   reports whether the database session that row records is still present: while
+   it is, that session still holds the namespace lock and the next run waits for
+   it. Rerunning the same artifact is the recovery path; the checkpoint decides
+   where it resumes, and the attempt count on the row increments.
+7. **An amended ACTIVE migration** needs `migr8 migrate --recover ID`, which is a
+   deliberate operator action on an unpublished migration. [Recovery](#recovery)
+   has the rules.
+
+Rehearse one interrupted restartable migration before you need this: apply a
+batched migration against a disposable database, stop the runner between batches,
+and rerun it. Restoring a backup restores the application data *and* the metadata,
+which is the only consistent pair; installing an older version of the tool undoes
+nothing in the database.
 
 ## Reference
 
@@ -439,6 +726,7 @@ Operational notes:
 ```text
 migr8 migrate  [--config PATH] [--manifest PATH] [--recover ID] [--log-file PATH] [--json]
 migr8 validate [--config PATH] [--manifest PATH] [--log-file PATH] [--json]
+               [--offline] [--baseline PATH]
 migr8 status   [--config PATH] [--manifest PATH] [--log-file PATH] [--json]
 ```
 
@@ -468,7 +756,7 @@ immediately after the successful prefix.
 
 ### Adapter differences that affect how you write migrations
 
-| | Oracle | PostgreSQL | sqlite-probe |
+| | Oracle | PostgreSQL | sqlite |
 |---|---|---|---|
 | DDL in atomic mode | no | yes | yes |
 | `require_valid` | supported | refused | refused |
@@ -477,8 +765,17 @@ immediately after the successful prefix.
 | Separate connect user and schema | yes | no | n/a |
 | Parameters | `:name` | `%s` / `%(name)s` | `:name` or `?` |
 
-`sqlite-probe` is for development and tests. It is not an Oracle emulator and
-proves nothing about production behaviour.
+SQLite is a supported target within the profile below, and it is also the fast
+suite for everything the three adapters share. It is not an Oracle emulator: a
+migration that works on SQLite has been shown nothing about Oracle's DDL commits,
+server locks or transport failures.
+
+An adapter name is recorded in `m8_meta` on the first run and checked on every
+later one, so it is part of the namespace binding. The name `sqlite-probe` was
+retired: change `database.adapter` to `sqlite`. A namespace that was initialized
+under the old name is refused by name, and this release has no metadata repair,
+so migrate such a database from its own source of truth rather than editing
+`m8_meta`.
 
 ### Not in this tool, on purpose
 

@@ -8,8 +8,8 @@
 [![license](https://img.shields.io/badge/license-AGPL--3.0%20%7C%20commercial-blue)](LICENSING.md)
 
 An inspectable database migration engine. Oracle is the primary target,
-PostgreSQL is the second adapter, and SQLite is an explicitly limited local
-probe.
+PostgreSQL is the second adapter, and SQLite is a supported local-file target
+within a stated profile.
 
 The `tests` badge covers the whole suite, including the Oracle and PostgreSQL
 adapters running against real servers.
@@ -35,19 +35,24 @@ Command surface:
 
 ```text
 migr8 migrate  [--config PATH] [--manifest PATH] [--recover ID]
-migr8 validate [--config PATH] [--manifest PATH] [--json]
+migr8 validate [--config PATH] [--manifest PATH] [--json] [--offline] [--baseline PATH]
 migr8 status   [--config PATH] [--manifest PATH] [--json]
 ```
+
+`validate --offline` is the plan lint for CI: it checks the manifest, the
+fingerprints, statement admission and Python compilation with no database, no
+secret and no namespace, and `--baseline` holds a published plan to the artifact
+that was approved.
 
 There is no undo, no `clean`, no baseline, no history repair and no forced
 unlock. Those omissions are deliberate.
 
-## Quick start against the SQLite probe
+## Quick start on SQLite
 
 ```bash
 uv sync --all-extras
 uv run migr8 --help
-cd examples/sqlite-probe
+cd examples/sqlite
 uv run migr8 status   --config migr8.toml --manifest manifest.toml
 uv run migr8 migrate  --config migr8.toml --manifest manifest.toml
 uv run migr8 validate --config migr8.toml --manifest manifest.toml
@@ -56,9 +61,9 @@ uv run migr8 validate --config migr8.toml --manifest manifest.toml
 ## Tests
 
 ```bash
-uv run pytest -m "not oracle and not postgres"   # 400 tests, no services needed
+uv run pytest -m "not oracle and not postgres"   # 617 tests, no services needed
 testenv/dbctl.sh up                              # disposable Oracle + PostgreSQL
-testenv/dbctl.sh test                            # all 553, with the databases
+testenv/dbctl.sh test                            # all 777, with the databases
 testenv/dbctl.sh down
 ```
 
@@ -114,14 +119,14 @@ src/migr8/
   diagnostics.py                                   correlation id and event log
   cli.py readonly.py reporting.py                  three commands and their output
   adapters/base.py                                 the contract, the session rules, the operation guard
-  adapters/{oracle,postgres,sqlite_probe}.py       dialect and engine-specific behaviour
+  adapters/{oracle,postgres,sqlite}.py             dialect and engine-specific behaviour
 docs/  examples/  testenv/  deploy/  tests/
 migr8                                              thin entry point for a checkout
 ```
 
 `adapters` imports from the core, and `engine`, `context` and `checks` import
 `adapters.base` for the `Adapter` contract. No core module imports a concrete
-driver: `oracle`, `postgres` and `sqlite_probe` are reached only through
+driver: `oracle`, `postgres` and `sqlite` are reached only through
 `adapters.create`, and the engine contains no engine-specific SQL.
 
 ## Licensing
