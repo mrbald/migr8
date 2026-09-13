@@ -8,6 +8,13 @@
 # engine whose Oracle and PostgreSQL adapters were never run against a server
 # in the release build is not a release candidate, so the whole suite runs here
 # against the same disposable services CI uses, not just the fast tier.
+#
+# The suite runs from the checkout, which is not what an operator installs. The
+# smoke steps below install the built wheel into clean virtual environments that
+# contain nothing else, and run it from outside the source tree: once with no
+# extra against SQLite, and once with the oracle extra against the live server
+# that is still up at that point. The artifacts published afterwards are the
+# ones those steps installed.
 
 name: release
 
@@ -41,8 +48,9 @@ jobs:
           fi
           echo "releasing ${pkg}"
 
-      - run: uv run ruff check src tests testenv
-      - run: uv run ruff format --check src tests testenv
+      # The whole repository, the same scope as the tests workflow and AGENTS.md.
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run mypy
       - run: uv run coverage run -m pytest -q -m "not oracle and not postgres"
       - run: uv run coverage report
@@ -59,18 +67,83 @@ jobs:
             echo "a suite skipped with both services up; not releasing"
             exit 1
           fi
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+
+      # The runtime dependency set for each installable profile, with the exact
+      # versions and hashes this release resolved. Pinning migr8 alone does not
+      # freeze an open-ended driver requirement, so the set is published with it.
+      - name: record the runtime dependency set per profile
+        run: |
+          set -euo pipefail
+          uv pip compile pyproject.toml --generate-hashes -o runtime-base.txt
+          uv pip compile pyproject.toml --extra oracle --generate-hashes -o runtime-oracle.txt
+
+      - name: the base wheel runs the SQLite example from a clean environment
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          work="$(mktemp -d)"
+          cp -r examples/sqlite "$work/example"
+          uv venv --python 3.14 "$work/venv"
+          uv pip install --python "$work/venv/bin/python" "$wheel"
+          # Installed, not imported from the checkout: a source-tree import would
+          # test the repository rather than the artifact.
+          "$work/venv/bin/python" -c 'import migr8; assert "site-packages" in migr8.__file__, migr8.__file__; print(migr8.__file__)'
+          uv pip list --python "$work/venv/bin/python" --format=freeze | tee "$work/installed.txt"
+          if grep -Eiq '^(oracledb|psycopg|pytest|ruff|mypy|coverage)' "$work/installed.txt"; then
+            echo "the base profile installed more than migr8 and its runtime needs"
+            exit 1
+          fi
+          cd "$work/example"
+          "$work/venv/bin/migr8" --version
+          "$work/venv/bin/migr8" validate --offline
+          "$work/venv/bin/migr8" migrate
+          "$work/venv/bin/migr8" validate
+          "$work/venv/bin/migr8" status
+
+      # A schema of its own: the suite above leaves MIGR8_TEST bound to its own
+      # lock id, and the example is configured for another, so reusing it would
+      # fail the binding check by design rather than tell us anything about the
+      # wheel.
+      - name: the oracle wheel runs against the live server from a clean environment
+        env:
+          MIGR8_PASSWORD: migr8_ora_test
+          ORACLE_TEST_USER: MIGR8_SMOKE
+          ORACLE_TEST_PASSWORD: migr8_ora_test
+        run: |
+          set -euo pipefail
+          uv run testenv/provision_oracle.py
+          wheel="$(ls dist/*.whl)"
+          work="$(mktemp -d)"
+          cp -r examples/oracle "$work/example"
+          sed -i 's/MIGR8_TEST/MIGR8_SMOKE/g' "$work/example/migr8.toml"
+          uv venv --python 3.14 "$work/venv"
+          uv pip install --python "$work/venv/bin/python" "${wheel}[oracle]"
+          uv pip list --python "$work/venv/bin/python" --format=freeze | tee "$work/installed.txt"
+          grep -qi '^oracledb' "$work/installed.txt"
+          if grep -qi '^psycopg' "$work/installed.txt"; then
+            echo "the oracle profile pulled the PostgreSQL driver"
+            exit 1
+          fi
+          cd "$work/example"
+          "$work/venv/bin/migr8" validate --offline
+          "$work/venv/bin/migr8" migrate
+          "$work/venv/bin/migr8" validate
+          "$work/venv/bin/migr8" status
+
       - name: stop the services
         if: always()
         run: testenv/dbctl.sh destroy
 
-      - run: uv build
-      - run: uvx twine check --strict dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: |
             dist/
             versions.txt
+            runtime-base.txt
+            runtime-oracle.txt
 
   publish:
     needs: build
@@ -114,9 +187,12 @@ jobs:
             echo '```'
             cat versions.txt
             echo '```'
+            echo
+            echo "The attached runtime-*.txt files are the resolved runtime"
+            echo "dependency set for each installable profile, with hashes."
           } > notes.md
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file notes.md \
             --generate-notes \
-            dist/*
+            dist/* runtime-base.txt runtime-oracle.txt

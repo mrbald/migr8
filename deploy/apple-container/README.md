@@ -7,9 +7,12 @@ Compose.
 It is the realistic production shape: migrations are a job that runs once,
 alongside the database, from an image whose contents are fixed.
 
-Verified on this machine. **The run predates the current `ctl.sh` and
-`Containerfile` and has not been repeated against them**, so the table is
-evidence about the runtime rather than about the files as they stand:
+Verified on this machine. **The database runs predate the current `ctl.sh` and
+`Containerfile` and have not been repeated against them**, so the table is
+evidence about the runtime rather than about the files as they stand. One part
+has been rechecked: on 2026-09-13, with `container` CLI 1.4.1, the image builds
+from the current `Containerfile` and a job run with the event-log mount leaves
+`run.jsonl` on the host after the container is removed.
 
 | Component | Version |
 |---|---|
@@ -32,7 +35,8 @@ deploy/apple-container/ctl.sh migrate oracle
 deploy/apple-container/ctl.sh status  oracle
 deploy/apple-container/ctl.sh migrate postgres
 deploy/apple-container/ctl.sh validate postgres
-deploy/apple-container/ctl.sh destroy   # remove the containers and generated configs
+deploy/apple-container/ctl.sh runlog     # the job's event log, kept on the host
+deploy/apple-container/ctl.sh destroy    # remove the containers and generated configs
 ```
 
 `ctl.sh` only ever touches names beginning `migr8-ac-`, plus the
@@ -52,20 +56,25 @@ COPY examples ./examples       # the migrations
 That is deliberate. Fingerprints exist to pin what was executed, so the
 migration tree must not be able to change after the image is built. Mounting
 migrations from the host would reintroduce exactly the drift the fingerprint is
-there to catch. The only thing mounted at run time is the generated
-configuration, and the only thing passed in the environment is the password:
+there to catch. Two things are mounted at run time: the generated
+configuration, and a host directory for the event log. The only thing passed in
+the environment is the password:
 
 ```bash
 container run --rm \
   --volume "$GEN:/etc/migr8" \
+  --volume "$GEN/runs:/var/log/migr8" \
   --env "MIGR8_PASSWORD=..." \
   migr8-runner:local \
   migrate --config /etc/migr8/oracle.toml --manifest /opt/migr8/examples/oracle/manifest.toml
 ```
 
 The image runs as an unprivileged user and contains no credential. Its event log
-goes to `/var/log/migr8/run.jsonl` via `MIGR8_LOG_FILE`; mount that path to
-keep the log after the job exits.
+goes to `/var/log/migr8/run.jsonl` via `MIGR8_LOG_FILE`, and the job container is
+removed when it exits, so that path is mounted from the host: the log outlives
+the container in `generated/runs/run.jsonl`, and `ctl.sh runlog` prints it. The
+job runs as uid 10001, so `ctl.sh` opens that directory to it; a deployment
+mounts a directory its own runner owns.
 
 ## Three runtime behaviours worth knowing
 
