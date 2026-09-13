@@ -1,18 +1,26 @@
 # migr8
 
-An experimental, inspectable database migration engine. Oracle is the primary
-target, PostgreSQL is the second adapter, and SQLite is an explicitly limited
-local probe.
+[![tests](https://github.com/mrbald/migr8/actions/workflows/ci.yml/badge.svg)](https://github.com/mrbald/migr8/actions/workflows/ci.yml)
+[![vulnerabilities](https://github.com/mrbald/migr8/actions/workflows/audit.yml/badge.svg)](https://github.com/mrbald/migr8/actions/workflows/audit.yml)
+[![secrets](https://github.com/mrbald/migr8/actions/workflows/secrets.yml/badge.svg)](https://github.com/mrbald/migr8/actions/workflows/secrets.yml)
+[![PyPI](https://img.shields.io/pypi/v/migr8)](https://pypi.org/project/migr8/)
+[![Python](https://img.shields.io/pypi/pyversions/migr8)](https://pypi.org/project/migr8/)
+[![license](https://img.shields.io/badge/license-AGPL--3.0%20%7C%20commercial-blue)](LICENSING.md)
 
-**Status: experimental.** See [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) for what
-has actually been tested and which acceptance gates are still open. Fast tests
-passing is not a production-readiness claim.
+An inspectable database migration engine. Oracle is the primary target,
+PostgreSQL is the second adapter, and SQLite is an explicitly limited local
+probe.
+
+The `tests` badge covers the whole suite, including the Oracle and PostgreSQL
+adapters running against real servers.
+[`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) records what each tier proves and
+which gates are open.
 
 | Document | What it is for |
 |---|---|
 | [`docs/MANUAL.md`](docs/MANUAL.md) | **Start here.** Install, configure, write a migration, run it, recover, diagnose. |
 | [`docs/SPEC.md`](docs/SPEC.md) | The maintained specification: the protocol and its guarantees. |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture review: ranked findings and the decision taken on each. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module layering, what each adapter owns, and the standing design positions. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | What was tested, against which versions, and which gates are open. |
 | [`deploy/apple-container/`](deploy/apple-container/) | Running the migration job as a container under Apple's `container` runtime. |
 
@@ -48,15 +56,18 @@ uv run migr8 validate --config migr8.toml --manifest manifest.toml
 ## Tests
 
 ```bash
-uv run pytest -m "not oracle and not postgres"   # 315 tests, no services needed
+uv run pytest -m "not oracle and not postgres"   # 331 tests, no services needed
 testenv/dbctl.sh up                              # disposable Oracle + PostgreSQL
-testenv/dbctl.sh test                            # all 460, with the databases
+testenv/dbctl.sh test                            # all 476, with the databases
 testenv/dbctl.sh down
 ```
 
 `tests/test_adapter_contract.py` is one contract suite run against every
 configured adapter, so adding an adapter means filling in a dialect and running
 it rather than writing a new test file.
+
+The same gates run in CI on every push and pull request, the live-database job
+included.
 
 ## Diagnosing a failure
 
@@ -101,3 +112,9 @@ migr8                                              thin entry point for a checko
 
 The dependency direction is one-way: adapters import from the core, never the
 reverse, and the engine contains no engine-specific SQL.
+
+## Licensing
+
+AGPL-3.0-only ([LICENSE](LICENSE)), with commercial licenses available
+separately ([COMMERCIAL.md](COMMERCIAL.md)). The model and the dependency audit
+behind it are in [LICENSING.md](LICENSING.md).

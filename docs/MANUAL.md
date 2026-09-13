@@ -3,9 +3,9 @@
 `migr8` applies one ordered sequence of migrations to one database namespace.
 It has three commands and no undo.
 
-Status: **experimental**. See [`ACCEPTANCE.md`](ACCEPTANCE.md) for what has
-actually been tested. The specification is [`SPEC.md`](SPEC.md); this manual is
-how to use the thing.
+[`ACCEPTANCE.md`](ACCEPTANCE.md) records what has been tested and against which
+versions. The specification is [`SPEC.md`](SPEC.md); this manual is how to use
+the thing.
 
 **Contents** — [Install](#install) · [Configure](#configure) ·
 [Write a migration](#write-a-migration) · [Run it](#run-it) ·

@@ -11,8 +11,10 @@ name: migr8-testenv
 
 services:
   oracle:
-    # Oracle Database Free. This exercises the implementation on this release;
-    # it does not certify Oracle 19c.
+    # Oracle Database Free 23ai: the only Oracle release distributed as a freely
+    # redistributable image, and therefore the one the suite runs against. The
+    # digest is a multi-architecture index, so CI on linux/amd64 and a developer
+    # on arm64 test against the same pinned release.
     image: gvenzl/oracle-free:23.9-slim@sha256:945400df5e3fc9589db628223385f906e1024932dc3b72e118fc4fcd0f0e9bbb
     container_name: migr8-oracle
     environment:

@@ -1,9 +1,8 @@
 """Run diagnostics: a correlation id and an append-only event log.
 
-A migration failure is often diagnosed after the fact, by someone who was not
-watching the terminal. What they need is the order things happened in, how long
-each step took, which identity and fingerprint were involved, and the exact
-phase that failed. That is what this module records.
+Records the order things happened in, how long each step took, which identity
+and fingerprint were involved, and the phase that failed -- what a failure
+diagnosed after the fact needs.
 
 Design rules:
 

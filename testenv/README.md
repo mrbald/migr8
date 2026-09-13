@@ -56,8 +56,10 @@ creates three users, dropping any previous copies first:
   privileges and `DBMS_LOCK`, but deliberately *not* `V$SESSION`, so the
   unprivileged diagnostic path is exercised too.
 
-Oracle Free exercises the implementation on its own release. It does not certify
-Oracle 19c; see [`../docs/ACCEPTANCE.md`](../docs/ACCEPTANCE.md).
+Oracle Database Free 23ai is the only Oracle release available as a freely
+redistributable container image, so it is the Oracle this project's tests and CI
+run against. Results are results on that release; see
+[`../docs/ACCEPTANCE.md`](../docs/ACCEPTANCE.md).
 
 ## PostgreSQL schema
 

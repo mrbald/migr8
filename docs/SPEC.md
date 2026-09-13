@@ -1,18 +1,10 @@
-# migr8 - Specification v6.1 (maintained)
+# migr8 - Specification v6.1
 
-Status: maintained specification for an experimental MVP, kept in step with the
-implementation in `src/migr8/`. It supersedes earlier drafts in full. No
-database version is certified by this document alone.
+The maintained specification, kept in step with the implementation in
+`src/migr8/`. No database version is certified by this document alone.
 
-This revision records the implementation as built and tested. Every substantive
-change made while implementing v6 is marked **[v6.1]** inline and collected in
-Section 17. Nothing in Section 17 weakens history integrity, recovery
-boundaries, or the declared scope; changes that would have done so were not
-made.
-
-Acceptance evidence, including which gates are still open, is in
-[`ACCEPTANCE.md`](ACCEPTANCE.md). The originating handover is kept verbatim in
-[`HANDOVER.md`](HANDOVER.md).
+Acceptance evidence, including which gates are open, is in
+[`ACCEPTANCE.md`](ACCEPTANCE.md).
 
 The primary target is Oracle. PostgreSQL is the second database adapter and a useful comparison target. SQLite is an explicitly limited local probe adapter. Their different roles are specified in §13.
 
@@ -171,7 +163,7 @@ Paths use `/`, have no empty, `.` or `..` components, and contain no backslashes
 
 Files are read in binary with no newline or whitespace normalization. The migrations tree must use a consistent Git line-ending policy, for example a root `.gitattributes` containing `* -text` or `* text eol=lf`.
 
-Only regular files and directories are accepted. No ignore list applies. Symlinks and special files are rejected. `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, and `.mypy_cache` within units are errors. **[v6.1]** `*.pyo` is included for the same reason as `*.pyc`. Empty units and missing/non-file entries are errors. Set `sys.dont_write_bytecode = True` before importing migrations.
+Only regular files and directories are accepted. No ignore list applies. Symlinks and special files are rejected. `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, and `.mypy_cache` within units are errors. `*.pyo` is included for the same reason as `*.pyc`. Empty units and missing/non-file entries are errors. Set `sys.dont_write_bytecode = True` before importing migrations.
 
 ### 4.3 Staging
 
@@ -205,7 +197,7 @@ Immediately before inserting SUCCESS, read the id without creating a transaction
 
 Other adapters must either provide an appropriate guard or state their supported enforcement boundary. SQLite's native transaction state and PostgreSQL's driver/server transaction facilities are adapter concerns; do not copy Oracle SQL into the core.
 
-**[v6.1]** The implemented boundaries are:
+The other two adapters' boundaries are:
 
 - **PostgreSQL** has a real transaction-identity tripwire. `pg_current_xact_id()` assigns and returns the identity; `pg_current_xact_id_if_assigned()` reads it without assigning one. A commit inside the migration leaves a transaction with no assigned identity, which the check detects. PostgreSQL additionally refuses `COMMIT` inside a `DO` block running in an explicit transaction, so most violations never reach the tripwire at all.
 - **The SQLite probe** has no server transaction identity. Its stated enforcement boundary is facade statement admission plus SQLite's native `in_transaction` state and an adapter-owned transaction epoch, incremented on every begin, commit, and rollback the adapter performs. A commit reachable only through the facade therefore changes the epoch and is detected; effects reachable some other way are not claimed to be detectable.
@@ -232,11 +224,11 @@ The adapter owns SQL execution. A `.sql` file contains one database statement or
 
 Use an Oracle-aware lexical scanner for leading tokens and terminators. It must preserve literal contents and recognize line comments, non-nested block comments, escaped single quotes, quoted identifiers, and supported Oracle alternative/national string forms. If a form cannot be classified safely, reject it with a specific unsupported-syntax error.
 
-**[v6.1]** The scanner also recognizes PostgreSQL dollar quoting, `$$ ... $$` and `$tag$ ... $tag$`. Without it the PostgreSQL adapter could not accept a `DO` block at all, because the semicolons inside the body would read as statement separators. Oracle input is unaffected: Oracle never opens a token with `$`, which appears only inside identifiers such as `V$SESSION` and is still scanned as one word. An opening tag with no matching closing tag is an unterminated literal and is rejected rather than guessed at.
+The scanner also recognizes PostgreSQL dollar quoting, `$$ ... $$` and `$tag$ ... $tag$`. Without it the PostgreSQL adapter could not accept a `DO` block at all, because the semicolons inside the body would read as statement separators. Oracle input is unaffected: Oracle never opens a token with `$`, which appears only inside identifiers such as `V$SESSION` and is still scanned as one word. An opening tag with no matching closing tag is an unterminated literal and is rejected rather than guessed at.
 
 For an Oracle non-PL/SQL statement, remove at most one trailing SQL terminator outside comments/literals. Preserve PL/SQL's final semicolon. A final standalone `/` outside literals/comments may be accepted solely as an end-of-file convenience; it is not a statement separator.
 
-**[v6.1]** Two further rules make "not a separator" concrete. After the optional trailing terminator is removed, a remaining bare `;` outside comments and literals in a non-PL/SQL statement means the file holds more than one statement, and is rejected. A standalone `/`, meaning one alone on its line, anywhere other than at the very end is rejected as a separator attempt rather than split on. Division never occupies a line by itself, so valid arithmetic is unaffected. `CREATE LIBRARY` is not a PL/SQL body and must not be classified as one merely because it creates an object. Use exact tested grammar for identifying stored PL/SQL definitions.
+Two further rules make "not a separator" concrete. After the optional trailing terminator is removed, a remaining bare `;` outside comments and literals in a non-PL/SQL statement means the file holds more than one statement, and is rejected. A standalone `/`, meaning one alone on its line, anywhere other than at the very end is rejected as a separator attempt rather than split on. Division never occupies a line by itself, so valid arithmetic is unaffected. `CREATE LIBRARY` is not a PL/SQL body and must not be classified as one merely because it creates an object. Use exact tested grammar for identifying stored PL/SQL definitions.
 
 Apply the same normalization to SQL entries and SQL text passed through the Python facade, including `ctx.sql()` results. Python parameters use the native adapter's driver binding convention. SQL entry files have no parameter binding or substitution.
 
@@ -269,7 +261,7 @@ Existence alone also does not establish intended columns, indexes, constraints, 
 
 | Transition | Transaction contents | Recovery after lost acknowledgement |
 |---|---|---|
-| Metadata object created **[v6.1]** | One metadata object's creation | Inspect which objects exist and complete the permitted prefix under Section 8.4. |
+| Metadata object created | One metadata object's creation | Inspect which objects exist and complete the permitted prefix under Section 8.4. |
 | Initialization complete | The `m8_meta` singleton row, after metadata objects have been created and verified | Inspect marker, object definitions, and existing rows under the lock. |
 | Atomic completion | Supported migration work plus one SUCCESS row | SUCCESS present: validate and skip. Absent after exclusive reacquisition: retry compliant work. |
 | Restartable admission | ACTIVE creation, or its attempt/accepted-definition update | No code runs until acknowledged. A later run inspects ACTIVE and admits a new attempt. |
@@ -278,7 +270,7 @@ Existence alone also does not establish intended columns, indexes, constraints, 
 
 Oracle metadata-object creation and migration DDL can commit independently. They are governed by recoverable initialization and restartable execution, respectively, not disguised as history-only transactions.
 
-**[v6.1]** The two initialization transitions are named separately because they recover differently and because an acceptance harness must be able to target each one. Object creation is `metadata_object_created`; the marker is `initialization_complete`. On Oracle each object's `CREATE` commits implicitly, so only the marker carries an engine-issued commit. On PostgreSQL and the SQLite probe each object is created in its own explicit transaction.
+The two initialization transitions are named separately because they recover differently and because an acceptance harness must be able to target each one. Object creation is `metadata_object_created`; the marker is `initialization_complete`. On Oracle each object's `CREATE` commits implicitly, so only the marker carries an engine-issued commit. On PostgreSQL and the SQLite probe each object is created in its own explicit transaction.
 
 ### 7.2 Failure handling
 
@@ -290,7 +282,7 @@ A known server rejection of a statement is distinct from communication loss. Und
 
 Do not label an operation non-committing solely because its first token passed a lexical allow-list; routines and indirect effects require the trusted-author contract. Driver error allow-lists must be narrow and justified by driver behavior. Unclassified communication failures are unknown.
 
-**[v6.1]** A driver-side refusal raised *before* anything is submitted is as definite as a server rejection: no durable effect is possible. The implementation therefore treats an outcome as definite in exactly these cases, and everything else, including an unrecognized exception or an unlisted driver code, as unknown:
+A driver-side refusal raised *before* anything is submitted is as definite as a server rejection: no durable effect is possible. The implementation therefore treats an outcome as definite in exactly these cases, and everything else, including an unrecognized exception or an unlisted driver code, as unknown:
 
 - **Oracle:** an `ORA-` error number returned by the server that is not in the adapter's transport-failure list, or a driver code in the adapter's enumerated client-side list. An unlisted `DPY-` code stays unknown on purpose.
 - **PostgreSQL:** a SQLSTATE outside class `08`, the connection-exception class. A `psycopg` error with no SQLSTATE is unknown unless it is a `ProgrammingError` or `NotSupportedError`, which are raised client-side.
@@ -300,7 +292,7 @@ An unknown batch outcome may be caught by user code accidentally. The facade mus
 
 A dead client may leave a live server session executing its submitted call. A fresh runner proceeds only after acquiring the lock, not after observing that the previous operating-system process has disappeared.
 
-**[v6.1]** An interruption counts as a communication failure when it lands inside a commit-capable call. Ctrl-C, `SIGTERM` and `SIGHUP` during a commit leave exactly the same doubt as a lost acknowledgement: the request may already be durable. The implementation therefore latches the run as unknown, discards the connection without further SQL, and exits 4. An interruption *outside* such a call is an ordinary failure: uncommitted work is rolled back, a restartable migration stays ACTIVE, and the exit code is 3.
+An interruption counts as a communication failure when it lands inside a commit-capable call. Ctrl-C, `SIGTERM` and `SIGHUP` during a commit leave exactly the same doubt as a lost acknowledgement: the request may already be durable. The implementation therefore latches the run as unknown, discards the connection without further SQL, and exits 4. An interruption *outside* such a call is an ordinary failure: uncommitted work is rolled back, a restartable migration stays ACTIVE, and the exit code is 3.
 
 `SIGTERM` must be handled explicitly for this to hold, because the default disposition ends the process with no unwinding at all. A runner that can be stopped by a supervisor or an orchestrator must install a handler, or a stop during a commit abandons the session with nothing recorded.
 
@@ -312,7 +304,7 @@ All cooperating runners for a namespace must contend on the same lock. The lock 
 
 For Oracle use `DBMS_LOCK.REQUEST` with exclusive mode and `release_on_commit => FALSE`, through the real package or a documented wrapper. An explicitly configured integer in `0..1073741823` is recorded in `m8_meta`. All subsequent runs verify that binding before migration work. Wrong bindings fail; the runner does not switch locks mid-run.
 
-**[v6.1]** The recorded binding is the lock id alone, rendered `dbms_lock:<id>` for Oracle and `advisory:<id>` for PostgreSQL. `DBMS_LOCK` user locks are global by id, so a documented wrapper package is an access path rather than a different lock namespace. Recording the package name would make a wrapper change look like a binding mismatch while two runners were in fact contending on the same lock. The provider is recorded separately in `lock_provider`, and the configured package name is still validated as an identifier before being used to build SQL.
+The recorded binding is the lock id alone, rendered `dbms_lock:<id>` for Oracle and `advisory:<id>` for PostgreSQL. `DBMS_LOCK` user locks are global by id, so a documented wrapper package is an access path rather than a different lock namespace. Recording the package name would make a wrapper change look like a binding mismatch while two runners were in fact contending on the same lock. The provider is recorded separately in `lock_provider`, and the configured package name is still validated as an identifier before being used to build SQL.
 
 Return codes: 0 means acquired; 1 timeout and 2 deadlock mean exit 5; 3 parameter error and 5 illegal handle mean configuration failure; 4 already owned is an internal lifecycle error. Acquire once per run. Release once on normal exit, and close the physical session. Never release a lock through another connection after losing the owning session.
 
@@ -341,7 +333,7 @@ Adapters implement the following fixed logical objects. Physical SQL types are a
 
 Enforce primary-key and position uniqueness, valid state/mode/language values, positive positions, and at most one ACTIVE row. ACTIVE must imply restartable. Enforce appropriate nullability for timestamps and counters. An Oracle function-based unique index on `CASE WHEN status = 'ACTIVE' THEN 1 END` is an appropriate one-active constraint.
 
-**[v6.1]** Two physical details follow from the target engines.
+Two physical details follow from the target engines.
 
 `MODE` is an Oracle reserved word. The Oracle column is created and referenced as `"MODE"`, because an unquoted `mode` raises ORA-03050, and its bind placeholder is named `exec_mode`, because a `:mode` placeholder raises ORA-01745. It still appears as `MODE` in the data dictionary, so definition validation is unaffected.
 
@@ -361,7 +353,7 @@ For Oracle, use `ALL_*` views filtered by exact target owner, even when the conn
 
 After reading a consistent snapshot, validate consecutive positions, exact successful prefix, stored language/mode consistency, active position/id/mode, fingerprint formats, row-state consistency, and progress ownership. A database primary key does not by itself make an identity immutable; immutability is also a runner update rule.
 
-**[v6.1]** These checks split across two exit codes, because they mean different things to an operator.
+These checks split across two exit codes, because they mean different things to an operator.
 
 Exit 7, metadata damaged: the rows are internally inconsistent, or use an unsupported layout or fingerprint format. No manifest could make them valid. Examples are a position gap, two ACTIVE rows, an ACTIVE row recorded as atomic, an ACTIVE row with no attempt count, a SUCCESS row with no completion time, an atomic SUCCESS row carrying an attempt count, a stored fingerprint in an unknown format, and progress attached to a SUCCESS row or to an unrelated identity.
 
@@ -413,7 +405,7 @@ The runtime and dependency environment must be pinned for repeatable deployment.
 | `ctx.query(sql, params=None)` | One query; a list of tuples in selected-column order. |
 | `ctx.sql(relative_path)` | Read text from a regular SQL file within the staged unit; reject absolute/traversing/escaping paths. |
 | `ctx.log(message, **fields)` | Structured log correlated with this run and migration; exclude secrets. |
-| `ctx.transaction()` | Restartable only; non-nested batch context yielding the same facade, commits on clean exit, rolls back on ordinary failure. **[v6.1]** It returns an explicit context-manager object rather than a generator-based one, so a batch entered and never exited is deterministically detectable instead of being silently rolled back by garbage collection. |
+| `ctx.transaction()` | Restartable only; non-nested batch context yielding the same facade, commits on clean exit, rolls back on ordinary failure. It returns an explicit context-manager object rather than a generator-based one, so a batch entered and never exited is deterministically detectable instead of being silently rolled back by garbage collection. |
 | `ctx.ddl(sql)` | Restartable only; one admitted DDL statement outside a batch and with no open transaction. |
 | `ctx.progress.get(key, default=None)` | Restartable only; stored string or the supplied default when absent. |
 | `ctx.progress.set(key, value)` | Restartable only, inside its current batch transaction; never commits independently. |
@@ -500,7 +492,7 @@ migr8 migrate [--config PATH] [--manifest PATH] [--recover ID]
 
 All structural and fingerprint errors must be found before migration execution. SQL syntax/semantic errors requiring execution, unavailable external dependencies, and migration-specific final-state failures may still occur later. Do not claim that preflight establishes every pending migration will succeed.
 
-**[v6.1]** Preflight covers every unit in the manifest, not only the pending suffix, because step 1 happens before any history is read. One consequence is recorded deliberately: if a future change to the lexical scanner rejected a form an already-successful migration uses, `migrate` would fail with exit 2 even though the database state is sound. A published migration's source cannot change, so only a tool change can cause this, and failing loudly is preferred to skipping checks on the part of the manifest that defines the successful prefix.
+Preflight covers every unit in the manifest, not only the pending suffix, because step 1 happens before any history is read. One consequence is recorded deliberately: if a future change to the lexical scanner rejected a form an already-successful migration uses, `migrate` would fail with exit 2 even though the database state is sound. A published migration's source cannot change, so only a tool change can cause this, and failing loudly is preferred to skipping checks on the part of the manifest that defines the successful prefix.
 
 A waiting runner may acquire the lock after another runner has finished, validate, find no pending work, and exit successfully. This is correct, not a lock-test failure.
 
@@ -513,7 +505,7 @@ migr8 status   [--config PATH] [--manifest PATH] [--json]
 
 Both are read-only application operations: no metadata creation, staging, imports, migration SQL, recompilation, or migration lock. Use a short consistent metadata read; a single query where feasible, otherwise a read-only/snapshot transaction implemented by the adapter. Do not hold it open while waiting for user input.
 
-**[v6.1]** For Oracle the single query is not merely preferred, it is required. A `SET TRANSACTION READ ONLY` snapshot that reads a table whose definition changed in the same second raises ORA-01466. That happens on every run which has just created metadata or executed migration DDL, which is exactly the long migration `status` exists to observe. The Oracle adapter therefore reads history, progress, and the marker in one `UNION ALL` statement, which is read-consistent in Oracle without a transaction. PostgreSQL uses `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` and the SQLite probe uses `BEGIN DEFERRED`; neither has that restriction.
+For Oracle the single query is not merely preferred, it is required. A `SET TRANSACTION READ ONLY` snapshot that reads a table whose definition changed in the same second raises ORA-01466. That happens on every run which has just created metadata or executed migration DDL, which is exactly the long migration `status` exists to observe. The Oracle adapter therefore reads history, progress, and the marker in one `UNION ALL` statement, which is read-consistent in Oracle without a transaction. PostgreSQL uses `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` and the SQLite probe uses `BEGIN DEFERRED`; neither has that restriction.
 
 An uninitialized compatible namespace is reported distinctly. Missing objects after completed initialization, incompatible definitions, orphaned rows, or invalid history are damage/validation failures. Missing access privileges are not evidence of uninitialized state.
 
@@ -525,7 +517,7 @@ Status remains useful during a long migration. Oracle and PostgreSQL should retu
 
 Session-liveness diagnostics are optional and separate from the consistent history snapshot. A session match requires a full usable identity, not a reusable SID alone; include Oracle instance/SID/serial information where available. Without adequate privileges, report unknown. Session existence is not proof that the migration is currently executing or holding the lock.
 
-### 11.3a Run diagnostics **[v6.1]**
+### 11.3a Run diagnostics
 
 A failure is usually diagnosed later, by someone who was not watching. The
 implementation therefore provides three things, none of which changes the
@@ -600,7 +592,7 @@ The MVP uses `python-oracledb`, initially Thin mode where compatible with the te
 
 Use one physical connection for the run with `autocommit = False`. Establish `COMMIT_WAIT = FORCE_WAIT` before acquiring the migration lock or writing metadata. If the setting fails, fail setup. Read it back when the required view privilege is available; lack of optional read-back must be reported and must not be described as a successful verification.
 
-**[v6.1]** Oracle exposes no session-level read-back for `COMMIT_WAIT`. `V$PARAMETER` reports the instance value, which a session setting overrides. The adapter therefore reports the setting as NOT VERIFIED at session level in its capability notes, records the instance value when `V$PARAMETER` is readable, and says so when it is not. The `ALTER SESSION` itself is still required to succeed, and `COMMIT_LOGGING = IMMEDIATE` is set alongside it. PostgreSQL does support a real session read-back, and its adapter requires `SHOW synchronous_commit` to return `on` after setting it.
+Oracle exposes no session-level read-back for `COMMIT_WAIT`. `V$PARAMETER` reports the instance value, which a session setting overrides. The adapter therefore reports the setting as NOT VERIFIED at session level in its capability notes, records the instance value when `V$PARAMETER` is readable, and says so when it is not. The `ALTER SESSION` itself is still required to succeed, and `COMMIT_LOGGING = IMMEDIATE` is set alongside it. PostgreSQL does support a real session read-back, and its adapter requires `SHOW synchronous_commit` to return `on` after setting it.
 
 Prohibit migration changes to required session settings. Disable transparent reconnect and replay for this runner. Transaction Guard is compatible with Oracle's continuity features, but integrating either is outside this MVP's recovery path.
 
@@ -614,7 +606,7 @@ Oracle DDL is restartable, including single-statement DDL. A plain CREATE that e
 
 Bulk DML must default to raising on error rather than silently collecting partial row errors. Engine batch rollback and progress coupling must be verified against Oracle. Partial effects inside permitted restartable procedural calls remain author-owned recovery states.
 
-**[v6.1]** One more Oracle detail shapes the adapter. Oracle assigns a local transaction id only once a write happens, so `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot answer "am I inside an engine-opened batch": the first write in a batch is often the progress checkpoint itself. The adapter tracks batch state explicitly and keeps `LOCAL_TRANSACTION_ID` for what it does answer correctly, namely whether uncommitted work exists, which is what `ctx.ddl()`'s precondition and the post-return state check need.
+One more Oracle detail shapes the adapter. Oracle assigns a local transaction id only once a write happens, so `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot answer "am I inside an engine-opened batch": the first write in a batch is often the progress checkpoint itself. The adapter tracks batch state explicitly and keeps `LOCAL_TRANSACTION_ID` for what it does answer correctly, namely whether uncommitted work exists, which is what `ctx.ddl()`'s precondition and the post-return state check need.
 
 ## 13. Probe adapters and practical test databases
 
@@ -699,11 +691,11 @@ Apply the two branches separately to initialization completion, ACTIVE admission
 
 Use hooks or a test wrapper that actually obtains a successful server commit and then suppresses acknowledgement only where its evidentiary scope is stated. Keep transport-level failures separate from wrapper simulations. Test hooks must not be accidentally activatable by normal deployment configuration.
 
-## 15. Implementation boundaries and first milestone
+## 15. Implementation boundaries
 
 Keep a small separation between manifest/fingerprint/staging, pure state validation, execution orchestration, database adapters, and CLI/reporting. No plugin discovery framework, ORM, distributed job system, or universal SQL AST is required.
 
-**[v6.1]** The separation runs *through* the adapter layer as well, and the line is between rule and dialect. Every rule this specification states belongs in the shared adapter base and must exist exactly once:
+The separation runs *through* the adapter layer as well, and the line is between rule and dialect. Every rule this specification states belongs in the shared adapter base and must exist exactly once:
 
 - which columns an attempt or completion update may touch, and which are permanent;
 - that an affected-row count other than one is metadata damage;
@@ -717,20 +709,17 @@ Metadata *inspection* stays per-adapter, because dictionary views differ in
 substance rather than in spelling, and forcing them together would obscure all of
 them.
 
-Two consequences were load-bearing in practice. Engine transaction state must be
-tracked by the adapter base rather than inferred from the database, because Oracle
-assigns a local transaction id only on first write, so "is there uncommitted work"
-and "am I inside an engine-opened transaction" are different questions with
-different answers. And a conformance suite run against every adapter is part of
-the deliverable: without it, three implementations of one rule drift silently, and
-adding a fourth adapter means writing a fourth set of tests that may not cover the
-same ground.
+Two rules follow from this. Engine transaction state is tracked by the adapter
+base rather than inferred from the database, because Oracle assigns a local
+transaction id only on first write, so "is there uncommitted work" and "am I
+inside an engine-opened transaction" are different questions with different
+answers. And one conformance suite runs against every adapter: without it, three
+implementations of one rule drift silently, and adding a fourth adapter means
+writing a fourth set of tests that may not cover the same ground.
 
-The first milestone is an experimental vertical slice: a Python package and CLI implementing the specified protocols; fast unit/SQLite probes; an Oracle adapter exercised against a disposable real database; a PostgreSQL probe using its real transaction semantics; examples; and a repeatable test-environment setup. Implementation and this spec should be updated together as concrete tests expose gaps.
-
-For each adapter, report implemented capabilities and tested capabilities separately. An unavailable Oracle environment is a blocked acceptance gate, not a reason to certify the engine from SQLite. Continue independent work and record the exact environment requirement needed to finish.
-
-Before claiming production readiness, complete the actual target-version release gates, deterministic failure tests, and a review of the final implementation. Until then label the package experimental. Avoid another broad feature expansion as part of resolving a small implementation discrepancy.
+For each adapter, implemented capabilities and tested capabilities are reported
+separately. An unavailable database environment is a blocked acceptance gate, not
+a reason to certify the engine from the SQLite probe.
 
 ## 16. Primary technical references
 
@@ -746,40 +735,10 @@ These references support database facts. The protocol and scope choices above ar
 - Driver DML output binding: [python-oracledb binds](https://python-oracledb.readthedocs.io/en/stable/user_guide/bind.html#dml-returning-bind-variables).
 - Explicit PostgreSQL driver transactions: [Psycopg transaction management](https://www.psycopg.org/psycopg3/docs/basic/transactions.html).
 
-## 17. Implementation deltas from v6 to v6.1
+## 17. Deliberate omissions
 
-Every item here is marked **[v6.1]** at the point it applies. None of them
-changes the state machine, the recovery boundaries, the command surface, or the
-declared scope. Each exists because a concrete test or a real database behaviour
-required it.
-
-| # | Section | Change | Why |
-|---|---|---|---|
-| 1 | 4.2 | `*.pyo` added to the forbidden in-unit artefacts | Same reason as `*.pyc`: its presence would make a fingerprint depend on whether Python had run. |
-| 2 | 5.1 | PostgreSQL and SQLite enforcement boundaries stated | PostgreSQL has a real transaction identity; the SQLite probe does not, and says so rather than implying one. |
-| 3 | 5.3 | PostgreSQL dollar quoting recognized | Without it no `DO` block could be accepted, because its body's semicolons would read as separators. Oracle input is unchanged. |
-| 4 | 5.3 | A remaining bare `;`, or a non-final standalone `/`, is rejected | Makes "no statement splitter" enforceable instead of silently executing only the first statement. |
-| 5 | 7.1 | Initialization split into `metadata_object_created` and `initialization_complete` | They recover differently, and the acceptance harness must target each boundary separately. |
-| 6 | 7.2 | A driver refusal raised before submission is classified as definite | It cannot have had a durable effect. Per-adapter lists stay narrow; anything unlisted stays unknown. |
-| 7 | 8.1 | The recorded lock binding is the id, not the package | `DBMS_LOCK` user locks are global by id, so a documented wrapper is an access path. The provider is recorded separately. |
-| 8 | 8.2 | Oracle quotes `"MODE"` and names its bind `exec_mode` | `MODE` is reserved: unquoted raises ORA-03050, and a `:mode` placeholder raises ORA-01745. |
-| 9 | 8.2 | PostgreSQL uses a partial unique index for the one-active rule | Native equivalent of Oracle's function-based index. |
-| 10 | 8.3 | History problems split between exit 7 and exit 2, with the rule stated | "Damage or validation failure" was one phrase covering two different operator situations. |
-| 11 | 9.2 | `ctx.transaction()` returns an explicit context-manager object | A generator-based version is closed by garbage collection, which would hide an abandoned batch instead of reporting it. |
-| 12 | 11.1 | Preflight covers the whole manifest, with the consequence recorded | Step 1 runs before history is read, so the pending suffix is not yet known. |
-| 13 | 11.2 | Oracle's consistent read is a single statement, not a read-only transaction | ORA-01466 makes the snapshot approach fail right after any DDL, including during the long migration `status` exists to observe. |
-| 14 | 12 | `COMMIT_WAIT` is reported as not verified at session level | Oracle provides no session-level read-back. The setting is still required to succeed. |
-| 15 | 12 | Oracle batch state is tracked by the adapter, not inferred from the transaction id | Oracle assigns a transaction id only on first write, and the first write is often the checkpoint itself. |
-| 16 | 7.2 | An interruption during a commit-capable call is an unknown outcome; `SIGTERM` is handled | The doubt is identical to a lost acknowledgement, and the default signal disposition would abandon the session with nothing recorded. |
-| 17 | 11.3a | Run correlation id, optional JSON event log, `--json` outcome record | A failure is diagnosed later by someone who did not watch it. Adds no database object and no correctness dependency. |
-| 18 | 15 | Every rule lives once in the shared adapter base; adapters supply dialect only | Three implementations of one invariant is three places to get it wrong, with nothing detecting disagreement. |
-| 19 | 15 | An adapter conformance suite, run against every adapter, is part of the deliverable | It is what makes a fourth adapter cheap and catches drift; it found a real nested-`begin` defect on Oracle on its first run. |
-| 20 | 11.3 | An unexpected internal fault maps to a defined exit code with the run id | A migration tool that crashes must still tell the operator what is safe to do next. |
-
-### Deliberate non-changes
-
-These were considered and rejected, because making them would have weakened
-something the specification protects:
+Each of these would weaken something the specification protects, and none of
+them is in the tool:
 
 - **Relaxing preflight to the pending suffix only.** It would hide a tool
   regression affecting the part of the manifest that defines the successful
