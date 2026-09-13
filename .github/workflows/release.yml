@@ -1,0 +1,122 @@
+# Publish to PyPI via trusted publishing (OIDC, no stored tokens) on version
+# tags. One-time setup on pypi.org: Account -> Publishing -> add a pending
+# publisher (project migr8, owner mrbald, repository migr8, workflow
+# release.yml, environment pypi). Release: git tag vX.Y.Z && git push origin
+# vX.Y.Z.
+#
+# Nothing is published that has not passed the real-database gate. A migration
+# engine whose Oracle and PostgreSQL adapters were never run against a server
+# in the release build is not a release candidate, so the whole suite runs here
+# against the same disposable services CI uses, not just the fast tier.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+      - run: uv sync --all-extras
+
+      # The tag is the release's name and src/migr8/version.py is the version
+      # written into every durable history row. A mismatch means a published
+      # artifact would record a version nobody can find, so refuse before doing
+      # any work.
+      - name: the tag matches the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv run python -c 'from migr8.version import TOOL_VERSION; print(TOOL_VERSION)')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match src/migr8/version.py (${pkg})"
+            exit 1
+          fi
+          echo "releasing ${pkg}"
+
+      - run: uv run ruff check src tests testenv
+      - run: uv run ruff format --check src tests testenv
+      - run: uv run mypy
+      - run: uv run coverage run -m pytest -q -m "not oracle and not postgres"
+      - run: uv run coverage report
+
+      - name: start Oracle and PostgreSQL
+        run: testenv/dbctl.sh up
+      - name: record the server versions this release was built against
+        run: testenv/dbctl.sh versions | tee versions.txt
+      - name: full suite against both servers
+        run: |
+          set -euo pipefail
+          testenv/dbctl.sh test -q | tee suite.log
+          if grep -qE '[0-9]+ skipped' suite.log; then
+            echo "a suite skipped with both services up; not releasing"
+            exit 1
+          fi
+      - name: stop the services
+        if: always()
+        run: testenv/dbctl.sh destroy
+
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/
+            versions.txt
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/migr8
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: .
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: .
+      # The release notes carry the server versions the build was tested
+      # against, because "tested on Oracle" without a release number is not a
+      # claim anyone can check.
+      - name: publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Tested against:"
+            echo
+            echo '```'
+            cat versions.txt
+            echo '```'
+          } > notes.md
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --generate-notes \
+            dist/*

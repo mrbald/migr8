@@ -1,0 +1,16 @@
+# Action versions are pinned by major tag in the workflows; this is what moves
+# them when a major lands, rather than leaving them to rot unnoticed.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
