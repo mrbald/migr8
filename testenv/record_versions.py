@@ -11,10 +11,20 @@ import sys
 
 
 def run(args: list[str]) -> str:
+    """Stdout, or a marked failure.
+
+    A command that fails must not come back as an empty string: this output is
+    the evidence an acceptance claim rests on, and a blank digest reads as "no
+    digest exists" rather than "nobody could read one".
+    """
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.strip()
+        done = subprocess.run(args, capture_output=True, text=True, timeout=60)
     except Exception as exc:  # pragma: no cover
         return f"<unavailable: {exc}>"
+    if done.returncode != 0:
+        first = next(iter(done.stderr.strip().splitlines()), "no stderr")
+        return f"<unavailable: {args[0]} {args[1]} exited {done.returncode}: {first}>"
+    return done.stdout.strip() or "<unavailable: no output>"
 
 
 def main() -> int:
@@ -37,11 +47,20 @@ def main() -> int:
         print("psycopg         : NOT INSTALLED")
     print(f"docker          : {run(['docker', '--version'])}")
     print()
-    for image in ("gvenzl/oracle-free:23.9-slim", "postgres:17.5"):
-        digest = run(["docker", "image", "inspect", image, "--format", "{{index .RepoDigests 0}}"])
-        arch = run(["docker", "image", "inspect", image, "--format", "{{.Architecture}}"])
-        print(f"image           : {image}")
-        print(f"  digest        : {digest}")
+    # Read the reference off the running container rather than naming a tag
+    # here. compose.yaml pins each image as tag@sha256:..., and a host that
+    # pulled that pinned reference has no bare tag to inspect -- which is every
+    # clean runner, so the tag lookup reported nothing exactly where the
+    # evidence mattered most. This also keeps one source of truth: whatever
+    # compose started is what gets recorded.
+    for container in ("migr8-oracle", "migr8-postgres"):
+        ref = run(["docker", "inspect", container, "--format", "{{.Config.Image}}"])
+        print(f"container       : {container}")
+        print(f"  image         : {ref}")
+        if ref.startswith("<unavailable"):
+            print("  architecture  : <unavailable: no image reference>")
+            continue
+        arch = run(["docker", "image", "inspect", ref, "--format", "{{.Architecture}}"])
         print(f"  architecture  : {arch}")
     print()
 
