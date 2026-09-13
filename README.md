@@ -48,9 +48,9 @@ uv run migr8 validate --config migr8.toml --manifest manifest.toml
 ## Tests
 
 ```bash
-uv run pytest -m "not oracle and not postgres"   # 301 tests, no services needed
+uv run pytest -m "not oracle and not postgres"   # 315 tests, no services needed
 testenv/dbctl.sh up                              # disposable Oracle + PostgreSQL
-testenv/dbctl.sh test                            # all 430, with the databases
+testenv/dbctl.sh test                            # all 460, with the databases
 testenv/dbctl.sh down
 ```
 

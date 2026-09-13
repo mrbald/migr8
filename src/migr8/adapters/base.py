@@ -27,21 +27,31 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from ..config import Config
-from ..errors import UnknownOutcomeError, UnsupportedCapabilityError, UsageError
+from ..errors import (
+    MetadataDamagedError,
+    UnknownOutcomeError,
+    UnsupportedCapabilityError,
+    UsageError,
+)
 from ..latch import RunLatch
 from ..manifest import Language, Mode, RequiredObject
 from ..model import (
     HISTORY_TABLE,
+    LAYOUT_VERSION,
+    META_SINGLETON_KEY,
+    META_TABLE,
     PROGRESS_TABLE,
     RESERVED_OBJECT_NAMES,
     MetadataReport,
+    MetaRow,
     Snapshot,
 )
 from ..sqltext import Statement, StatementKind
 from ..testing import hooks
+from . import metadata as md
 
 
 class OutcomeClass(StrEnum):
@@ -130,6 +140,9 @@ class Adapter(ABC):
 
     #: Adapter identity recorded in ``m8_meta``.
     name: ClassVar[str]
+    #: The driver's base exception, so shared metadata code can catch the one
+    #: thing this engine raises rather than swallowing every exception.
+    driver_error: ClassVar[type[Exception]] = Exception
 
     # --- dialect: how engine-owned metadata SQL is written ---------------------
 
@@ -260,13 +273,113 @@ class Adapter(ABC):
 
     # --- metadata --------------------------------------------------------------
 
-    @abstractmethod
     def inspect_metadata(self) -> MetadataReport:
-        """Inspect the namespace without creating or altering anything."""
+        """Inspect the namespace without creating or altering anything.
+
+        The sequence is the same on every engine: which objects exist, whether
+        their definitions match, then the marker.  Only the dictionary queries
+        behind :meth:`_objects_present` and :meth:`_definition_problems` are
+        engine-specific, and forcing those into one shape would obscure all three.
+        """
+        present = self._objects_present()
+        problems = self._definition_problems(present)
+        meta = None
+        if META_TABLE in present:
+            try:
+                meta, rows = self._read_meta()
+            except self.driver_error as exc:
+                problems.append(f"{META_TABLE} cannot be read: {exc}")
+            else:
+                if meta is not None and rows != 1:
+                    problems.append(
+                        f"{META_TABLE} holds {rows} rows; exactly one is expected"
+                    )
+        return md.classify(
+            present=present,
+            problems=problems,
+            meta=meta,
+            history_count=self._count(HISTORY_TABLE, present),
+            progress_count=self._count(PROGRESS_TABLE, present),
+        )
+
+    def initialize(self) -> None:
+        """Create missing metadata objects in fixed order, verify, then mark complete.
+
+        The marker is written last and only once the whole layout has been
+        re-inspected, so an interruption leaves a recognisable prefix rather than
+        a namespace that claims to be initialized.  This exists once because it
+        is the rule; only the physical creation is delegated.
+        """
+        present = self._objects_present()
+        for name in md.CREATION_ORDER:
+            if name not in present:
+                self._create_metadata_object(name)
+
+        present = self._objects_present()
+        missing = sorted(set(md.CREATION_ORDER) - present)
+        problems = self._definition_problems(present)
+        if missing or problems:
+            raise MetadataDamagedError(
+                "metadata layout is not complete after creating objects: "
+                + "; ".join([*(f"missing {name}" for name in missing), *problems])
+            )
+
+        self.begin()
+        self._exec(
+            f"INSERT INTO {self.metadata_name(META_TABLE)} "
+            f"({self._columns(*md.META_COLUMNS)}) "
+            "VALUES (:meta_key, :layout_version, :adapter, :lock_provider, "
+            ":lock_binding, :target_namespace, {now})",
+            {
+                "meta_key": META_SINGLETON_KEY,
+                "layout_version": LAYOUT_VERSION,
+                "adapter": self.name,
+                "lock_provider": self.config.lock.provider,
+                "lock_binding": self.lock_binding(),
+                "target_namespace": self.normalized_namespace(),
+            },
+        )
+        self.durable_commit(Boundary.INITIALIZATION_COMPLETE)
+
+    def _read_meta(self) -> tuple[MetaRow | None, int]:
+        """Read the singleton marker and the marker table's row count."""
+        meta_table = self.metadata_name(META_TABLE)
+        count = int(self._fetch(f"SELECT COUNT(*) FROM {meta_table}", {})[0][0])
+        rows = self._fetch(
+            f"SELECT {self._columns(*md.META_COLUMNS)} FROM {meta_table} "
+            f"WHERE {self.metadata_column('meta_key')} = :meta_key",
+            {"meta_key": META_SINGLETON_KEY},
+        )
+        if not rows:
+            return None, count
+        return md.meta_row(tuple(rows[0]), md.parse_iso_timestamp), count
+
+    def _count(self, table: str, present: set[str]) -> int | None:
+        """Row count of a metadata table, or None when it does not exist."""
+        if table not in present:
+            return None
+        return int(self._fetch(f"SELECT COUNT(*) FROM {self.metadata_name(table)}", {})[0][0])
 
     @abstractmethod
-    def initialize(self) -> None:
-        """Create missing metadata objects in fixed order, verify, then mark complete."""
+    def _objects_present(self) -> set[str]:
+        """Which metadata objects exist, named as ``md.CREATION_ORDER`` names them.
+
+        Engines that fold identifiers must fold back: the caller compares these
+        against the logical lower-case names, never against the dictionary's
+        spelling.
+        """
+
+    @abstractmethod
+    def _definition_problems(self, present: set[str]) -> list[str]:
+        """Every way the existing objects differ from the supported layout."""
+
+    @abstractmethod
+    def _create_metadata_object(self, name: str) -> None:
+        """Create one metadata object and make it durable on its own.
+
+        Engines with transactional DDL wrap it in an engine transaction and a
+        ``METADATA_OBJECT_CREATED`` commit; Oracle's DDL commits by itself.
+        """
 
     @abstractmethod
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
@@ -320,13 +433,20 @@ class Adapter(ABC):
         return identifier.upper() if self.identifier_case == "upper" else identifier.lower()
 
     def _render(self, sql: str) -> str:
-        """Translate shared ``:name`` placeholders and ``{now}`` for this engine."""
-        rendered = sql.replace("{now}", self.now_expression)
+        """Translate shared ``:name`` placeholders and ``{now}`` for this engine.
+
+        Placeholders are translated *before* ``{now}`` is substituted, for the
+        same reason :meth:`_binds` reads placeholder names from the unrendered
+        template: an engine's timestamp expression must not be able to look like
+        a placeholder.  A cast such as ``now()::timestamptz`` would otherwise
+        become ``now():%(timestamptz)s``.
+        """
+        rendered = sql
         if self.paramstyle == "pyformat":
             rendered = re.sub(r":([a-z_][a-z0-9_]*)", r"%(\1)s", rendered)
         elif self.paramstyle != "named":  # pragma: no cover - guarded at import
             raise UsageError(f"unsupported paramstyle {self.paramstyle!r}")
-        return rendered
+        return rendered.replace("{now}", self.now_expression)
 
     def _columns(self, *logical: str) -> str:
         return ", ".join(self.metadata_column(name) for name in logical)
@@ -422,16 +542,20 @@ class Adapter(ABC):
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
 
     def update_active_attempt(self, *, migration_id: str, fingerprint: str,
-                              language: Language) -> int:
+                              language: Language) -> None:
         """Increment the attempt counter for the matching ACTIVE row and commit.
 
         Position, identity, mode, the original start time and the first
         fingerprint are never in the SET list, so recovery cannot change them.
         An affected-row count other than one is metadata damage.
+
+        The new attempt number is not read back.  The caller holds the namespace
+        lock and read the previous value under it, so the incremented value is
+        already known and a round trip would only restate it.
         """
         history = self.metadata_name(HISTORY_TABLE)
         attempt = self.metadata_column("attempt")
-        affected = self._metadata_execute_in_transaction(
+        self._metadata_execute_in_transaction(
             f"UPDATE {history} SET {attempt} = {attempt} + 1, "
             f"{self.metadata_column('fingerprint')} = :fingerprint, "
             f"{self.metadata_column('language')} = :language, "
@@ -447,14 +571,7 @@ class Adapter(ABC):
              "migration_id": migration_id, **self._runner_binds()},
             what=f"admitting a new attempt for {migration_id!r}",
         )
-        assert affected == 1
-        row = self._fetch(
-            f"SELECT {attempt} FROM {history} "
-            f"WHERE {self.metadata_column('migration_id')} = :migration_id",
-            {"migration_id": migration_id},
-        )
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
-        return int(row[0][0])
 
     def complete_active_row(self, *, migration_id: str) -> None:
         """ACTIVE to SUCCESS plus progress deletion, in one committed transaction."""
@@ -477,10 +594,12 @@ class Adapter(ABC):
         self.durable_commit(Boundary.RESTARTABLE_COMPLETION, migration_id=migration_id)
 
     def _metadata_execute_in_transaction(self, sql: str, params: Mapping[str, object],
-                                         *, what: str) -> int:
-        """Open a transaction, run one update, and require exactly one affected row."""
-        from ..errors import MetadataDamagedError
+                                         *, what: str) -> None:
+        """Open a transaction, run one update, and require exactly one affected row.
 
+        Returns normally only when exactly one row was affected, so callers need
+        no further check.
+        """
         self.begin()
         affected = self._exec(sql, params)
         if affected != 1:
@@ -488,7 +607,6 @@ class Adapter(ABC):
             raise MetadataDamagedError(
                 f"{what} affected {affected} rows; exactly one ACTIVE row was expected"
             )
-        return affected
 
     # --- progress store (shared; spec Sections 8.2 and 9.2) --------------------
 
@@ -694,10 +812,15 @@ class Adapter(ABC):
         return
 
     def _reject_reserved(self, statement: Statement) -> None:
-        """Refuse any statement naming an engine-reserved metadata object."""
-        upper = statement.text.upper()
+        """Refuse any statement naming an engine-reserved metadata object.
+
+        The comparison is against the statement's identifier tokens, not its raw
+        text.  A substring scan refuses far more than it should: a table called
+        ``custom8_history`` contains ``m8_history``, and so does a comment or a
+        string literal that merely mentions the engine table.
+        """
         for reserved in sorted(RESERVED_OBJECT_NAMES):
-            if reserved.upper() in upper:
+            if reserved.upper() in statement.names:
                 raise UsageError(
                     f"migration code must not reference the reserved metadata object "
                     f"{reserved}; use the supplied progress API"
@@ -706,20 +829,37 @@ class Adapter(ABC):
     # --- execution -------------------------------------------------------------
 
     @abstractmethod
+    def _run(self, text: str, params: object | None) -> Any:
+        """Submit one migration statement and return the driver cursor.
+
+        This is the facade's execution path, separate from ``_metadata_execute``:
+        migration SQL is submitted verbatim, after admission, with the author's
+        own bind parameters.
+        """
+
     def execute(self, statement: Statement, params: object | None) -> int:
-        ...
+        return max(self._run(statement.text, params).rowcount, 0)
+
+    def query(self, statement: Statement, params: object | None) -> list[tuple]:
+        return [tuple(row) for row in self._run(statement.text, params).fetchall()]
 
     @abstractmethod
     def executemany(self, statement: Statement, parameter_sets: list[object]) -> int:
-        ...
+        """Not shared: the drivers differ on how per-row errors are suppressed."""
 
-    @abstractmethod
-    def query(self, statement: Statement, params: object | None) -> list[tuple]:
-        ...
-
-    @abstractmethod
     def execute_ddl(self, statement: Statement) -> None:
-        ...
+        """Run DDL in its own transaction, for engines whose DDL is transactional.
+
+        Oracle's implicit DDL commits are not emulated; that adapter overrides
+        this with a plain submission.
+        """
+        self.begin()
+        try:
+            self._run(statement.text, None)
+        except self.driver_error:
+            self.rollback()
+            raise
+        self.durable_commit(Boundary.RESTARTABLE_DDL)
 
     # --- final validity --------------------------------------------------------
 
@@ -750,3 +890,20 @@ class Adapter(ABC):
 
 def _listed(tokens: frozenset[str]) -> str:
     return ", ".join(sorted(tokens))
+
+
+def bind_params(params: object | None, *, empty: object):
+    """Normalise an author's bind parameters for a DB-API driver.
+
+    ``empty`` is what "no parameters" means to this driver, and the drivers do
+    not agree: sqlite3 refuses ``None``, while psycopg treats ``None`` as "do not
+    interpolate at all", which is what keeps a literal ``%`` in migration SQL
+    from being read as a placeholder.
+    """
+    if params is None:
+        return empty
+    if isinstance(params, (list, tuple)):
+        return tuple(params)
+    if isinstance(params, dict):
+        return params
+    return (params,)

@@ -310,6 +310,36 @@ def test_unchanged_retry_resumes_without_the_recover_flag(project):
     assert row[6] == row[7]
 
 
+def test_the_attempt_the_author_sees_is_the_attempt_that_was_recorded(project):
+    """``ctx.attempt`` is derived, not read back, so it must track the row.
+
+    The engine computes the new attempt from the snapshot it read under the
+    namespace lock rather than selecting it again after the update; this pins
+    the two together across several attempts.
+    """
+    root, config, db = project
+    seen = root / "attempts.txt"
+    body = (
+        "def migrate(ctx):\n"
+        "    import pathlib\n"
+        f"    log = pathlib.Path({str(seen)!r})\n"
+        "    with log.open('a') as handle:\n"
+        "        handle.write(f'{ctx.attempt}\\n')\n"
+        "    if ctx.attempt < 3:\n"
+        "        raise RuntimeError('not yet')\n"
+    )
+    manifest = _batch_project(root, body)
+
+    assert support.migrate(config, manifest) == Exit.MIGRATION_FAILED
+    assert support.migrate(config, manifest) == Exit.MIGRATION_FAILED
+    assert support.migrate(config, manifest) == Exit.OK
+
+    assert seen.read_text().split() == ["1", "2", "3"]
+    row = [r for r in support.history(db) if r[1] == "copy"][0]
+    assert row[2] == "SUCCESS"
+    assert row[5] == 3, "the recorded attempt and the reported attempt must agree"
+
+
 def test_rerunning_completed_work_is_a_no_op(project):
     root, config, db = project
     manifest = _batch_project(root)

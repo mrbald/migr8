@@ -17,8 +17,9 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .adapters.base import Adapter, Boundary, RunnerInfo
+from .checks import preflight, verify_bindings
 from .config import Config
-from .context import AtomicContext, RestartableContext, build_context
+from .context import build_context
 from .diagnostics import RunLog
 from .errors import (
     ContractViolationError,
@@ -26,22 +27,19 @@ from .errors import (
     Migr8Error,
     MetadataDamagedError,
     MigrationFailedError,
-    NotInitializedError,
     RecoveryRequiredError,
     UnknownOutcomeError,
-    UsageError,
-    ValidationError,
 )
 from .latch import RunLatch
 from .loader import load_entry
 from .manifest import Language, Mode
-from .model import LAYOUT_VERSION, Capture, CapturedUnit, MetadataState, Plan, Snapshot
+from .model import Capture, CapturedUnit, MetadataState, Plan, Snapshot
 from .statevalidate import (
     build_plan,
     check_recovery_admission,
     require_no_recovery_needed,
 )
-from .sqltext import Statement, StatementKind, normalize
+from .sqltext import StatementKind, normalize
 from .version import TOOL_VERSION
 
 LOGGER = logging.getLogger("migr8.engine")
@@ -109,56 +107,6 @@ def runner_info(run_id: str) -> RunnerInfo:
         tool_version=TOOL_VERSION,
         run_id=run_id,
     )
-
-
-def preflight(capture: Capture, adapter: Adapter) -> None:
-    """Everything checkable without a connection or migration code (spec Section 11.1 step 1).
-
-    Covers supported language/mode combinations, required-object declarations and
-    the lexical rules for every SQL unit.  Applying the lexical check to the
-    whole manifest rather than only the pending suffix is deliberate: the spec
-    requires structural errors to surface before execution, and a published
-    unit's bytes never change.
-    """
-    for unit in capture.units:
-        adapter.admit_combination(unit.language, unit.mode)
-        adapter.admit_required_objects(unit.definition.required)
-        if unit.language is Language.SQL:
-            entry_path = unit.source_dir / unit.definition.entry
-            text = entry_path.read_text(encoding="utf-8")
-            statement = normalize(text)
-            if unit.mode is Mode.ATOMIC:
-                adapter.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
-            elif statement.kind is not StatementKind.PLSQL_BLOCK:
-                adapter.admit_ddl(statement)
-
-
-def verify_bindings(adapter: Adapter, plan_meta) -> None:
-    """Confirm the recorded namespace, lock and adapter bindings (spec Section 8.1)."""
-    if plan_meta is None:
-        raise MetadataDamagedError("initialization marker is missing after initialization")
-    expected_namespace = adapter.normalized_namespace()
-    expected_lock = adapter.lock_binding()
-    if plan_meta.layout_version != LAYOUT_VERSION:
-        raise MetadataDamagedError(
-            f"metadata layout_version {plan_meta.layout_version} is not supported "
-            f"(expected {LAYOUT_VERSION})"
-        )
-    if plan_meta.adapter != adapter.name:
-        raise UsageError(
-            f"namespace was initialized by adapter {plan_meta.adapter!r} but this run uses "
-            f"{adapter.name!r}"
-        )
-    if plan_meta.target_namespace != expected_namespace:
-        raise UsageError(
-            f"namespace binding mismatch: metadata records {plan_meta.target_namespace!r}, "
-            f"this run targets {expected_namespace!r}"
-        )
-    if plan_meta.lock_binding != expected_lock:
-        raise UsageError(
-            f"lock binding mismatch: metadata records {plan_meta.lock_binding!r}, this run is "
-            f"configured for {expected_lock!r}. The runner does not switch locks mid-run."
-        )
 
 
 class Engine:
@@ -367,15 +315,7 @@ class Engine:
         identity = adapter.establish_transaction_identity()
         try:
             self._invoke(unit, attempt=None)
-            validity = adapter.check_required_objects(unit.definition.required)
-            self.report.warnings.extend(validity.warnings)
-            if validity.failures:
-                raise MigrationFailedError(
-                    "declared required objects are not valid after execution: "
-                    + "; ".join(validity.failures),
-                    phase="final_validity",
-                    migration_id=unit.id,
-                )
+            self._require_valid(unit)
             self._check_transaction_identity(unit, identity)
             adapter.insert_success_row(
                 seq=unit.position,
@@ -386,12 +326,10 @@ class Engine:
             )
         except UnknownOutcomeError:
             raise
-        except ContractViolationError:
-            # Roll back what remains; no success row is written.  Durable
-            # effects of non-compliant code may still need remediation.
-            self._rollback_quietly()
-            raise
-        except MigrationFailedError:
+        except (ContractViolationError, MigrationFailedError):
+            # Roll back what remains; no success row is written.  After a contract
+            # violation, durable effects of non-compliant code may still need
+            # remediation.
             self._rollback_quietly()
             raise
         except Exception as exc:
@@ -445,11 +383,14 @@ class Engine:
             )
             attempt = 1
         else:
-            attempt = adapter.update_active_attempt(
+            adapter.update_active_attempt(
                 migration_id=unit.id,
                 fingerprint=unit.fingerprint,
                 language=unit.language,
             )
+            # The snapshot behind ``active`` was read under the namespace lock,
+            # which is still held, so nothing else can have written history since.
+            attempt = active.attempt + 1
         self.log.event("admitted", migration=unit.id, attempt=attempt)
 
         context = None
@@ -457,10 +398,7 @@ class Engine:
             context = self._invoke(unit, attempt=attempt)
         except UnknownOutcomeError:
             raise
-        except ContractViolationError:
-            self._post_return_cleanup(unit)
-            raise
-        except MigrationFailedError:
+        except (ContractViolationError, MigrationFailedError):
             self._post_return_cleanup(unit)
             raise
         except Exception as exc:
@@ -476,7 +414,7 @@ class Engine:
         # author code catching its exception (spec Sections 7.2 and 9.2).
         self.latch.check()
 
-        if getattr(context, "batch_open", False) or adapter.has_open_transaction():
+        if (context is not None and context.batch_open) or adapter.has_open_transaction():
             self._rollback_quietly()
             raise MigrationFailedError(
                 f"restartable migration {unit.id!r} returned with an open transaction; "
@@ -486,7 +424,13 @@ class Engine:
                 migration_id=unit.id,
             )
 
-        validity = adapter.check_required_objects(unit.definition.required)
+        self._require_valid(unit)
+
+        adapter.complete_active_row(migration_id=unit.id)
+
+    def _require_valid(self, unit: CapturedUnit) -> None:
+        """Run the read-only final-validity check; warnings never fail the run."""
+        validity = self.adapter.check_required_objects(unit.definition.required)
         self.report.warnings.extend(validity.warnings)
         if validity.failures:
             raise MigrationFailedError(
@@ -496,10 +440,13 @@ class Engine:
                 migration_id=unit.id,
             )
 
-        adapter.complete_active_row(migration_id=unit.id)
-
     def _post_return_cleanup(self, unit: CapturedUnit) -> None:
-        """Roll back remaining uncommitted work; the ACTIVE row is retained."""
+        """Roll back remaining uncommitted work; the ACTIVE row is retained.
+
+        The latch is checked before anything else, and not only inside
+        ``_rollback_quietly``: ``has_open_transaction`` is itself a round trip on
+        Oracle, and no SQL at all may follow an unknown outcome (spec Section 7.2).
+        """
         if self.latch.unknown:
             return
         if self.adapter.has_open_transaction():
@@ -553,14 +500,4 @@ class Engine:
         return ctx
 
 
-__all__ = [
-    "Engine",
-    "RunReport",
-    "AtomicContext",
-    "RestartableContext",
-    "Statement",
-    "ValidationError",
-    "NotInitializedError",
-    "preflight",
-    "verify_bindings",
-]
+__all__ = ["Engine", "RunReport"]

@@ -114,16 +114,6 @@ class Snapshot:
     progress: tuple[ProgressRow, ...]
     meta: MetaRow | None = None
 
-    def active(self) -> HistoryRow | None:
-        actives = [row for row in self.history if row.is_active]
-        return actives[0] if len(actives) == 1 else None
-
-    def by_id(self, migration_id: str) -> HistoryRow | None:
-        for row in self.history:
-            if row.migration_id == migration_id:
-                return row
-        return None
-
 
 @dataclass(frozen=True, slots=True)
 class CapturedUnit:
@@ -169,12 +159,6 @@ class Capture:
     def at_position(self, position: int) -> CapturedUnit | None:
         if 1 <= position <= len(self.units):
             return self.units[position - 1]
-        return None
-
-    def by_id(self, migration_id: str) -> CapturedUnit | None:
-        for unit in self.units:
-            if unit.id == migration_id:
-                return unit
         return None
 
 

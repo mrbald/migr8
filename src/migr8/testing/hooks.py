@@ -46,10 +46,6 @@ def clear() -> None:
     _callbacks.clear()
 
 
-def active() -> bool:
-    return bool(_callbacks)
-
-
 def _ensure_module_loaded() -> None:
     global _module_loaded
     if _module_loaded:

@@ -8,10 +8,18 @@ the review.
 The tool was renamed from `flyway.py` / `flywaypy` to `migr8` after that pass.
 The rename also changed the metadata object prefix from `fw_` to `m8_`, the
 fingerprint domain string, the `MIGR8_*` environment variables and the default
-configuration name `migr8.toml`. The full suite, the three examples and the
-recorded versions below were re-run after the rename against freshly created
-services, with the same results. The Apple `container` deployment section at the
-end was **not** re-run.
+configuration name `migr8.toml`. A third pass then acted on a fresh architectural
+review, recorded as findings 13 to 18 in [`ARCHITECTURE.md`](ARCHITECTURE.md):
+two defects fixed, about 180 source lines removed, and metadata initialization
+and inspection moved into the adapter base. The full suite, the three examples
+and the recorded versions below were re-run after each pass against freshly
+created services. The Apple `container` deployment section at the end was **not**
+re-run.
+
+Two output changes came with that third pass. `status --json` and
+`validate --json` no longer carry the always-empty `notes` key. Running the tool
+from a checkout is `./migr8` rather than `python migr8.py`, because a file named
+`migr8.py` in the project root would shadow the `migr8` package.
 
 ## Status
 
@@ -98,28 +106,30 @@ cd examples/postgres && MIGR8_PASSWORD=... uv run migr8 migrate
 
 | Level | Result | Tests | Evidence |
 |---|---|---|---|
-| Pure / unit | **PASS** | 209 | Deterministic fixtures, including malformed, colliding and corrupt definitions. No database. |
-| SQLite probe | **PASS** | 92 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
-| PostgreSQL integration | **PASS** | 48 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures. |
-| Oracle integration | **PASS** | 81 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures. |
+| Pure / unit | **PASS** | 214 | Deterministic fixtures, including malformed, colliding and corrupt definitions. No database. |
+| SQLite probe | **PASS** | 101 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
+| PostgreSQL integration | **PASS** | 56 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures. |
+| Oracle integration | **PASS** | 89 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures. |
 | Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available in this environment. See [Open gates](#open-gates). |
 
-Total: **430 tests, 430 passed, 0 failed, 0 skipped** when all services are up.
-Run time about 51 s. Without the services, 301 run and the live suites skip with
+Total: **460 tests, 460 passed, 0 failed, 0 skipped** when all services are up.
+Run time about 52 s. Without the services, 315 run and the live suites skip with
 an explicit message naming the missing environment variables; a skip is never
 counted as coverage.
 
-The adapter contract suite contributes 61 of those tests: 21 behaviours across
-three adapters, in one file. It earned its place on first run by finding a real
-defect, a nested `begin()` accepted on Oracle, described in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#5-oracle-accepted-a-nested-begin--fixed).
+The adapter contract suite contributes 88 of those tests, in one file. It earned
+its place on first run by finding a real defect, a nested `begin()` accepted on
+Oracle, described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#5-oracle-accepted-a-nested-begin--fixed), and
+again on the third pass, where it is what holds the reserved-object fix to the
+same behaviour on all three engines.
 
 | File | Tests |
 |---|---|
+| `tests/test_adapter_contract.py` | 88 |
 | `tests/test_sqltext.py` | 66 |
-| `tests/test_adapter_contract.py` | 61 |
 | `tests/test_manifest.py` | 48 |
-| `tests/test_sqlite_probe.py` | 40 |
+| `tests/test_sqlite_probe.py` | 41 |
 | `tests/test_statevalidate.py` | 38 |
 | `tests/test_fingerprint.py` | 21 |
 | `tests/test_cli.py` | 17 |
@@ -128,6 +138,7 @@ defect, a nested `begin()` accepted on Oracle, described in
 | `tests/test_loader.py` | 10 |
 | `tests/test_staging.py` | 8 |
 | `tests/test_concurrency_probe.py` | 5 |
+| `tests/test_checks.py` | 2 |
 | `tests/integration/test_oracle_execution.py` | 26 |
 | `tests/integration/test_commit_failure.py` | 20 |
 | `tests/integration/test_oracle.py` | 20 |
@@ -152,7 +163,7 @@ item in the group is not covered, and the gap is named.
 | 9 | Oracle and SQL details | **PARTIAL** | Correct `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` invocation with an output bind; multiline `UPDATE` with a line beginning `SET`; PL/SQL `EXIT WHEN`; literals and comments containing slashes and semicolons surviving normalisation and executing against the real server; stored PL/SQL keeping its terminator while `CREATE LIBRARY` does not; top-level SQL*Plus commands refused in preflight without rejecting valid internal tokens; direct DDL restrictions; synchronous commit session setup; native driver parameter handling; and the realistic bounded backfill example running against Oracle. **Gap:** `COMMIT_WAIT` cannot be read back at session level on Oracle, so its establishment is reported as NOT VERIFIED rather than asserted. |
 | 11 | Interruption and internal failure **[new]** | **PASS** | Ctrl-C and `SIGTERM` between commits roll back, retain ACTIVE, exit 3 and print no traceback; an interruption during a commit latches an unknown outcome, discards the connection and exits 4; an injected internal defect produces a defined exit code naming the run id rather than a traceback. |
 | 12 | Diagnostics **[new]** | **PASS** | The event log records the phases in order with a single correlation id and monotonic timings; the terminal record names the failing migration and phase; author `ctx.log` lines interleave; credentials, DSNs and bind values are excluded; the log appends across runs and is absent unless configured; `--json` carries outcome, failing identity, phase and recovery command. |
-| 13 | Adapter contract **[new]** | **PASS** | 21 behaviours per adapter: initialization to a verified layout, well-typed empty snapshot, physical-name resolution, engine-transaction state, uncommitted-work detection, transaction identity across a commit, the full admission/attempt/completion lifecycle including the permanence of `first_fingerprint` and `started_at`, a success row riding the caller's transaction, affected-row damage detection, bind narrowing and missing-bind detection, admission in every context, reserved-object refusal, the DDL allow-list, required-object consistency, and error classification. |
+| 13 | Adapter contract **[new]** | **PASS** | Every behaviour below, per adapter: initialization to a verified layout, well-typed empty snapshot, physical-name resolution, engine-transaction state, uncommitted-work detection, transaction identity across a commit, the full admission/attempt/completion lifecycle including the permanence of `first_fingerprint` and `started_at`, a success row riding the caller's transaction, affected-row damage detection, bind narrowing and missing-bind detection, admission in every context, reserved-object refusal, the DDL allow-list, required-object consistency, error classification, and the identifier-level reserved-object rule with both its refusals and its admissions. |
 | 10 | Inspection | **PASS** | `validate` and `status` perform no initialization, no code import (driven by a unit whose module body raises), no migration execution, no compilation and no SQLite WAL change; consistent history snapshots; uninitialized distinguished from damaged and from incomplete-but-compatible; session-liveness diagnostics reporting `present` where privileges allow and `unknown` where they do not, with the honest caveat attached. |
 
 ## Commit-acknowledgement failure evidence

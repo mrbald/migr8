@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
 
 import oracledb
 
@@ -27,22 +26,19 @@ from ..errors import (
     UnsupportedCapabilityError,
     UsageError,
 )
-from ..manifest import Language, Mode, RequiredObject
+from ..manifest import Mode, RequiredObject
 from ..model import (
     ACTIVE_INDEX,
     HISTORY_TABLE,
-    LAYOUT_VERSION,
     META_SINGLETON_KEY,
     META_TABLE,
     PROGRESS_TABLE,
-    MetadataReport,
     Snapshot,
 )
 from ..sqltext import Statement
 from . import metadata as md
 from .base import (
     Adapter,
-    Boundary,
     Capabilities,
     OutcomeClass,
     StatementPolicy,
@@ -135,6 +131,7 @@ def _require_identifier(value: str, what: str) -> str:
 
 class OracleAdapter(Adapter):
     name = ADAPTER_NAME
+    driver_error = oracledb.Error
 
     # --- dialect ---------------------------------------------------------------
 
@@ -193,10 +190,6 @@ class OracleAdapter(Adapter):
         self._banner = "not connected"
         self._session_identity: str | None = None
         self._commit_wait_note = "not established"
-        #: Oracle assigns a local transaction id only once a write happens, so
-        #: "inside an engine-opened batch" is tracked explicitly rather than
-        #: inferred from LOCAL_TRANSACTION_ID.
-        self._batch_open = False
 
     # --- reporting ----------------------------------------------------------------
 
@@ -496,27 +489,8 @@ class OracleAdapter(Adapter):
 
     # --- metadata ----------------------------------------------------------------------
 
-    def inspect_metadata(self) -> MetadataReport:
-        present = self._objects_present()
-        problems = self._definition_problems(present)
-        meta = None
-        if META_TABLE.upper() in present:
-            try:
-                meta, extra = self._read_meta()
-            except oracledb.Error as exc:
-                problems.append(f"{META_TABLE} cannot be read: {exc}")
-                extra = None
-            if extra is not None and extra != 1 and meta is not None:
-                problems.append(f"{META_TABLE} holds {extra} rows; exactly one is expected")
-        return md.classify(
-            present={name.lower() for name in present},
-            problems=problems,
-            meta=meta,
-            history_count=self._count(HISTORY_TABLE, present),
-            progress_count=self._count(PROGRESS_TABLE, present),
-        )
-
     def _objects_present(self) -> set[str]:
+        """Oracle stores these folded to upper case; fold back to logical names."""
         names = [n.upper() for n in md.CREATION_ORDER]
         placeholders = ", ".join(f":n{i}" for i in range(len(names)))
         binds = {f"n{i}": name for i, name in enumerate(names)}
@@ -525,17 +499,12 @@ class OracleAdapter(Adapter):
             f"('TABLE','INDEX') AND object_name IN ({placeholders})",
             owner=self._schema, **binds,
         ).fetchall()
-        return {row[0] for row in rows}
-
-    def _count(self, table: str, present: set[str]) -> int | None:
-        if table.upper() not in present:
-            return None
-        return int(self._cursor().execute(f"SELECT COUNT(*) FROM {self._q(table)}").fetchone()[0])
+        return {row[0].lower() for row in rows}
 
     def _definition_problems(self, present: set[str]) -> list[str]:
         problems: list[str] = []
         for table, expected in _EXPECTED_COLUMNS.items():
-            if table.upper() not in present:
+            if table not in present:
                 continue
             rows = self._cursor().execute(
                 "SELECT column_name, data_type, char_length, char_used, nullable, "
@@ -564,7 +533,7 @@ class OracleAdapter(Adapter):
     def _constraint_problems(self, present: set[str]) -> list[str]:
         problems: list[str] = []
         for table, expected in _EXPECTED_CONSTRAINTS.items():
-            if table.upper() not in present:
+            if table not in present:
                 continue
             rows = self._cursor().execute(
                 "SELECT c.constraint_type, c.status, c.validated, c.search_condition, "
@@ -592,7 +561,7 @@ class OracleAdapter(Adapter):
                     continue
                 condition = row[3]
                 text = condition.read() if hasattr(condition, "read") else (condition or "")
-                checks.append((_normalise_condition(text), row[1], row[2]))
+                checks.append((md.normalise_definition(text), row[1], row[2]))
             for fragment in expected["checks"]:
                 matches = [c for c in checks if fragment in c[0]]
                 if not matches:
@@ -609,7 +578,7 @@ class OracleAdapter(Adapter):
         return problems
 
     def _index_problems(self, present: set[str]) -> list[str]:
-        if ACTIVE_INDEX.upper() not in present:
+        if ACTIVE_INDEX not in present:
             return []
         problems: list[str] = []
         row = self._cursor().execute(
@@ -636,7 +605,7 @@ class OracleAdapter(Adapter):
         rendered = " ".join(
             (value[0].read() if hasattr(value[0], "read") else str(value[0])) for value in expression
         )
-        normalised = _normalise_condition(rendered)
+        normalised = md.normalise_definition(rendered)
         if "STATUS" not in normalised or "ACTIVE" not in normalised:
             problems.append(
                 f"{ACTIVE_INDEX} expression does not restrict to status='ACTIVE': "
@@ -644,51 +613,14 @@ class OracleAdapter(Adapter):
             )
         return problems
 
-    def _read_meta(self):
-        columns = ", ".join(md.META_COLUMNS)
-        cursor = self._cursor()
-        count = int(cursor.execute(f"SELECT COUNT(*) FROM {self._q(META_TABLE)}").fetchone()[0])
-        row = cursor.execute(
-            f"SELECT {columns} FROM {self._q(META_TABLE)} WHERE meta_key = :key",
-            key=META_SINGLETON_KEY,
-        ).fetchone()
-        if row is None:
-            return None, count
-        return md.meta_row(tuple(row), _parse_timestamp), count
-
-    def initialize(self) -> None:
-        present = self._objects_present()
-        cursor = self._cursor()
-        for name in md.CREATION_ORDER:
-            if name.upper() in present:
-                continue
-            # Oracle DDL commits independently, so each object is its own durable
-            # step; an interruption leaves a recognisable prefix.
-            statement = _DDL[name].format(history=self._q(HISTORY_TABLE),
-                                          progress=self._q(PROGRESS_TABLE),
-                                          meta=self._q(META_TABLE),
-                                          index=self._q(ACTIVE_INDEX))
-            cursor.execute(statement)
-
-        present = self._objects_present()
-        missing = sorted({n.upper() for n in md.CREATION_ORDER} - present)
-        problems = self._definition_problems(present)
-        if missing or problems:
-            raise MetadataDamagedError(
-                "metadata layout is not complete after creating objects: "
-                + "; ".join([*(f"missing {n}" for n in missing), *problems])
-            )
-
-        self.begin()
-        self._exec(
-            f"INSERT INTO {self.metadata_name(META_TABLE)} (meta_key, layout_version, "
-            "adapter, lock_provider, lock_binding, target_namespace, initialized_at) "
-            "VALUES (:key, :layout, :adapter, :provider, :binding, :namespace, {now})",
-            {"key": META_SINGLETON_KEY, "layout": LAYOUT_VERSION, "adapter": self.name,
-             "provider": self.config.lock.provider, "binding": self.lock_binding(),
-             "namespace": self._schema},
-        )
-        self.durable_commit(Boundary.INITIALIZATION_COMPLETE)
+    def _create_metadata_object(self, name: str) -> None:
+        """Oracle DDL commits independently, so the CREATE is its own durable step."""
+        self._cursor().execute(_DDL[name].format(
+            history=self._q(HISTORY_TABLE),
+            progress=self._q(PROGRESS_TABLE),
+            meta=self._q(META_TABLE),
+            index=self._q(ACTIVE_INDEX),
+        ))
 
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         """Read history, progress and the marker in one statement.
@@ -748,8 +680,6 @@ class OracleAdapter(Adapter):
             )
         return Snapshot(history=tuple(history), progress=tuple(progress), meta=meta)
 
-    # --- history transitions -------------------------------------------------------------
-
     # --- transaction control --------------------------------------------------------------
 
     def has_open_transaction(self) -> bool:
@@ -807,10 +737,10 @@ class OracleAdapter(Adapter):
 
     # --- execution --------------------------------------------------------------------------------
 
-    def execute(self, statement: Statement, params: object | None) -> int:
+    def _run(self, text: str, params: object | None):
         cursor = self._cursor()
-        cursor.execute(statement.text, params or {})
-        return max(cursor.rowcount, 0)
+        cursor.execute(text, params or {})
+        return cursor
 
     def executemany(self, statement: Statement, parameter_sets: list[object]) -> int:
         cursor = self._cursor()
@@ -819,13 +749,9 @@ class OracleAdapter(Adapter):
                            arraydmlrowcounts=False)
         return max(cursor.rowcount, 0)
 
-    def query(self, statement: Statement, params: object | None) -> list[tuple]:
-        cursor = self._cursor()
-        cursor.execute(statement.text, params or {})
-        return [tuple(row) for row in cursor.fetchall()]
-
     def execute_ddl(self, statement: Statement) -> None:
-        self._cursor().execute(statement.text)
+        """Oracle DDL commits independently, so it owns no engine transaction."""
+        self._run(statement.text, None)
 
     # --- final validity ---------------------------------------------------------------------------
 
@@ -913,8 +839,6 @@ class OracleAdapter(Adapter):
             f"line {row[0]}:{row[1]} {str(_lob(row[2])).strip()}" for row in rows
         )
 
-    # --- progress -----------------------------------------------------------------------------------
-
     # --- diagnostics -----------------------------------------------------------------------------------
 
     def probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
@@ -978,16 +902,6 @@ class OracleAdapter(Adapter):
 # --- helpers ---------------------------------------------------------------------------------------------
 
 _KIND_NAMES = {"P": "primary key", "U": "unique key", "R": "foreign key"}
-
-
-def _normalise_condition(text: str) -> str:
-    return re.sub(r'[\s"]+', " ", (text or "").upper()).strip()
-
-
-def _parse_timestamp(value: object) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value  # type: ignore[return-value]
-    return md.parse_iso_timestamp(value)
 
 
 def _lob(value):

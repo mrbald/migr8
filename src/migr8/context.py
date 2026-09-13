@@ -59,7 +59,8 @@ class _BaseContext:
         self._adapter.admit_statement(statement, mode=self._mode, in_batch=self._in_batch)
         return statement
 
-    def _guard_call(self, operation: str, func, *args):
+    def _guard_call(self, operation: str, func, *args,
+                    phase: str = "migration_execution"):
         """Run a non-commit-capable driver call and classify any failure.
 
         A call that is not commit-capable can still lose the transport.  When it
@@ -73,11 +74,20 @@ class _BaseContext:
                     UnknownOutcomeError(
                         str(exc),
                         operation=operation,
-                        phase="migration_execution",
+                        phase=phase,
                         migration_id=self.migration_id,
                     )
                 ) from exc
             raise
+
+    @property
+    def batch_open(self) -> bool:
+        """True when a batch was entered and never exited.
+
+        Always False in atomic mode, which has no batches; the engine's
+        post-return check can therefore ask any context.
+        """
+        return False
 
     # --- SQL -------------------------------------------------------------------
 
@@ -223,12 +233,10 @@ class _BatchContext:
     report.
     """
 
-    __slots__ = ("_owner", "_entered", "_finished")
+    __slots__ = ("_owner",)
 
     def __init__(self, owner: RestartableContext) -> None:
         self._owner = owner
-        self._entered = False
-        self._finished = False
 
     def __enter__(self) -> RestartableContext:
         owner = self._owner
@@ -246,12 +254,10 @@ class _BatchContext:
         owner._adapter.begin()
         owner._in_batch = True
         owner._open_batch = self
-        self._entered = True
         return owner
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         owner = self._owner
-        self._finished = True
         owner._in_batch = False
         owner._open_batch = None
         if exc_type is not None:
@@ -320,19 +326,10 @@ class RestartableContext(_BaseContext):
                 migration_id=self.migration_id,
             )
         hooks.fire(Boundary.RESTARTABLE_DDL, hooks.BEFORE_DDL)
-        try:
-            self._adapter.execute_ddl(statement)
-        except Exception as exc:
-            if self._adapter.classify_exception(exc) is OutcomeClass.COMMUNICATION_FAILURE:
-                raise self._latch.latch_unknown(
-                    UnknownOutcomeError(
-                        str(exc),
-                        operation="DDL execution",
-                        phase="restartable_ddl",
-                        migration_id=self.migration_id,
-                    )
-                ) from exc
-            raise
+        self._guard_call(
+            "DDL execution", self._adapter.execute_ddl, statement,
+            phase="restartable_ddl",
+        )
         hooks.fire(Boundary.RESTARTABLE_DDL, hooks.AFTER_DDL)
 
 

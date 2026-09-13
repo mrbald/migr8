@@ -7,6 +7,7 @@ recreated once the completion marker exists.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from ..model import (
@@ -102,6 +103,18 @@ def meta_row(values: tuple, parse_timestamp) -> MetaRow:
     )
 
 
+def normalise_definition(text: str, *, drop_parens: bool = False) -> str:
+    """Collapse whitespace and quoting so a stored definition compares by meaning.
+
+    Constraint and index definitions come back formatted by the database, and
+    their generated names differ per installation, so the comparison is against
+    the normalised text rather than the name.  PostgreSQL also parenthesises
+    check conditions more than Oracle does, hence ``drop_parens``.
+    """
+    pattern = r'[\s"()]+' if drop_parens else r'[\s"]+'
+    return re.sub(pattern, " ", (text or "").upper()).strip()
+
+
 def parse_iso_timestamp(value: object) -> datetime | None:
     """Parse a database-produced ISO-8601 timestamp string."""
     if value is None:
@@ -189,10 +202,7 @@ __all__ = [
     "history_row",
     "progress_row",
     "meta_row",
+    "normalise_definition",
     "parse_iso_timestamp",
     "classify",
-    "HISTORY_TABLE",
-    "PROGRESS_TABLE",
-    "META_TABLE",
-    "ACTIVE_INDEX",
 ]

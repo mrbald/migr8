@@ -54,7 +54,6 @@ class Report:
     problem_kind: str | None = None
     recovery_command: str | None = None
     exit_code: int = int(Exit.OK)
-    notes: list[str] = field(default_factory=list)
     #: Correlation id shared with the event log, so a report and its log line up.
     run_id: str = ""
 
@@ -114,8 +113,6 @@ class Report:
                         )
                         if item.session_liveness_detail:
                             lines.append(f"        note: {item.session_liveness_detail}")
-        for note in self.notes:
-            lines.append(f"note: {note}")
         if self.problem:
             lines.append("")
             lines.append(f"{self.problem_kind or 'problem'}: {self.problem}")

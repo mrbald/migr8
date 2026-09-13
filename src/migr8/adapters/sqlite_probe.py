@@ -27,28 +27,30 @@ from ..config import Config
 from ..errors import (
     ConfigError,
     LockNotAcquiredError,
-    MetadataDamagedError,
     UnsupportedCapabilityError,
     UsageError,
 )
-from ..manifest import Language, Mode, RequiredObject
 from ..model import (
     ACTIVE_INDEX,
     HISTORY_TABLE,
     META_SINGLETON_KEY,
     META_TABLE,
     PROGRESS_TABLE,
-    LAYOUT_VERSION,
-    MetadataReport,
     Snapshot,
 )
-from ..sqltext import Statement, StatementKind
-from ..version import TOOL_VERSION
+from ..sqltext import Statement
 from . import metadata as md
-from .base import Adapter, Boundary, Capabilities, OutcomeClass, StatementPolicy
+from .base import (
+    Adapter,
+    Boundary,
+    Capabilities,
+    OutcomeClass,
+    StatementPolicy,
+    bind_params,
+)
 
 ADAPTER_NAME = "sqlite-probe"
-LOCK_SUFFIX = ".fwlock"
+LOCK_SUFFIX = ".m8lock"
 
 #: Database time, produced by SQLite rather than by the Python process.
 _NOW = "strftime('%Y-%m-%dT%H:%M:%f','now')"
@@ -146,6 +148,7 @@ _EXPECTED_COLUMNS = {
 
 class SqliteProbeAdapter(Adapter):
     name = ADAPTER_NAME
+    driver_error = sqlite3.Error
 
     # --- dialect ---------------------------------------------------------------
 
@@ -341,22 +344,6 @@ class SqliteProbeAdapter(Adapter):
                 )
         return problems
 
-    def _read_meta(self, present: set[str]):
-        if META_TABLE not in present:
-            return None
-        columns = ", ".join(md.META_COLUMNS)
-        row = self._db.execute(
-            f"SELECT {columns} FROM {META_TABLE} WHERE meta_key = ?", (META_SINGLETON_KEY,)
-        ).fetchone()
-        if row is None:
-            return None
-        return md.meta_row(tuple(row), md.parse_iso_timestamp)
-
-    def _count(self, table: str, present: set[str]) -> int | None:
-        if table not in present:
-            return None
-        return int(self._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-
     # --- engine-owned SQL path, transactions and admission policy -----------------
 
     def _metadata_execute(self, sql: str, params) -> int:
@@ -385,65 +372,11 @@ class SqliteProbeAdapter(Adapter):
 
     # --- metadata -----------------------------------------------------------------
 
-    def inspect_metadata(self) -> MetadataReport:
-        present = self._objects_present()
-        problems = self._definition_problems(present)
-        meta = None
-        if not problems or META_TABLE in present:
-            try:
-                meta = self._read_meta(present)
-            except sqlite3.Error as exc:
-                problems.append(f"{META_TABLE} cannot be read: {exc}")
-        if meta is not None:
-            extra_rows = int(
-                self._db.execute(f"SELECT COUNT(*) FROM {META_TABLE}").fetchone()[0]
-            )
-            if extra_rows != 1:
-                problems.append(f"{META_TABLE} holds {extra_rows} rows; exactly one is expected")
-        return md.classify(
-            present=present,
-            problems=problems,
-            meta=meta,
-            history_count=self._count(HISTORY_TABLE, present),
-            progress_count=self._count(PROGRESS_TABLE, present),
-        )
-
-    def initialize(self) -> None:
-        """Create missing objects in fixed order, verify, then commit the marker last."""
-        present = self._objects_present()
-        for name in md.CREATION_ORDER:
-            if name in present:
-                continue
-            # Each CREATE is its own durable step, so an interruption leaves a
-            # recognisable prefix rather than a half-built object.
-            self.begin()
-            self._db.execute(_DDL[name])
-            self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
-
-        present = self._objects_present()
-        missing = sorted(set(md.CREATION_ORDER) - present)
-        problems = self._definition_problems(present)
-        if missing or problems:
-            raise MetadataDamagedError(
-                "metadata layout is not complete after creating objects: "
-                + "; ".join([*(f"missing {name}" for name in missing), *problems])
-            )
-
+    def _create_metadata_object(self, name: str) -> None:
+        """SQLite DDL is transactional, so each CREATE is its own durable step."""
         self.begin()
-        self._exec(
-            f"INSERT INTO {META_TABLE} (meta_key, layout_version, adapter, lock_provider, "
-            f"lock_binding, target_namespace, initialized_at) "
-            f"VALUES (:key, :layout, :adapter, :provider, :binding, :namespace, {{now}})",
-            {
-                "key": META_SINGLETON_KEY,
-                "layout": LAYOUT_VERSION,
-                "adapter": self.name,
-                "provider": self.config.lock.provider,
-                "binding": self.lock_binding(),
-                "namespace": self.normalized_namespace(),
-            },
-        )
-        self.durable_commit(Boundary.INITIALIZATION_COMPLETE)
+        self._db.execute(_DDL[name])
+        self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
 
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         db = self._db
@@ -468,14 +401,12 @@ class SqliteProbeAdapter(Adapter):
                     "ORDER BY migration_id, prog_key"
                 ).fetchall()
             )
-            meta = self._read_meta({META_TABLE})
+            meta, _rows = self._read_meta()
         finally:
             if opened:
                 db.execute("COMMIT")
                 self._txn_epoch += 1
         return Snapshot(history=history, progress=progress, meta=meta)
-
-    # --- history transitions -------------------------------------------------------
 
     # --- transaction control --------------------------------------------------------
 
@@ -497,36 +428,14 @@ class SqliteProbeAdapter(Adapter):
             return None
         return f"sqlite-txn:{self._txn_epoch}"
 
-    # --- admission -------------------------------------------------------------------
-
     # --- execution --------------------------------------------------------------------
 
-    def execute(self, statement: Statement, params: object | None) -> int:
-        cursor = self._db.execute(statement.text, _bind(params))
-        return max(cursor.rowcount, 0)
+    def _run(self, text: str, params: object | None):
+        return self._db.execute(text, _bind(params))
 
     def executemany(self, statement: Statement, parameter_sets: list[object]) -> int:
         cursor = self._db.executemany(statement.text, [_bind(item) for item in parameter_sets])
         return max(cursor.rowcount, 0)
-
-    def query(self, statement: Statement, params: object | None) -> list[tuple]:
-        cursor = self._db.execute(statement.text, _bind(params))
-        return [tuple(row) for row in cursor.fetchall()]
-
-    def execute_ddl(self, statement: Statement) -> None:
-        # SQLite DDL is transactional; the probe runs it in its own transaction
-        # rather than pretending Oracle's implicit commits exist.
-        self.begin()
-        try:
-            self._db.execute(statement.text)
-        except sqlite3.Error:
-            self.rollback()
-            raise
-        self.durable_commit(Boundary.RESTARTABLE_DDL)
-
-    # --- final validity ----------------------------------------------------------------
-
-    # --- progress ----------------------------------------------------------------------
 
     # --- error classification -----------------------------------------------------------
 
@@ -543,10 +452,5 @@ class SqliteProbeAdapter(Adapter):
 
 
 def _bind(params: object | None):
-    if params is None:
-        return ()
-    if isinstance(params, (list, tuple)):
-        return tuple(params)
-    if isinstance(params, dict):
-        return params
-    return (params,)
+    """sqlite3 refuses ``None`` where it expects a parameter sequence."""
+    return bind_params(params, empty=())
