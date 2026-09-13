@@ -181,7 +181,7 @@ def test_lock_file_is_not_unlinked_and_is_reused(tmp_path):
     ])
     support.sqlite_config(root, db_path=db, timeout=5)
     assert run_cli(["migrate"], root).returncode == Exit.OK
-    lock_file = db.with_name(db.name + ".fwlock")
+    lock_file = db.with_name(db.name + ".m8lock")
     assert lock_file.exists()
     inode = os.stat(lock_file).st_ino
     assert run_cli(["migrate"], root).returncode == Exit.OK

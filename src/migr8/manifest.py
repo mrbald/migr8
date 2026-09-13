@@ -36,7 +36,7 @@ class Mode(StrEnum):
     RESTARTABLE = "restartable"
 
 
-@dataclass(frozen=True, slots=True, order=True)
+@dataclass(frozen=True, slots=True)
 class RequiredObject:
     """One declared final-validity requirement.  The owner is the target schema."""
 
@@ -72,17 +72,6 @@ class Manifest:
     path: Path
     directory: Path
     migrations: tuple[MigrationDef, ...]
-
-    def by_id(self, migration_id: str) -> MigrationDef | None:
-        for entry in self.migrations:
-            if entry.id == migration_id:
-                return entry
-        return None
-
-    def at_position(self, position: int) -> MigrationDef | None:
-        if 1 <= position <= len(self.migrations):
-            return self.migrations[position - 1]
-        return None
 
 
 def load(manifest_path: Path) -> Manifest:

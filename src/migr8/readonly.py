@@ -12,11 +12,9 @@ from .errors import (
     Exit,
     Migr8Error,
     MetadataDamagedError,
-    NotInitializedError,
     RecoveryRequiredError,
-    UsageError,
 )
-from .engine import preflight, verify_bindings
+from .checks import preflight, verify_bindings
 from .model import Capture, MetadataState, Snapshot
 from .reporting import Report, status_from_row
 from .statevalidate import build_plan, require_no_recovery_needed
@@ -110,21 +108,28 @@ def _prepare(command: str, adapter: Adapter, capture: Capture) -> tuple[Report, 
     return report, snapshot
 
 
-def run_status(adapter: Adapter, capture: Capture) -> Report:
-    """Always describe the namespace; the exit code still reflects any failure."""
+def _run(command: str, adapter: Adapter, capture: Capture, *, with_liveness: bool,
+         recovery_suffix: str = "") -> Report:
+    """The shared body of both read-only commands.
+
+    They differ only in whether the active migration's session is probed and in
+    how much the recovery-required message spells out, so the sequence itself
+    exists once: preflight, connect, inspect, read, then validate the plan
+    without acting on it.
+    """
     preflight(capture, adapter)
     adapter.connect()
     try:
-        report, snapshot = _prepare("status", adapter, capture)
+        report, snapshot = _prepare(command, adapter, capture)
         if snapshot is None:
             return report
-        _fill(report, capture, snapshot, adapter, with_liveness=True)
+        _fill(report, capture, snapshot, adapter, with_liveness=with_liveness)
         try:
             plan = build_plan(capture, snapshot)
             require_no_recovery_needed(plan)
         except RecoveryRequiredError as exc:
             report.problem_kind = "recovery required"
-            report.problem = exc.message
+            report.problem = exc.message + recovery_suffix
             report.recovery_command = f"migr8 migrate --recover {exc.migration_id}"
             report.exit_code = int(exc.exit_code)
         except Migr8Error as exc:
@@ -136,38 +141,22 @@ def run_status(adapter: Adapter, capture: Capture) -> Report:
         return report
     finally:
         adapter.close()
+
+
+def run_status(adapter: Adapter, capture: Capture) -> Report:
+    """Always describe the namespace; the exit code still reflects any failure."""
+    return _run("status", adapter, capture, with_liveness=True)
 
 
 def run_validate(adapter: Adapter, capture: Capture) -> Report:
     """Check the manifest and history contracts.  Modifies nothing."""
-    preflight(capture, adapter)
-    adapter.connect()
-    try:
-        report, snapshot = _prepare("validate", adapter, capture)
-        if snapshot is None:
-            return report
-        _fill(report, capture, snapshot, adapter, with_liveness=False)
-        try:
-            plan = build_plan(capture, snapshot)
-            require_no_recovery_needed(plan)
-        except RecoveryRequiredError as exc:
-            report.problem_kind = "recovery required"
-            report.problem = (
-                exc.message
-                + " This is a recovery-required condition, not permission to modify the "
-                "active marker."
-            )
-            report.recovery_command = f"migr8 migrate --recover {exc.migration_id}"
-            report.exit_code = int(exc.exit_code)
-        except Migr8Error as exc:
-            report.problem_kind = (
-                "metadata damaged" if isinstance(exc, MetadataDamagedError) else "validation"
-            )
-            report.problem = exc.report()
-            report.exit_code = int(exc.exit_code)
-        return report
-    finally:
-        adapter.close()
+    return _run(
+        "validate", adapter, capture, with_liveness=False,
+        recovery_suffix=(
+            " This is a recovery-required condition, not permission to modify the "
+            "active marker."
+        ),
+    )
 
 
-__all__ = ["run_status", "run_validate", "NotInitializedError", "UsageError"]
+__all__ = ["run_status", "run_validate"]

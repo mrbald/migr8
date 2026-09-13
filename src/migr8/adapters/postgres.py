@@ -17,33 +17,29 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
 
 import psycopg
-from psycopg import sql as pgsql
 
 from ..config import Config
-from ..errors import (
-    ConfigError,
-    LockNotAcquiredError,
-    MetadataDamagedError,
-    UnsupportedCapabilityError,
-    UsageError,
-)
-from ..manifest import Language, Mode, RequiredObject
+from ..errors import ConfigError, LockNotAcquiredError, UsageError
+from ..manifest import Mode
 from ..model import (
     ACTIVE_INDEX,
     HISTORY_TABLE,
-    LAYOUT_VERSION,
-    META_SINGLETON_KEY,
     META_TABLE,
     PROGRESS_TABLE,
-    MetadataReport,
     Snapshot,
 )
-from ..sqltext import Statement, StatementKind
+from ..sqltext import Statement
 from . import metadata as md
-from .base import Adapter, Boundary, Capabilities, OutcomeClass, StatementPolicy
+from .base import (
+    Adapter,
+    Boundary,
+    Capabilities,
+    OutcomeClass,
+    StatementPolicy,
+    bind_params,
+)
 
 LOGGER = logging.getLogger("migr8.adapters.postgres")
 
@@ -82,6 +78,7 @@ def _require_identifier(value: str, what: str) -> str:
 
 class PostgresAdapter(Adapter):
     name = ADAPTER_NAME
+    driver_error = psycopg.Error
 
     # --- dialect ---------------------------------------------------------------
 
@@ -122,7 +119,6 @@ class PostgresAdapter(Adapter):
         self._banner = "not connected"
         self._session_identity: str | None = None
         self._synchronous_commit = "not established"
-        self._batch_open = False
 
     # --- reporting ------------------------------------------------------------
 
@@ -197,11 +193,7 @@ class PostgresAdapter(Adapter):
             )
         self._synchronous_commit = "VERIFIED 'on' by session read-back"
         try:
-            conn.execute(
-                pgsql.SQL("SET search_path = {}, pg_catalog").format(
-                    pgsql.Identifier(self._schema)
-                )
-            )
+            conn.execute(f"SET search_path = {self.quoted(self._schema)}, pg_catalog")
         except psycopg.Error as exc:
             raise UsageError(f"cannot set search_path to {self._schema}: {exc}") from exc
         row = conn.execute(
@@ -293,17 +285,6 @@ class PostgresAdapter(Adapter):
             raise UsageError("the PostgreSQL session is not connected")
         return self._conn
 
-    def _t(self, name: str) -> pgsql.Composed:
-        """Schema-qualified metadata object, for the psycopg-composed queries.
-
-        It resolves through the shared :meth:`Adapter.metadata_name` inputs, so
-        the composed and the string-built paths cannot name different objects.
-        """
-        return pgsql.SQL("{}.{}").format(
-            pgsql.Identifier(self.metadata_schema or self._schema),
-            pgsql.Identifier(self._physical_object_name(name)),
-        )
-
     # --- engine-owned SQL path, transactions and admission policy ------------------
 
     def _metadata_execute(self, sql: str, params) -> int:
@@ -338,27 +319,6 @@ class PostgresAdapter(Adapter):
 
     # --- metadata ------------------------------------------------------------------
 
-    def inspect_metadata(self) -> MetadataReport:
-        present = self._objects_present()
-        problems = self._definition_problems(present)
-        meta = None
-        if META_TABLE in present:
-            try:
-                meta, extra = self._read_meta()
-                if meta is not None and extra != 1:
-                    problems.append(
-                        f"{META_TABLE} holds {extra} rows; exactly one is expected"
-                    )
-            except psycopg.Error as exc:
-                problems.append(f"{META_TABLE} cannot be read: {exc}")
-        return md.classify(
-            present=present,
-            problems=problems,
-            meta=meta,
-            history_count=self._count(HISTORY_TABLE, present),
-            progress_count=self._count(PROGRESS_TABLE, present),
-        )
-
     def _objects_present(self) -> set[str]:
         rows = self._db.execute(
             "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -366,15 +326,6 @@ class PostgresAdapter(Adapter):
             (self._schema, list(md.CREATION_ORDER)),
         ).fetchall()
         return {row[0] for row in rows}
-
-    def _count(self, table: str, present: set[str]) -> int | None:
-        if table not in present:
-            return None
-        return int(
-            self._db.execute(
-                pgsql.SQL("SELECT count(*) FROM {}").format(self._t(table))
-            ).fetchone()[0]
-        )
 
     def _definition_problems(self, present: set[str]) -> list[str]:
         problems: list[str] = []
@@ -424,7 +375,8 @@ class PostgresAdapter(Adapter):
                         f"{sorted(keys)}"
                     )
             checks = [
-                (_normalise(row[2]), row[1]) for row in rows if row[0] == "c"
+                (md.normalise_definition(row[2], drop_parens=True), row[1])
+                for row in rows if row[0] == "c"
             ]
             for fragment in expected["checks"]:
                 matches = [item for item in checks if fragment in item[0]]
@@ -463,67 +415,28 @@ class PostgresAdapter(Adapter):
             problems.append(f"{ACTIVE_INDEX} is not UNIQUE")
         if not valid or not ready:
             problems.append(f"{ACTIVE_INDEX} is not valid and ready")
-        normalised = _normalise(definition)
+        normalised = md.normalise_definition(definition, drop_parens=True)
         if "WHERE" not in normalised or "ACTIVE" not in normalised:
             problems.append(
                 f"{ACTIVE_INDEX} is not restricted to status='ACTIVE': {definition!r}"
             )
         return problems
 
-    def _read_meta(self):
-        conn = self._db
-        count = int(
-            conn.execute(
-                pgsql.SQL("SELECT count(*) FROM {}").format(self._t(META_TABLE))
-            ).fetchone()[0]
-        )
-        row = conn.execute(
-            pgsql.SQL("SELECT {} FROM {} WHERE meta_key = %s").format(
-                pgsql.SQL(", ").join(pgsql.Identifier(c) for c in md.META_COLUMNS),
-                self._t(META_TABLE),
-            ),
-            (META_SINGLETON_KEY,),
-        ).fetchone()
-        if row is None:
-            return None, count
-        return md.meta_row(tuple(row), _passthrough), count
+    def _create_metadata_object(self, name: str) -> None:
+        """PostgreSQL DDL is transactional, so each object gets its own commit.
 
-    def initialize(self) -> None:
-        conn = self._db
-        present = self._objects_present()
-        for name in md.CREATION_ORDER:
-            if name in present:
-                continue
-            # PostgreSQL DDL is transactional, so each object is created in its own
-            # explicit transaction.  Oracle's implicit DDL commits are not emulated.
-            self.begin()
-            conn.execute(_DDL[name].format(
-                history=self._t(HISTORY_TABLE).as_string(conn),
-                progress=self._t(PROGRESS_TABLE).as_string(conn),
-                meta=self._t(META_TABLE).as_string(conn),
-                index=pgsql.Identifier(ACTIVE_INDEX).as_string(conn),
-            ))
-            self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
-
-        present = self._objects_present()
-        missing = sorted(set(md.CREATION_ORDER) - present)
-        problems = self._definition_problems(present)
-        if missing or problems:
-            raise MetadataDamagedError(
-                "metadata layout is not complete after creating objects: "
-                + "; ".join([*(f"missing {name}" for name in missing), *problems])
-            )
-
+        Oracle's implicit DDL commits are not emulated.
+        """
         self.begin()
-        self._exec(
-            f"INSERT INTO {self.metadata_name(META_TABLE)} (meta_key, layout_version, "
-            "adapter, lock_provider, lock_binding, target_namespace, initialized_at) "
-            "VALUES (:key, :layout, :adapter, :provider, :binding, :namespace, {now})",
-            {"key": META_SINGLETON_KEY, "layout": LAYOUT_VERSION, "adapter": self.name,
-             "provider": self.config.lock.provider, "binding": self.lock_binding(),
-             "namespace": self._schema},
-        )
-        self.durable_commit(Boundary.INITIALIZATION_COMPLETE)
+        self._db.execute(_DDL[name].format(
+            history=self.metadata_name(HISTORY_TABLE),
+            progress=self.metadata_name(PROGRESS_TABLE),
+            meta=self.metadata_name(META_TABLE),
+            # CREATE INDEX takes a bare name; PostgreSQL puts the index in the
+            # schema of the table it indexes.
+            index=self.quoted(self._physical_object_name(ACTIVE_INDEX)),
+        ))
+        self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
 
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         conn = self._db
@@ -535,36 +448,29 @@ class PostgresAdapter(Adapter):
             opened = True
         try:
             history = tuple(
-                md.history_row(tuple(row), _passthrough)
-                for row in conn.execute(
-                    pgsql.SQL("SELECT {} FROM {} ORDER BY seq").format(
-                        pgsql.SQL(", ").join(
-                            pgsql.Identifier(c) for c in md.HISTORY_COLUMNS
-                        ),
-                        self._t(HISTORY_TABLE),
-                    )
-                ).fetchall()
+                md.history_row(row, md.parse_iso_timestamp)
+                for row in self._fetch(
+                    f"SELECT {self._columns(*md.HISTORY_COLUMNS)} "
+                    f"FROM {self.metadata_name(HISTORY_TABLE)} "
+                    f"ORDER BY {self.metadata_column('seq')}",
+                    {},
+                )
             )
             progress = tuple(
-                md.progress_row(tuple(row), _passthrough)
-                for row in conn.execute(
-                    pgsql.SQL(
-                        "SELECT {} FROM {} ORDER BY migration_id, prog_key"
-                    ).format(
-                        pgsql.SQL(", ").join(
-                            pgsql.Identifier(c) for c in md.PROGRESS_COLUMNS
-                        ),
-                        self._t(PROGRESS_TABLE),
-                    )
-                ).fetchall()
+                md.progress_row(row, md.parse_iso_timestamp)
+                for row in self._fetch(
+                    f"SELECT {self._columns(*md.PROGRESS_COLUMNS)} "
+                    f"FROM {self.metadata_name(PROGRESS_TABLE)} "
+                    f"ORDER BY {self.metadata_column('migration_id')}, "
+                    f"{self.metadata_column('prog_key')}",
+                    {},
+                )
             )
-            meta, _count = self._read_meta()
+            meta, _rows = self._read_meta()
         finally:
             if opened:
                 conn.execute("COMMIT")
         return Snapshot(history=history, progress=progress, meta=meta)
-
-    # --- history transitions ---------------------------------------------------------
 
     # --- transaction control ------------------------------------------------------
 
@@ -592,13 +498,10 @@ class PostgresAdapter(Adapter):
         ).fetchone()
         return None if row is None or row[0] is None else str(row[0])
 
-    # --- admission --------------------------------------------------------------------
-
     # --- execution ------------------------------------------------------------------------
 
-    def execute(self, statement: Statement, params: object | None) -> int:
-        cursor = self._db.execute(statement.text, _bind(params))
-        return max(cursor.rowcount, 0)
+    def _run(self, text: str, params: object | None):
+        return self._db.execute(text, _bind(params))
 
     def executemany(self, statement: Statement, parameter_sets: list[object]) -> int:
         with self._db.cursor() as cursor:
@@ -606,28 +509,13 @@ class PostgresAdapter(Adapter):
             cursor.executemany(statement.text, [_bind(item) for item in parameter_sets])
             return max(cursor.rowcount, 0)
 
-    def query(self, statement: Statement, params: object | None) -> list[tuple]:
-        cursor = self._db.execute(statement.text, _bind(params))
-        return [tuple(row) for row in cursor.fetchall()]
-
     def execute_ddl(self, statement: Statement) -> None:
-        conn = self._db
         if _is_concurrent(statement):
             # CREATE/DROP INDEX CONCURRENTLY cannot run in a transaction block, so it
             # runs on the autocommit connection with no BEGIN around it.
-            conn.execute(statement.text)
+            self._run(statement.text, None)
             return
-        self.begin()
-        try:
-            conn.execute(statement.text)
-        except psycopg.Error:
-            self.rollback()
-            raise
-        self.durable_commit(Boundary.RESTARTABLE_DDL)
-
-    # --- final validity -------------------------------------------------------------------
-
-    # --- progress -------------------------------------------------------------------------
+        super().execute_ddl(statement)
 
     # --- diagnostics ------------------------------------------------------------------------
 
@@ -680,31 +568,15 @@ class PostgresAdapter(Adapter):
 _KIND_NAMES = {"p": "primary key", "u": "unique key", "f": "foreign key"}
 
 
-def _normalise(text: str) -> str:
-    """Collapse whitespace, quotes and parentheses so semantics can be compared."""
-    return re.sub(r'[\s"()]+', " ", (text or "").upper()).strip()
-
-
 def _is_concurrent(statement: Statement) -> bool:
     return "CONCURRENTLY" in statement.lead or "CONCURRENTLY" in {
         word.upper() for word in statement.text.split()
     }
 
 
-def _passthrough(value: object) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value  # type: ignore[return-value]
-    return md.parse_iso_timestamp(value)
-
-
 def _bind(params: object | None):
-    if params is None:
-        return None
-    if isinstance(params, (list, tuple)):
-        return tuple(params)
-    if isinstance(params, dict):
-        return params
-    return (params,)
+    """psycopg reads ``None`` as "do not interpolate", so a literal ``%`` survives."""
+    return bind_params(params, empty=None)
 
 
 _DDL = {

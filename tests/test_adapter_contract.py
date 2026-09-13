@@ -23,7 +23,7 @@ from migr8.adapters.base import Adapter, OutcomeClass
 from migr8.config import load as load_config
 from migr8.errors import MetadataDamagedError, UnsupportedCapabilityError, UsageError
 from migr8.manifest import Language, Mode
-from migr8.model import HISTORY_TABLE, MetadataState
+from migr8.model import HISTORY_TABLE, META_TABLE, PROGRESS_TABLE, MetadataState
 from migr8.sqltext import normalize
 
 LOCK_ID = 4719  # distinct from the other suites so they never contend
@@ -265,10 +265,9 @@ def test_admission_completion_and_progress_lifecycle(ready: Adapter):
 
     # A later admission changes only what recovery is allowed to change.
     first = ready.read_snapshot(consistent=True).history[0]
-    attempt = ready.update_active_attempt(
+    ready.update_active_attempt(
         migration_id="contract", fingerprint=FP_B, language=Language.SQL
     )
-    assert attempt == 2
     row = ready.read_snapshot(consistent=True).history[0]
     assert row.attempt == 2
     assert row.fingerprint == FP_B
@@ -342,6 +341,33 @@ def test_bind_narrowing_and_missing_bind_detection(ready: Adapter):
         )
 
 
+class _Dialect:
+    """The two attributes ``Adapter._render`` reads, and nothing else.
+
+    Calling the unbound method keeps this a unit test of the renderer rather than
+    of any one adapter, and lets it use a dialect no shipped adapter declares.
+    """
+
+    def __init__(self, paramstyle: str, now_expression: str) -> None:
+        self.paramstyle = paramstyle
+        self.now_expression = now_expression
+
+
+@pytest.mark.parametrize("paramstyle,now,expected", [
+    # A cast in the timestamp expression must not be mistaken for a placeholder.
+    ("pyformat", "now()::timestamptz", "(%(migration_id)s, now()::timestamptz)"),
+    ("pyformat", "clock_timestamp()", "(%(migration_id)s, clock_timestamp())"),
+    ("named", "SYSTIMESTAMP", "(:migration_id, SYSTIMESTAMP)"),
+])
+def test_placeholders_are_translated_before_the_timestamp_expression(
+    paramstyle, now, expected
+):
+    rendered = Adapter._render(
+        _Dialect(paramstyle, now), "INSERT INTO t (a, ts) VALUES (:migration_id, {now})"
+    )
+    assert rendered == f"INSERT INTO t (a, ts) VALUES {expected}"
+
+
 # --- statement admission --------------------------------------------------------------
 
 def test_forbidden_tokens_are_refused_in_every_context(ready: Adapter):
@@ -369,12 +395,42 @@ def test_queries_are_admitted_outside_a_batch(ready: Adapter):
     )
 
 
-def test_reserved_metadata_objects_are_refused(ready: Adapter):
-    statement = normalize(f"DELETE FROM {HISTORY_TABLE}")
+@pytest.mark.parametrize("sql", [
+    f"DELETE FROM {HISTORY_TABLE}",
+    f"DELETE FROM other_schema.{HISTORY_TABLE}",
+    f'DELETE FROM "{HISTORY_TABLE.upper()}"',
+    f'DELETE FROM "{HISTORY_TABLE}"',
+])
+def test_reserved_metadata_objects_are_refused(ready: Adapter, sql):
+    """Every way of naming the object is a reference, quoted or qualified."""
     with pytest.raises(UsageError, match="reserved metadata object"):
-        ready.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
+        ready.admit_statement(normalize(sql), mode=Mode.ATOMIC, in_batch=False)
     with pytest.raises(UsageError, match="reserved metadata object"):
         ready.admit_ddl(normalize(f"DROP TABLE {HISTORY_TABLE}"))
+
+
+#: An application object whose name merely *contains* a reserved one, built by
+#: prefixing so the case keeps tracking the constants: "custo" + "m8_history"
+#: is "custom8_history". A substring scan refuses these; a token match does not.
+_LOOKALIKE_HISTORY = f"custo{HISTORY_TABLE}"
+_LOOKALIKE_PROGRESS = f"platfor{PROGRESS_TABLE}"
+_LOOKALIKE_META = f"custo{META_TABLE}"
+
+
+@pytest.mark.parametrize("sql", [
+    f"UPDATE {_LOOKALIKE_HISTORY} SET col = 1",
+    f"SELECT col FROM {_LOOKALIKE_PROGRESS}",
+    # A literal or a comment mentioning the engine table is prose, not a
+    # reference; the lexer already separates both from identifiers.
+    f"INSERT INTO probe_table (col) VALUES ('see {META_TABLE} for details')",
+    f"-- {HISTORY_TABLE} is the engine table; do not touch\nSELECT col FROM probe_table",
+])
+def test_names_that_merely_contain_a_reserved_name_are_admitted(ready: Adapter, sql):
+    ready.admit_statement(normalize(sql), mode=Mode.ATOMIC, in_batch=False)
+
+
+def test_ddl_naming_a_lookalike_object_is_admitted(ready: Adapter):
+    ready.admit_ddl(normalize(f"CREATE TABLE {_LOOKALIKE_META} (id INTEGER)"))
 
 
 def test_ddl_allow_list_is_enforced(ready: Adapter):

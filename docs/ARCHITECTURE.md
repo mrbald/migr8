@@ -25,10 +25,22 @@ marked **kept** or **open** is a deliberate position with a reason.
 | 11 | The five reporting methods could collapse into one descriptor | low | open |
 | 12 | Oracle's `has_open_transaction()` costs a round trip and is called often | low | kept |
 
-Counts after the work: **430 tests**, all passing, across pure, SQLite probe,
+A second pass after the rename to `migr8` reviewed the whole tree again:
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| 13 | Reserved-object refusal matched substrings, not identifiers | **high** | fixed |
+| 14 | Placeholder translation ran before the timestamp expression was safe | medium | fixed |
+| 15 | Metadata initialization and inspection were implemented three times | medium | fixed |
+| 16 | `readonly` imported `engine`, and through it the Python unit loader | low | fixed |
+| 17 | Eleven unreferenced members and two redundant wrappers | low | fixed |
+| 18 | The PostgreSQL adapter built SQL two different ways | low | fixed |
+
+Counts after the work: **460 tests**, all passing, across pure, SQLite probe,
 PostgreSQL 17.5 and Oracle Free 23.9. The adapter contract went from 35 abstract
 members to **27**, and about 630 lines of duplicated adapter logic became ~380
-lines of shared policy.
+lines of shared policy. The second pass removed a further 178 source lines while
+adding the tests that pin findings 13 and 14.
 
 ---
 
@@ -129,6 +141,8 @@ Two real bugs surfaced while doing it, which is the point:
 What was **not** merged: metadata inspection and the physical DDL. Oracle's
 `ALL_TAB_COLUMNS`, PostgreSQL's `pg_attribute` and SQLite's `PRAGMA table_info`
 are genuinely different, and forcing them into one shape would obscure all three.
+That still holds for the dictionary queries themselves. It did not hold for the
+sequence around them, which finding 15 later moved into the base.
 
 Net effect on size is roughly flat, about 7,250 lines. The win is structural: the
 number of places one rule can be wrong went from three to one.
@@ -160,7 +174,7 @@ Adapters were tested through the engine, in one test file per engine. Adding an
 adapter meant writing a fourth file and hoping it covered the same ground.
 
 `tests/test_adapter_contract.py` is one suite parametrised over every configured
-adapter: 21 behaviours covering initialization, engine-transaction state,
+adapter, covering initialization, engine-transaction state,
 transaction identity, the full admission/attempt/completion lifecycle, the
 permanence of `first_fingerprint` and `started_at` across a recovery, bind
 narrowing, statement admission in every context, reserved-object refusal, and
@@ -225,29 +239,160 @@ be wrong: the whole point is to ask the database rather than trust bookkeeping,
 which is precisely the mistake finding 5 came from. The cost is one round trip at
 a handful of boundaries per migration.
 
+## 13. Reserved-object refusal matched substrings — fixed
+
+`_reject_reserved` upper-cased the whole statement and asked whether each
+reserved name appeared anywhere in it. That refuses far more than it should, and
+the rename made it sharper, because `m8` reads like the end of an ordinary word.
+All four of these were rejected:
+
+```
+CREATE TABLE custom8_history (id INTEGER)
+SELECT * FROM platform8_progress
+INSERT INTO orders (note) VALUES ('see m8_meta for details')
+-- m8_history is the engine table; do not touch
+SELECT 1
+```
+
+It fails in the safe direction, but it fails on legitimate work: a schema with a
+table called `custom8_history` could not be migrated at all, and the message
+would blame the author for something they had not done.
+
+The lexer already separates identifiers from comments and literals. `Statement`
+now carries `names`, the upper-cased set of its word and quoted-identifier
+tokens, built from the token list `normalize()` was already walking, and the
+refusal matches against that. Schema-qualified and quoted references still match,
+because `.` is not an identifier character to the scanner. The contract suite
+asserts both directions, on all three adapters.
+
+## 14. Placeholders were translated after `{now}` — fixed
+
+`_render` substituted the engine's timestamp expression first and only then
+rewrote `:name` into `%(name)s` for a pyformat engine. Its sibling `_binds` reads
+placeholder names from the *unrendered* template, and its docstring says why;
+`_render` did not follow the same rule. A timestamp expression carrying a
+PostgreSQL cast corrupted silently:
+
+```
+now()::timestamptz   ->   now():%(timestamptz)s
+```
+
+Not live, because the one pyformat adapter uses `clock_timestamp()`. That is the
+kind of defect worth fixing before it is live: the next adapter, or a change to
+this one, would have produced malformed engine-owned SQL with no failing test in
+between. The two statements are now in the other order, and a unit test pins it
+with a colon-bearing expression no shipped adapter declares.
+
+## 15. Metadata initialization and inspection existed three times — fixed
+
+Finding 4 consolidated the history transitions, the progress store and statement
+admission, and deliberately left metadata inspection alone because the dictionary
+queries are genuinely different. That was right about the queries and wrong about
+the sequence around them. `initialize()` was 31 to 34 lines in each adapter and
+differed only in which DDL text to run and whether each create needed its own
+commit; the marker insert, which is a durable transition with a real invariant,
+existed three times, and two copies spelled the same value differently.
+
+`Adapter` now owns `initialize()` and `inspect_metadata()`, plus `_read_meta()`
+and `_count()`, which turned out to need no engine-specific SQL at all once they
+were written through the shared renderer. What stayed adapter-owned is what is
+actually different: `_objects_present()`, `_definition_problems()` and one new
+`_create_metadata_object()` hook, where Oracle submits DDL that commits itself
+and the other two wrap it in an engine transaction.
+
+`_objects_present()` now has a stated contract: it returns logical names, so
+Oracle folds its dictionary's upper case back rather than making every caller
+remember to. That removed the `.upper()` calls scattered through four Oracle
+methods.
+
+The gate for this was the live suites, not the fast ones: the interrupted
+initialization scenarios parametrise over each independently durable object and
+over both sides of the marker.
+
+## 16. The read-only path imported the engine — fixed
+
+`readonly.py` imported `preflight` and `verify_bindings` from `engine.py`. Both
+are free functions with no relationship to the `Engine` class, but the import
+meant the module whose contract is that it imports no migration code pulled in
+the Python unit loader transitively. Both now live in `checks.py`, which
+`engine` and `readonly` each import. The module graph stays acyclic and the
+layering now matches what the docstring claims.
+
+`run_status` and `run_validate` were also merged. They were 25 and 29 lines and
+differed in three places: the command name, whether the active migration's
+session is probed, and one extra sentence on the recovery message.
+
+## 17. Eleven unreferenced members and two redundant wrappers — fixed
+
+Verified unreferenced across source, tests, examples and the test environment:
+`Snapshot.active`, `Snapshot.by_id`, `Capture.by_id`, `Manifest.by_id`,
+`Manifest.at_position`, `hooks.active`, `Statement.is_plsql`, `Report.notes`,
+`LoadedUnit.package`, `LoadedUnit.entry_module`, and `RequiredObject`'s unused
+`order=True`. Three attributes were written and never read: `_batch_open` on two
+adapters, and `_entered`/`_finished` on the batch context.
+
+The two wrappers were `_parse_timestamp` in the Oracle adapter and `_passthrough`
+in the PostgreSQL one: the same function, and both already implemented by
+`md.parse_iso_timestamp`. The Oracle adapter called both forms in different
+methods, which is how that kind of thing gets noticed.
+
+Also removed: the re-export blocks in `engine.py`, `readonly.py` and
+`adapters/metadata.py`, which imported names solely to list them in `__all__` and
+created dependencies that looked real, and ten empty section headers left by the
+earlier consolidation.
+
+`Report.notes` was rendered but never populated, so `status --json` and
+`validate --json` no longer carry an always-empty `notes` key.
+
+## 18. The PostgreSQL adapter built SQL two ways — fixed
+
+`_t()` composed object names through `psycopg.sql.Identifier` while the base
+rendered quoted, schema-qualified strings; `_t`'s own docstring flagged the risk
+of the two paths naming different objects. Every object involved is a
+compile-time constant plus one schema name already validated as a bare lower-case
+identifier, so the composition layer was buying nothing the base did not provide.
+It is gone, along with the `psycopg.sql` import.
+
+`execute` and `query` are now shared too, over one `_run()` hook returning the
+driver cursor, as is the transactional `execute_ddl`. `executemany` stays
+per-adapter: Oracle passes `batcherrors=False`, PostgreSQL needs a cursor context
+manager, and forcing those into one shape would obscure all three, which is the
+judgement finding 4 already made about dictionary queries.
+
+One round trip went with it. `update_active_attempt` selected the new attempt
+number after incrementing it, although the caller holds the namespace lock and
+read the previous value under it. The engine now derives it, and a probe test
+asserts that the attempt the author sees through `ctx.attempt` is the attempt
+recorded in history, across three attempts.
+
 ---
 
 ## What the structure looks like now
 
 ```text
-core, 2,400 code lines, no database dependency
+core, 2,500 code lines, no database dependency
   manifest  fingerprint  paths  staging      capture and source integrity
   sqltext                                    lexical scanning only; no policy
   model  statevalidate                       durable state; pure validation
+  checks                                     preflight and binding verification
   engine  context  loader  latch             orchestration and the author facade
   diagnostics                                correlation id and event log
   cli  readonly  reporting                   three commands and their output
 
-adapters, 3,500 lines
+adapters, 2,200 code lines
   base          the contract plus every shared rule: history transitions,
-                progress store, statement admission, engine transactions
+                metadata initialization and inspection, the progress store,
+                statement admission, engine transactions, execution
+  metadata      the logical layout, state classification, definition comparison
   oracle        primary target: DBMS_LOCK, transaction identity, ALL_* validity
   postgres      second adapter: advisory lock, transactional DDL, real xid guard
   sqlite_probe  local probe: file lock, stated enforcement boundary, no claims
 ```
 
 The dependency direction is one-way: `adapters` imports from the core, never the
-reverse, and the engine contains no engine-specific SQL.
+reverse, and the engine contains no engine-specific SQL. `checks` exists so the
+read-only commands can preflight without importing `engine`, which would pull in
+the Python unit loader.
 
 ## The author-facing API
 

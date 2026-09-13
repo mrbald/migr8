@@ -24,14 +24,11 @@ def package_name(migration_id: str) -> str:
 
 
 class LoadedUnit:
-    """A loaded unit package plus its entry callable."""
+    """A loaded unit's entry callable, plus what to discard afterwards."""
 
-    __slots__ = ("package", "entry_module", "migrate", "_names")
+    __slots__ = ("migrate", "_names")
 
-    def __init__(self, package: ModuleType, entry_module: ModuleType,
-                 migrate: Callable[[object], None], names: list[str]) -> None:
-        self.package = package
-        self.entry_module = entry_module
+    def __init__(self, migrate: Callable[[object], object], names: list[str]) -> None:
         self.migrate = migrate
         self._names = names
 
@@ -62,7 +59,7 @@ def load_entry(*, migration_id: str, staged_dir: Path, entry: str) -> LoadedUnit
 
     created: list[str] = []
     try:
-        package = _make_namespace(root, staged_dir)
+        _make_namespace(root, staged_dir)
         created.append(root)
 
         parts = entry[: -len(".py")].split("/")
@@ -98,7 +95,7 @@ def load_entry(*, migration_id: str, staged_dir: Path, entry: str) -> LoadedUnit
             name for name in sys.modules
             if name == root or name.startswith(root + ".")
         )
-        return LoadedUnit(package, module, target, names)
+        return LoadedUnit(target, names)
     except BaseException:
         for name in sorted(
             {*created, *(n for n in list(sys.modules) if n.startswith(root))},

@@ -210,16 +210,16 @@ def _try_scan_prefixed_string(sql: str, start: int) -> int | None:
     """
     upper = sql[start:start + 3].upper()
     if upper.startswith("NQ'"):
-        return _scan_alt_quoted(sql, start, start + 3)
+        return _scan_alt_quoted(sql, start + 3)
     if upper.startswith("Q'"):
-        return _scan_alt_quoted(sql, start, start + 2)
+        return _scan_alt_quoted(sql, start + 2)
     if upper.startswith("N'"):
         # A national character literal uses ordinary single-quote rules.
         return _scan_plain_string(sql, start + 1)
     return None
 
 
-def _scan_alt_quoted(sql: str, start: int, body: int) -> int:
+def _scan_alt_quoted(sql: str, body: int) -> int:
     if body >= len(sql):
         raise SqlSyntaxError("unterminated alternative-quoted literal")
     opener = sql[body]
@@ -272,14 +272,16 @@ class Statement:
     kind: StatementKind
     #: Significant leading words, upper-cased, up to four.
     lead: tuple[str, ...]
+    #: Every identifier the statement actually names, upper-cased: bare words
+    #: plus quoted identifiers with their quotes removed.  Comments and string
+    #: literals contribute nothing, so a name mentioned in prose is not a
+    #: reference.  Callers match object names against this rather than scanning
+    #: the raw text, where ``m8_history`` would also hit ``custom8_history``.
+    names: frozenset[str] = frozenset()
 
     @property
     def first_token(self) -> str:
         return self.lead[0] if self.lead else ""
-
-    @property
-    def is_plsql(self) -> bool:
-        return self.kind is not StatementKind.SQL
 
 
 def classify(sql: str) -> StatementKind:
@@ -385,7 +387,16 @@ def normalize(sql: str) -> Statement:
     if not stripped:
         raise SqlSyntaxError("SQL text is empty after normalisation")
 
-    words = tuple(tok.upper for tok in significant if tok.kind is TokenKind.WORD)[:4]
+    word_tokens = [tok.upper for tok in significant if tok.kind is TokenKind.WORD]
+    words = tuple(word_tokens)[:4]
+    # Quoted identifiers are folded to upper case here as well.  A lower-case
+    # quoted name is a different object on Oracle, so treating both forms as a
+    # reference is the conservative direction.
+    names = frozenset(word_tokens).union(
+        tok.text[1:-1].upper()
+        for tok in significant
+        if tok.kind is TokenKind.QUOTED_IDENT
+    )
     first = significant[0]
     if first.kind is TokenKind.PUNCT and first.text == "@":
         raise SqlSyntaxError(
@@ -397,7 +408,7 @@ def normalize(sql: str) -> Statement:
                 f"{words[0]} is an unsupported SQL*Plus or client command; "
                 "this tool has no SQL*Plus interpreter"
             )
-    return Statement(text=stripped, kind=kind, lead=words)
+    return Statement(text=stripped, kind=kind, lead=words, names=names)
 
 
 def _is_also_valid_sql(words: tuple[str, ...]) -> bool:
