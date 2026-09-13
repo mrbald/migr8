@@ -8,9 +8,12 @@ Design rules:
 
 * **One line per event, flushed immediately.** A crash or a kill must leave the
   log usable up to the last thing that happened.
-* **No credentials and no bind values, ever.** Events carry identities,
-  fingerprints, counts and phases. Author log lines carry whatever the author
-  passes, which is the author's responsibility and is documented as such.
+* **Failures are named by code, not by driver text.** The engine reports an
+  exception type and an engine error code, with the operation, phase and
+  identity around it; the driver's own message quotes the data that produced it
+  and is not written here. :data:`REDACTED_FIELDS` drops the field names below
+  as a further guard. Author log lines carry whatever the author passes, which
+  is the author's responsibility and is documented as such.
 * **No database objects.** The log is a file. Adding an audit table would change
   the metadata layout and enlarge the scope the specification fixes.
 * **Off by default.** Without ``--log-file`` nothing is written, and the engine
@@ -28,9 +31,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .errors import describe_safely
+
 LOGGER = logging.getLogger("migr8.run")
 
-#: Field names never written to the event log, whatever a caller passes.
+#: Field names dropped from an event, whatever a caller passes.
 REDACTED_FIELDS = frozenset({"password", "secret", "dsn", "credential", "params"})
 
 
@@ -72,8 +77,11 @@ class RunLog:
             return
         try:
             self._handle.write(json.dumps(payload, default=str, sort_keys=False) + "\n")
-        except OSError as exc:  # pragma: no cover - a broken log must not fail a run
-            LOGGER.warning("cannot write the run log: %s", exc)
+        except Exception as exc:
+            # The log is diagnostic: no correctness rule depends on it, so a log
+            # that stops working reports itself once and is abandoned rather
+            # than changing what the run does or what it returns.
+            LOGGER.warning("cannot write the run log: %s", describe_safely(exc))
             self._handle = None
 
     def close(self) -> None:

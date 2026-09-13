@@ -19,6 +19,12 @@ What this report claims, for the exact versions recorded below:
 - Both directions of commit-acknowledgement failure were induced at transport
   level at all five engine-owned durable transitions, on both databases, with an
   independent observer establishing which branch occurred.
+- A lost reply is classified the same way at every database boundary a run
+  crosses, not only during migration execution: metadata reads and writes,
+  namespace inspection, the snapshot read, `begin` and the transaction-state
+  probe each latch the run and discard the connection. The assertion that no SQL
+  follows an unknown outcome is made at the driver, so a rollback or a probe
+  would be visible.
 - An interruption during a commit is classified as an unknown outcome, and a
   supervised `SIGTERM` between commits rolls back and retains ACTIVE. Neither ends
   in a traceback.
@@ -78,9 +84,10 @@ testenv/dbctl.sh destroy           # also removes this project's volumes
 ```
 
 Examples, each run end to end while preparing this report. Run
-`testenv/dbctl.sh provision` first: the integration suites bind lock id 4719 in
-the shared test schemas, and the examples are configured for 4711, so an
-unprovisioned schema fails the lock-binding check by design.
+`testenv/dbctl.sh provision` first: `tests/test_adapter_contract.py` binds lock
+id 4719 in the shared test schemas so it never contends with the other suites,
+and the examples are configured for 4711, so a schema left behind by that suite
+fails the lock-binding check by design.
 
 ```bash
 cd examples/sqlite-probe && uv run migr8 migrate && uv run migr8 status
@@ -90,23 +97,28 @@ cd examples/postgres && MIGR8_PASSWORD=... uv run migr8 migrate
 
 ## Results by evidence level
 
+Levels are partitioned by pytest marker: `oracle`, `postgres`, `sqlite_probe`,
+and everything else.
+
 | Level | Result | Tests | Evidence |
 |---|---|---|---|
-| Pure / unit | **PASS** | 229 | Deterministic fixtures, including malformed, colliding and corrupt definitions. No database. |
-| SQLite probe | **PASS** | 102 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
-| PostgreSQL integration | **PASS** | 56 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures. |
-| Oracle integration | **PASS** | 89 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures. |
+| Pure / unit | **PASS** | 261 | Deterministic fixtures, including malformed, colliding and corrupt definitions, and dictionary rows recorded from the live servers. No database. |
+| SQLite probe | **PASS** | 175 | Real SQLite files, real transactions, real cooperating OS processes, real signals. |
+| PostgreSQL integration | **PASS** | 62 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures, live metadata mutation. |
+| Oracle integration | **PASS** | 95 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures, live metadata mutation. |
 | Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available. See [Open gates](#open-gates). |
 
-Total: **476 tests, 476 passed, 0 failed, 0 skipped** when all services are up.
-Run time about 51 s. Without the services, 331 run and the live suites skip with
-an explicit message naming the missing environment variables; a skip is never
-counted as coverage. The `databases` job in CI runs the whole suite against both
-servers on every push and pull request, and fails if anything skipped.
+Total: **593 tests, 593 passed, 0 failed, 0 skipped** with both services up, run
+on 2026-09-13 against the versions recorded above. Run time about 67 s. Without
+the services, 436 run and the live suites skip with an explicit message naming
+the missing environment variables; a skip is never counted as coverage. The
+`databases` job in CI runs the whole suite against both servers on every push
+and pull request, and fails if anything skipped.
 
-Branch coverage over the pure decision core -- `errors`, `fingerprint`, `latch`,
-`model`, `statevalidate` -- is held at 100% by the `checks` job. The scope and
-the reason for it are argued in `[tool.coverage.report]` in `pyproject.toml`.
+The `checks` job requires 100% branch coverage for `errors`, `fingerprint`,
+`latch`, `model` and `statevalidate`. `[tool.coverage.report]` in
+`pyproject.toml` lists the modules and states the scope limit: no adapter,
+engine or CLI coverage is measured, so that percentage says nothing about them.
 
 The adapter contract suite contributes 88 of those tests, in one file. It is one
 suite parametrised over every adapter, and `adapters.SUPPORTED` is asserted
@@ -118,19 +130,25 @@ against the parametrisation, so a new adapter cannot skip it.
 | `tests/test_sqltext.py` | 66 |
 | `tests/test_statevalidate.py` | 52 |
 | `tests/test_manifest.py` | 49 |
-| `tests/test_sqlite_probe.py` | 41 |
+| `tests/test_sqlite_probe.py` | 45 |
+| `tests/test_metadata_damage.py` | 29 |
+| `tests/test_outcome_authority.py` | 22 |
 | `tests/test_fingerprint.py` | 21 |
+| `tests/test_failure_reporting.py` | 19 |
+| `tests/test_entry_contract.py` | 18 |
 | `tests/test_cli.py` | 17 |
 | `tests/test_diagnostics.py` | 16 |
 | `tests/test_unknown_outcome.py` | 12 |
+| `tests/test_staging.py` | 11 |
 | `tests/test_loader.py` | 10 |
-| `tests/test_staging.py` | 8 |
+| `tests/test_terminal_result.py` | 10 |
 | `tests/test_concurrency_probe.py` | 5 |
 | `tests/test_checks.py` | 2 |
 | `tests/integration/test_oracle_execution.py` | 26 |
 | `tests/integration/test_commit_failure.py` | 20 |
 | `tests/integration/test_oracle.py` | 20 |
 | `tests/integration/test_postgres.py` | 18 |
+| `tests/integration/test_metadata_damage.py` | 12 |
 | `tests/integration/test_oracle_concurrency.py` | 5 |
 
 ## Required scenario groups
@@ -142,16 +160,16 @@ item in the group is not covered, and the gap is named.
 |---|---|---|---|
 | 1 | Manifest and fingerprint | **PARTIAL** | Golden canonical encoding is asserted against a hand-built byte string, not against the implementation's own loops. All covered inputs change the fingerprint; required-set reordering does not. Location and position independence, duplicate ids, duplicate and nested units, symlinked roots and in-unit symlinks, special files, bytecode and tool caches, invalid paths, missing entry, changed successful source, and staged source unaffected by later working-tree edits are all covered. Distinct ids `a-b` and `a_b` load distinct helpers. **Gap:** the case-folding collision rule is tested at the function level only; this host's filesystem is case-insensitive, so a colliding pair cannot be created to drive it end to end. |
 | 2 | History validation | **PASS** | Valid empty, prefix and full states; position gaps and duplicates; more than one ACTIVE; ACTIVE not next; ACTIVE marked atomic; ACTIVE without an attempt count; SUCCESS without a completion time; atomic SUCCESS carrying an attempt count; incorrect stored language and mode; orphaned progress; progress on a SUCCESS row; modified SUCCESS source; unsupported fingerprint and layout formats; corrupt enumerated fields. |
-| 3 | Initialization | **PARTIAL** | Interruption after each independently durable object creation (parametrised over all four objects) and before and after the final marker; permitted completion of an incomplete initialization; missing progress table, missing one-active index and incompatible column layout after completed initialization; populated history without a marker; lock and config binding mismatch. **Gaps:** an Oracle constraint left `DISABLED` or `NOVALIDATE` is not driven end to end, though the validation code checks both; and loss of dictionary inspection privilege mid-life is not simulated, though the adapter treats an inaccessible probe as an error and the equivalent "target schema absent" path is tested on PostgreSQL. |
-| 4 | Atomic | **PASS** | Normal DML; query-only success; statement error rollback; an error inserting the SUCCESS row rolling the migration work back with it; forbidden DDL; the transaction-identity tripwire firing on a real PL/SQL `COMMIT` with the work left durable and no SUCCESS row; no further work after a detected violation; work and history committing together; and lost completion acknowledgement in **both** proven branches on both databases. |
-| 5 | Restartable | **PASS** | Failure after a batch boundary and after DDL plus a batch; completed work present before SUCCESS (induced at the completion boundary); no-op rerun of completed work; open transaction on return rolled back with ACTIVE retained; progress and data committing together and rolling back together; checkpoint derived from the exact processed keys; progress writes outside a batch rejected; nested batches rejected; and no continuation after a caught unknown outcome, including when author code swallows every exception. |
+| 3 | Initialization | **PARTIAL** | Interruption after each independently durable object creation (parametrised over all four objects) and before and after the final marker; permitted completion of an incomplete initialization; missing progress table, missing one-active index and incompatible column layout after completed initialization; populated history without a marker; lock and config binding mismatch. Live mutation in a disposable schema of a `DISABLED` unique key, a dropped foreign key, a replaced one-ACTIVE index expression, a check constraint rewritten as a tautology and a foreign key repointed at a same-named history table in a second disposable schema on Oracle; and of a re-keyed index, an unpredicated index, a `NOT VALID` foreign key, a tautological check constraint and a cross-schema foreign key on PostgreSQL. Each is reported as exit 7 and left unrepaired. At the dictionary-row level, a check constraint that is missing, altered or added is refused on both engines, as is one whose condition the comparison does not recognise. **Gap:** loss of dictionary inspection privilege mid-life is not simulated, though the adapter treats an inaccessible probe as an error and the equivalent "target schema absent" path is tested on PostgreSQL. |
+| 4 | Atomic | **PASS** | Normal DML; query-only success; statement error rollback; an error inserting the SUCCESS row rolling the migration work back with it; forbidden DDL; the transaction-identity tripwire firing on a real PL/SQL `COMMIT` with the work left durable and no SUCCESS row; no further work after a detected violation; work and history committing together; a latched unknown outcome reported as exit 4 with the connection discarded even when the migration catches it and returns or raises its own exception; and lost completion acknowledgement in **both** proven branches on both databases. |
+| 5 | Restartable | **PASS** | Failure after a batch boundary and after DDL plus a batch; completed work present before SUCCESS (induced at the completion boundary); no-op rerun of completed work; open transaction on return rolled back with ACTIVE retained; progress and data committing together and rolling back together; checkpoint derived from the exact processed keys; progress writes outside a batch rejected; nested batches rejected; no continuation after a caught unknown outcome, including when author code replaces it with an exception of its own or swallows every exception; a deferred entry point (`async def`, generator, async generator, or a synchronous wrapper returning one) refused before any history row is written; and a helper imported inside `migrate` reloaded from its edited source on a same-process recovery. |
 | 6 | Required objects | **PARTIAL** | Missing, wrong-type and invalid declarations fail; the failure verdict is identical on a retry that skips recreation; a warning-only valid object passes; adding or removing a requirement changes the fingerprint; unsupported declaration types are refused before connecting. **Gaps:** an *ambiguous* `(owner, name, type)` row is not reproduced, because Oracle's dictionary does not permit two such rows in the supported namespace, so the branch exists without a live case; an object made inaccessible by privilege change is not simulated; and "unrelated invalid objects and compilation settings remain untouched" is argued from the read-only implementation rather than asserted by a test. |
-| 7 | Recovery admission | **PASS** | Unchanged retry without the flag; changed ACTIVE refused without the flag, reporting both fingerprints and the exact recovery command; wrong and absent active id refused; mode change refused even with the flag; SQL-to-Python recovery recording consistent metadata while preserving identity, position, mode, first fingerprint and original start time; convergence from checkpoints written by two earlier source versions; and an edit to a successful migration never admitted. |
+| 7 | Recovery admission | **PASS** | Unchanged retry without the flag; changed ACTIVE refused without the flag, reporting both fingerprints and the exact recovery command; wrong and absent active id refused; `--recover` against an absent namespace and against a partly created one refused with exit 2, with no metadata object, no marker and no migration execution left behind, while plain `migrate` still completes the same incomplete namespace; mode change refused even with the flag; SQL-to-Python recovery recording consistent metadata while preserving identity, position, mode, first fingerprint and original start time; convergence from checkpoints written by two earlier source versions; and an edit to a successful migration never admitted. |
 | 8 | Concurrency | **PARTIAL** | Deterministic contention at zero timeout on all three adapters; a waiter that later acquires the lock, finds no pending work and exits 0 (SQLite probe and Oracle); the lock held across DDL and across batch commits (all three); a dead client leaving a live server session that still holds the lock, with the lock released only once that session ends (Oracle, via the proxy); read-only `status` and `validate` during a long migration on all three. **Gaps:** the waiter-succeeds and dead-client cases are not repeated on PostgreSQL. |
 | 9 | Oracle and SQL details | **PARTIAL** | Correct `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` invocation with an output bind; multiline `UPDATE` with a line beginning `SET`; PL/SQL `EXIT WHEN`; literals and comments containing slashes and semicolons surviving normalisation and executing against the real server; stored PL/SQL keeping its terminator while `CREATE LIBRARY` does not; top-level SQL*Plus commands refused in preflight without rejecting valid internal tokens; direct DDL restrictions; synchronous commit session setup; native driver parameter handling; and the realistic bounded backfill example running against Oracle. **Gap:** `COMMIT_WAIT` cannot be read back at session level on Oracle, so its establishment is reported as NOT VERIFIED rather than asserted. |
-| 11 | Interruption and internal failure **[new]** | **PASS** | Ctrl-C and `SIGTERM` between commits roll back, retain ACTIVE, exit 3 and print no traceback; an interruption during a commit latches an unknown outcome, discards the connection and exits 4; an injected internal defect produces a defined exit code naming the run id rather than a traceback. |
-| 12 | Diagnostics **[new]** | **PASS** | The event log records the phases in order with a single correlation id and monotonic timings; the terminal record names the failing migration and phase; author `ctx.log` lines interleave; credentials, DSNs and bind values are excluded; the log appends across runs and is absent unless configured; `--json` carries outcome, failing identity, phase and recovery command. |
-| 13 | Adapter contract **[new]** | **PASS** | Every behaviour below, per adapter: initialization to a verified layout, well-typed empty snapshot, physical-name resolution, engine-transaction state, uncommitted-work detection, transaction identity across a commit, the full admission/attempt/completion lifecycle including the permanence of `first_fingerprint` and `started_at`, a success row riding the caller's transaction, affected-row damage detection, bind narrowing and missing-bind detection, admission in every context, reserved-object refusal, the DDL allow-list, required-object consistency, error classification, and the identifier-level reserved-object rule with both its refusals and its admissions. |
+| 11 | Interruption and internal failure | **PASS** | Ctrl-C and `SIGTERM` between commits roll back, retain ACTIVE, exit 3 and print no traceback; an interruption during a commit latches an unknown outcome, discards the connection and exits 4; an injected internal defect produces a defined exit code naming the run id rather than a traceback. |
+| 12 | Diagnostics | **PASS** | The event log records the phases in order with a single correlation id and monotonic timings; the terminal record names the failing migration and phase; author `ctx.log` lines interleave; a canary planted in a driver message reaches neither the report, the event log nor stderr, and the same holds for a canary in a metadata-read rejection surfacing through `status --json`, one raised at CLI adapter construction reaching the fallback handler, one in a close or rollback cleanup warning, and one in the run log's own write failure; the log appends across runs and is absent unless configured; `--json` carries outcome, failing identity, phase and recovery command. A log file that cannot be opened fails with exit 1 before the command connects; a log whose close fails leaves an acknowledged exit 0 and its durable history unchanged; a log that stops writing while the engine reports exit 4 changes neither the result nor the SQL issued; and a failure handled before the engine is reached carries the run id in both `--json` and stderr. |
+| 13 | Adapter contract | **PASS** | Every behaviour below, per adapter: initialization to a verified layout, well-typed empty snapshot, physical-name resolution, engine-transaction state, uncommitted-work detection, transaction identity across a commit, the full admission/attempt/completion lifecycle including the permanence of `first_fingerprint` and `started_at`, a success row riding the caller's transaction, affected-row damage detection, bind narrowing and missing-bind detection, admission in every context, reserved-object refusal, the DDL allow-list, required-object consistency, error classification, and the identifier-level reserved-object rule with both its refusals and its admissions. |
 | 10 | Inspection | **PASS** | `validate` and `status` perform no initialization, no code import (driven by a unit whose module body raises), no migration execution, no compilation and no SQLite WAL change; consistent history snapshots; uninitialized distinguished from damaged and from incomplete-but-compatible; session-liveness diagnostics reporting `present` where privileges allow and `unknown` where they do not, with the honest caveat attached. |
 
 ## Commit-acknowledgement failure evidence
@@ -187,9 +205,9 @@ Mechanism, in `tests/proxy.py` and `tests/integration/test_commit_failure.py`:
   a fresh invocation reconciles to a fully successful history.
 
 The dead-client test uses the same proxy to keep the upstream socket open after
-the client process is killed, which is what produces a genuinely live server
-session. A plain `SIGKILL` closes the socket and the session ends at once, so
-that weaker form would have proved nothing.
+the client process is killed, which leaves a live server session. A plain
+`SIGKILL` closes the socket and the session ends at once, so that form would not
+reach the case under test.
 
 `tests/test_unknown_outcome.py` covers the same contract against the SQLite
 probe by replacing the adapter's own `commit`. Those are labelled in the file as
@@ -236,11 +254,11 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
    most -- `DBMS_LOCK`, `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`, `ALL_ERRORS`,
    function-based unique indexes, `FETCH FIRST` with a bind -- all exist in 19c,
    but "exists" is not "tested".
-2. **Trusted code is genuinely trusted.** The facade's statement admission is an
-   honest-mistake guard. A migration that calls a routine with autonomous
-   transactions, external effects, or indirect DDL can defeat it, and the
-   specification says so. The tripwire catches a changed or absent transaction
-   identity; it cannot see an autonomous transaction.
+2. **The facade's statement admission is an honest-mistake guard, not a
+   sandbox.** A migration that calls a routine with autonomous transactions,
+   external effects, or indirect DDL can defeat it, and the specification says
+   so. The tripwire catches a changed or absent transaction identity; it cannot
+   see an autonomous transaction.
 3. **Required-object completeness is the author's.** The engine checks exactly
    what the manifest declares. A migration that creates an object and forgets to
    declare it will be recorded successful with that object invalid.

@@ -201,7 +201,12 @@ class PostgresAdapter(Adapter):
             # explicit BEGIN/COMMIT issued by this adapter.
             self._conn = psycopg.connect(conninfo, autocommit=True)
         except psycopg.Error as exc:
-            raise UsageError(f"cannot connect to PostgreSQL: {exc}") from exc
+            # The driver's connection message repeats the connection string, so it
+            # is reported by code and the operator is pointed at the settings.
+            raise UsageError(
+                f"cannot connect to PostgreSQL: {self.describe_exception(exc)}. Check "
+                "database.dsn, database.user and the MIGR8_PASSWORD environment variable."
+            ) from exc
         self._configure_session()
         self._banner = self._read_banner()
         self._session_identity = self._read_session_identity()
@@ -256,7 +261,9 @@ class PostgresAdapter(Adapter):
         if self._conn is None:
             return
         try:
-            if self.has_open_transaction():
+            # Teardown asks the driver directly: a failure while closing must not
+            # be reclassified as an unknown migration outcome.
+            if self._has_open_transaction():
                 self._conn.execute("ROLLBACK")
             self.release_lock()
         finally:
@@ -384,40 +391,79 @@ class PostgresAdapter(Adapter):
             if table not in present:
                 continue
             rows = self._db.execute(
+                # Key columns are read in key order, not table order: WITH
+                # ORDINALITY over conkey/confkey keeps (b, a) distinct from
+                # (a, b), which a plain ANY() lookup ordered by attnum loses.
                 "SELECT con.contype, con.convalidated, "
                 "  pg_get_constraintdef(con.oid), "
-                "  (SELECT string_agg(att.attname, ',' ORDER BY att.attnum) "
-                "     FROM pg_attribute att "
-                "    WHERE att.attrelid = con.conrelid "
-                "      AND att.attnum = ANY(con.conkey)) "
+                "  (SELECT string_agg(att.attname, ',' ORDER BY k.ord) "
+                "     FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                "     JOIN pg_attribute att ON att.attrelid = con.conrelid "
+                "      AND att.attnum = k.attnum), "
+                "  (SELECT rn.nspname FROM pg_class rc "
+                "     JOIN pg_namespace rn ON rn.oid = rc.relnamespace "
+                "    WHERE rc.oid = con.confrelid), "
+                "  (SELECT rc.relname FROM pg_class rc WHERE rc.oid = con.confrelid), "
+                "  (SELECT string_agg(att.attname, ',' ORDER BY k.ord) "
+                "     FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord) "
+                "     JOIN pg_attribute att ON att.attrelid = con.confrelid "
+                "      AND att.attnum = k.attnum) "
                 "FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE n.nspname = %s AND c.relname = %s",
                 (self._schema, table),
             ).fetchall()
-            keys = {(row[0], row[3] or "") for row in rows if row[0] in ("p", "u", "f")}
-            for kind, columns in expected["keys"]:
-                if (kind, columns) not in keys:
+            keys: dict[tuple[str, str], list[tuple]] = {}
+            for row in rows:
+                if row[0] in ("p", "u", "f"):
+                    keys.setdefault((row[0], row[3] or ""), []).append(row)
+            for expected_key in expected["keys"]:
+                kind, columns, references = expected_key
+                matches = keys.get((kind, columns))
+                if not matches:
                     problems.append(
                         f"{table} is missing a {_KIND_NAMES[kind]} on ({columns}); found "
                         f"{sorted(keys)}"
                     )
-            checks = [
-                (md.normalise_definition(row[2], drop_parens=True), row[1])
-                for row in rows
-                if row[0] == "c"
-            ]
-            for fragment in expected["checks"]:
-                matches = [item for item in checks if fragment in item[0]]
-                if not matches:
-                    problems.append(
-                        f"{table} is missing a check constraint containing {fragment!r}; "
-                        f"found {[item[0] for item in checks]}"
-                    )
                     continue
-                for _definition, validated in matches:
+                for (
+                    _type,
+                    validated,
+                    _definition,
+                    _columns,
+                    target_schema,
+                    target,
+                    target_columns,
+                ) in matches:
+                    # A key the server is not enforcing does not hold the layout up.
                     if not validated:
-                        problems.append(f"{table} check constraint for {fragment!r} is NOT VALID")
+                        problems.append(f"{table} {_KIND_NAMES[kind]} on ({columns}) is NOT VALID")
+                    if references is None:
+                        continue
+                    wanted_table, wanted_columns = references
+                    # The schema is part of the target identity: a same-named
+                    # history table in another schema would otherwise satisfy
+                    # this check while linking progress to that schema's history.
+                    expected_target = (
+                        f"{self.metadata_schema}."
+                        f"{self._physical_object_name(wanted_table)}({wanted_columns})"
+                    )
+                    actual = (
+                        f"{target_schema}.{target}({target_columns or ''})" if target else "nothing"
+                    )
+                    if actual != expected_target:
+                        problems.append(
+                            f"{table} {_KIND_NAMES[kind]} on ({columns}) references {actual}, "
+                            f"not {expected_target}"
+                        )
+            problems.extend(
+                md.check_problems(
+                    table,
+                    ((row[2], bool(row[1]), "NOT VALID") for row in rows if row[0] == "c"),
+                    expected["checks"],
+                    fold=self._fold,
+                )
+            )
         return problems
 
     def _index_problems(self, present: set[str]) -> list[str]:
@@ -425,7 +471,11 @@ class PostgresAdapter(Adapter):
             return []
         row = self._db.execute(
             "SELECT i.indisunique, i.indisvalid, i.indisready, "
-            "  pg_get_indexdef(i.indexrelid), c.relname "
+            "  pg_get_indexdef(i.indexrelid), c.relname, i.indnatts, "
+            "  pg_get_expr(i.indpred, i.indrelid), "
+            "  (SELECT string_agg(a.attname, ',' ORDER BY k.ord) "
+            "     FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) "
+            "     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) "
             "FROM pg_index i JOIN pg_class x ON x.oid = i.indexrelid "
             "JOIN pg_class c ON c.oid = i.indrelid "
             "JOIN pg_namespace n ON n.oid = x.relnamespace "
@@ -434,7 +484,7 @@ class PostgresAdapter(Adapter):
         ).fetchone()
         if row is None:
             return [f"{ACTIVE_INDEX} is not visible in pg_index"]
-        unique, valid, ready, definition, table_name = row
+        unique, valid, ready, definition, table_name, columns, predicate, indexed = row
         problems = []
         if table_name != HISTORY_TABLE:
             problems.append(f"{ACTIVE_INDEX} is on {table_name}, not {HISTORY_TABLE}")
@@ -442,9 +492,21 @@ class PostgresAdapter(Adapter):
             problems.append(f"{ACTIVE_INDEX} is not UNIQUE")
         if not valid or not ready:
             problems.append(f"{ACTIVE_INDEX} is not valid and ready")
-        normalised = md.normalise_definition(definition, drop_parens=True)
-        if "WHERE" not in normalised or "ACTIVE" not in normalised:
-            problems.append(f"{ACTIVE_INDEX} is not restricted to status='ACTIVE': {definition!r}")
+        # The indexed column and the predicate are checked separately: an index
+        # whose predicate mentions ACTIVE but whose key is some other column is
+        # unique per row and enforces nothing.
+        if int(columns) != 1 or (indexed or "") != ACTIVE_INDEX_COLUMN:
+            problems.append(
+                f"{ACTIVE_INDEX} indexes ({indexed}), not exactly ({ACTIVE_INDEX_COLUMN}): "
+                f"{definition!r}"
+            )
+        if (
+            md.compact_definition(predicate or "", drop_parens=True)
+            not in _SUPPORTED_ACTIVE_INDEX_PREDICATES
+        ):
+            problems.append(
+                f"{ACTIVE_INDEX} is not restricted to {ACTIVE_INDEX_PREDICATE}: {definition!r}"
+            )
         return problems
 
     def _create_metadata_object(self, name: str) -> None:
@@ -465,10 +527,10 @@ class PostgresAdapter(Adapter):
         )
         self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
 
-    def read_snapshot(self, *, consistent: bool) -> Snapshot:
+    def _read_snapshot(self, consistent: bool) -> Snapshot:
         conn = self._db
         opened = False
-        if consistent and not self.has_open_transaction():
+        if consistent and not self._has_open_transaction():
             # A read-only repeatable-read transaction gives one consistent view and
             # reads committed metadata without taking the migration lock.
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -501,14 +563,14 @@ class PostgresAdapter(Adapter):
 
     # --- transaction control ----------------------------------------------------------------------
 
-    def has_open_transaction(self) -> bool:
+    def _has_open_transaction(self) -> bool:
         if self._conn is None:
             return False
         return self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE
 
     # --- transaction identity ---------------------------------------------------------------------
 
-    def establish_transaction_identity(self) -> str | None:
+    def _establish_transaction_identity(self) -> str | None:
         row = self._db.execute("SELECT pg_current_xact_id()::text").fetchone()
         if row is None or row[0] is None:
             raise UsageError(
@@ -517,8 +579,8 @@ class PostgresAdapter(Adapter):
             )
         return str(row[0])
 
-    def read_transaction_identity(self) -> str | None:
-        if not self.has_open_transaction():
+    def _read_transaction_identity(self) -> str | None:
+        if not self._has_open_transaction():
             return None
         row = self._db.execute("SELECT pg_current_xact_id_if_assigned()::text").fetchone()
         return None if row is None or row[0] is None else str(row[0])
@@ -544,7 +606,7 @@ class PostgresAdapter(Adapter):
 
     # --- diagnostics ------------------------------------------------------------------------------
 
-    def probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
+    def _probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
         if not db_session:
             return ("unknown", "no session identity was recorded for the latest attempt")
         fields = dict(part.split("=", 1) for part in db_session.split(",") if "=" in part)
@@ -557,7 +619,7 @@ class PostgresAdapter(Adapter):
                 (int(fields["pid"]), fields["backend_start"]),
             ).fetchone()
         except psycopg.Error as exc:
-            return ("unknown", f"pg_stat_activity is not readable: {exc}")
+            return ("unknown", f"pg_stat_activity is not readable: {self.describe_exception(exc)}")
         verdict = "present" if row and row[0] else "absent"
         return (
             verdict,
@@ -569,17 +631,24 @@ class PostgresAdapter(Adapter):
     # --- error classification ---------------------------------------------------------------------
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
-        """A SQLSTATE means the server answered, so the outcome is definite.
+        """A SQLSTATE usually means the server answered, so the outcome is definite.
 
-        Anything without one -- a closed connection, a driver-side refusal this
-        adapter has not justified, an unrecognised exception -- is a communication
-        failure, so a commit-capable call that raised it has an unknown outcome.
+        Two families of code say otherwise and are excluded: class ``08``, the
+        connection exceptions, and ``40003`` ``statement_completion_unknown``,
+        which is the server stating in as many words that it does not know
+        whether the statement completed.  Receiving a code is not by itself an
+        outcome.
+
+        Anything without a SQLSTATE -- a closed connection, a driver-side refusal
+        this adapter has not justified, an unrecognised exception -- is a
+        communication failure, so a commit-capable call that raised it has an
+        unknown outcome.
         """
         if isinstance(exc, psycopg.Error):
             sqlstate = getattr(exc, "sqlstate", None)
             if sqlstate:
-                # 08xxx is the connection-exception class: not a definite answer.
-                if str(sqlstate).startswith("08"):
+                code = str(sqlstate)
+                if code.startswith(INDEFINITE_SQLSTATE_CLASSES) or code in INDEFINITE_SQLSTATES:
                     return OutcomeClass.COMMUNICATION_FAILURE
                 return OutcomeClass.SERVER_REJECTION
             if isinstance(exc, (psycopg.ProgrammingError, psycopg.NotSupportedError)):
@@ -587,10 +656,39 @@ class PostgresAdapter(Adapter):
                 return OutcomeClass.SERVER_REJECTION
         return OutcomeClass.COMMUNICATION_FAILURE
 
+    def error_code(self, exc: BaseException) -> str | None:
+        """The SQLSTATE alone; the diagnostic fields that follow it quote the row."""
+        if isinstance(exc, psycopg.Error):
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate:
+                return f"SQLSTATE {sqlstate}"
+        return None
+
 
 # --- helpers --------------------------------------------------------------------------------------
 
 _KIND_NAMES = {"p": "primary key", "u": "unique key", "f": "foreign key"}
+
+#: SQLSTATE class 08 is the connection-exception class: the server did not answer.
+INDEFINITE_SQLSTATE_CLASSES = ("08",)
+
+#: Individual codes that answer without settling the outcome.  40003 is
+#: ``statement_completion_unknown``: the server is reporting that it does not
+#: know whether the statement completed, which is exactly an unknown outcome.
+INDEFINITE_SQLSTATES = frozenset({"40003"})
+
+#: The one-ACTIVE index is a unique partial index: the key is the status column
+#: itself, so two ACTIVE rows collide, and the predicate keeps every other row
+#: out of the index.  Both halves are required; either alone enforces nothing.
+ACTIVE_INDEX_COLUMN = "status"
+ACTIVE_INDEX_PREDICATE = "status = 'ACTIVE'"
+
+#: How PostgreSQL renders that predicate back.  17.5 adds the varchar-to-text
+#: casts; the uncast form is accepted too so a plainer rendering still passes.
+_SUPPORTED_ACTIVE_INDEX_PREDICATES = frozenset(
+    md.compact_definition(text, drop_parens=True)
+    for text in (ACTIVE_INDEX_PREDICATE, "(status)::text = 'ACTIVE'::text")
+)
 
 
 def _is_concurrent(statement: Statement) -> bool:
@@ -704,24 +802,42 @@ _EXPECTED_COLUMNS = {
     ),
 }
 
+#: The complete supported constraint shape, one entry per metadata table.  Each
+#: check is the canonical form of ``pg_get_constraintdef`` for the DDL above,
+#: recorded from PostgreSQL 17.5 on 2026-09-13 rather than guessed.  Semantics
+#: are compared, never the database-generated constraint name.
 _EXPECTED_CONSTRAINTS: dict[str, md.ExpectedConstraints] = {
     HISTORY_TABLE: {
-        "keys": (("p", "migration_id"), ("u", "seq")),
-        # Fragments of the normalised pg_get_constraintdef output, so semantics
-        # are compared rather than database-generated constraint names.
+        "keys": (md.ExpectedKey("p", "migration_id"), md.ExpectedKey("u", "seq")),
         "checks": (
-            "CHECK SEQ > 0",
-            "LANGUAGE ::TEXT = ANY ARRAY['SQL'",
-            "MODE ::TEXT = ANY ARRAY['ATOMIC'",
-            "STATUS ::TEXT = ANY ARRAY['ACTIVE'",
+            "check ( ( seq > 0 ) )",
+            "check ( ( ( language ) :: text = any ( ( array [ 'sql' :: character varying , "
+            "'python' :: character varying ] ) :: text [ ] ) ) )",
+            "check ( ( ( mode ) :: text = any ( ( array [ 'atomic' :: character varying , "
+            "'restartable' :: character varying ] ) :: text [ ] ) ) )",
+            "check ( ( ( status ) :: text = any ( ( array [ 'ACTIVE' :: character varying , "
+            "'SUCCESS' :: character varying ] ) :: text [ ] ) ) )",
+            "check ( ( ( attempt is null ) or ( attempt > 0 ) ) )",
+            "check ( ( ( ( status ) :: text <> 'ACTIVE' :: text ) or ( ( ( mode ) :: text = "
+            "'restartable' :: text ) and ( attempt is not null ) and ( finished_at is null ) "
+            ") ) )",
+            "check ( ( ( ( status ) :: text <> 'SUCCESS' :: text ) or ( finished_at is not "
+            "null ) ) )",
         ),
     },
     PROGRESS_TABLE: {
-        "keys": (("p", "migration_id,prog_key"), ("f", "migration_id")),
-        "checks": (),
+        "keys": (
+            md.ExpectedKey("p", "migration_id,prog_key"),
+            md.ExpectedKey("f", "migration_id", (HISTORY_TABLE, "migration_id")),
+        ),
+        "checks": (
+            "check ( ( ( char_length ( ( prog_key ) :: text ) >= 1 ) and ( char_length ( ( "
+            "prog_key ) :: text ) <= 128 ) ) )",
+            "check ( ( char_length ( ( prog_value ) :: text ) >= 1 ) )",
+        ),
     },
     META_TABLE: {
-        "keys": (("p", "meta_key"),),
-        "checks": ("META_KEY ::TEXT = 'SINGLETON'::TEXT",),
+        "keys": (md.ExpectedKey("p", "meta_key"),),
+        "checks": ("check ( ( ( meta_key ) :: text = 'singleton' :: text ) )",),
     },
 }

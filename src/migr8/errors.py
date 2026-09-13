@@ -26,6 +26,22 @@ class Exit(IntEnum):
     CONTRACT_VIOLATION = 8
 
 
+#: A one-word outcome per exit code, so an operator or a script does not have to
+#: map the number back to a meaning.  Every surface that reports an exit code --
+#: the run report and the CLI's own failure handling -- renders it from here.
+OUTCOME_NAMES: dict[Exit, str] = {
+    Exit.OK: "ok",
+    Exit.USAGE: "usage_error",
+    Exit.VALIDATION: "validation_failed",
+    Exit.MIGRATION_FAILED: "migration_failed",
+    Exit.UNKNOWN_OUTCOME: "outcome_unknown",
+    Exit.LOCK_NOT_ACQUIRED: "lock_not_acquired",
+    Exit.NOT_INITIALIZED: "not_initialized",
+    Exit.METADATA_DAMAGED: "metadata_damaged",
+    Exit.CONTRACT_VIOLATION: "contract_violation",
+}
+
+
 class Migr8Error(Exception):
     """Base class for every failure the CLI turns into an exit code."""
 
@@ -142,3 +158,18 @@ class ContractViolationError(Migr8Error):
     """
 
     exit_code = Exit.CONTRACT_VIOLATION
+
+
+def describe_safely(exc: BaseException) -> str:
+    """Name a failure without reproducing what it said (spec Section 11.5).
+
+    The engine's own errors are written for an operator and carry no driver
+    text, so they pass through unchanged.  Anything else is named by module and
+    type.  This is the description for surfaces that have no adapter to ask for
+    an engine error code -- the CLI's own handlers above all -- and it is why a
+    wrapped driver exception must never be given a ``Migr8Error`` message built
+    from the driver's text: the renderer cannot tell the two apart afterwards.
+    """
+    if isinstance(exc, Migr8Error):
+        return exc.report()
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"

@@ -181,7 +181,7 @@ def migrate(ctx):
             if changed != len(ids):
                 raise RuntimeError("batch membership changed under the migration")
             last = max(ids)
-            ctx.progress.set("last_id", str(last))        # commits with the batch
+            ctx.progress.set("last_id", str(last))  # commits with the batch
         ctx.log("batch committed", last_id=last, rows=len(ids))
 ```
 
@@ -324,6 +324,11 @@ the current fingerprint, the language and the attempt count. It will not change
 the mode, will not touch a successful migration, and will not accept a different
 id.
 
+There has to be something to recover. Against a namespace with no completed
+metadata the flag is refused with exit 2 before anything is created, so a
+mistyped `--recover` on a fresh database leaves it exactly as it was. Run
+`migrate` without the flag to initialize.
+
 Your amended code must converge from **every** state any earlier admitted version
 could have left, including its checkpoint format. Existing progress rows are still
 there; reading the old key and writing a new one is part of recovery logic:
@@ -331,7 +336,7 @@ there; reading the old key and writing a new one is part of recovery logic:
 ```python
 def migrate(ctx):
     cursor = ctx.progress.get("cursor")
-    legacy = ctx.progress.get("last_id")          # written by the previous version
+    legacy = ctx.progress.get("last_id")  # written by the previous version
     start = int(cursor.split(":", 1)[1]) if cursor else (int(legacy) if legacy else 0)
     ...
 ```
@@ -359,7 +364,15 @@ migr8 migrate --log-file /var/log/migr8/run.jsonl
 
 Every line carries the same `run` id, which is printed on every failure. The
 terminal `run_end` line gives you the outcome, the failing migration and the
-phase. Passwords, DSNs and bind values are never written.
+phase.
+
+`detail` names the failure by exception type and engine error code, such as
+`oracledb.DatabaseError [ORA-00001]`. The driver's own message is not written to
+the log, to `--json` or to stderr: it quotes the statement and the values that
+produced the error. To see the server's text, reproduce the statement against the
+database yourself. Event fields named `password`, `secret`, `dsn`, `credential`
+or `params` are dropped whatever the caller passes; fields you pass to
+`ctx.log()` are your responsibility.
 
 For scripting, `--json` gives the outcome as one record:
 

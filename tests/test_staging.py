@@ -10,8 +10,9 @@ from pathlib import Path
 import pytest
 import support
 
-from migr8.errors import UnitError
-from migr8.manifest import load
+from migr8.errors import Exit, UnitError
+from migr8.manifest import ID_RE, load
+from migr8.manifest import load as load_manifest
 from migr8.staging import capture_in_place, cleanup, stage
 
 
@@ -153,3 +154,89 @@ def test_failed_staging_leaves_no_directory_behind(tmp_path, monkeypatch):
     with pytest.raises(UnitError, match="boom"):
         stage(manifest)
     assert roots and not roots[0].exists()
+
+
+# --- identifier length (spec Section 3.1) --------------------------------------------
+
+MAX_ID = "a" * 200
+
+
+def test_the_longest_permitted_id_stages_and_runs(tmp_path):
+    """Section 3.1 allows a 200-character id, so staging must accept one.
+
+    The staged directory name is internal. Hex-encoding the id there doubled a
+    length the manifest already allows to reach 200, producing a path component
+    no filesystem this runs on accepts.
+    """
+    assert ID_RE.match(MAX_ID)
+    support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE t (id INTEGER);\n"})
+    manifest_path = support.manifest(
+        tmp_path,
+        [{"id": MAX_ID, "path": "m1", "language": "sql", "mode": "restartable", "entry": "up.sql"}],
+    )
+    config = support.sqlite_config(tmp_path)
+
+    capture = stage(load_manifest(manifest_path))
+    try:
+        staged = capture.units[0].source_dir
+        assert staged.is_dir()
+        assert len(staged.name) <= 255
+        assert (staged / "up.sql").is_file()
+    finally:
+        cleanup(capture.staging_root)
+
+    # And the whole run works, not just the parse and the copy.
+    assert support.migrate(config, manifest_path) == Exit.OK
+    assert [row[1] for row in support.history(tmp_path / "build" / "probe.db")] == [MAX_ID]
+
+
+def test_long_ids_stay_in_their_own_staged_directories(tmp_path):
+    """Two ids sharing a 199-character prefix must not share a directory."""
+    first, second = MAX_ID[:-1] + "b", MAX_ID[:-1] + "c"
+    support.unit(tmp_path, "m1", {"up.sql": "CREATE TABLE t1 (id INTEGER);\n"})
+    support.unit(tmp_path, "m2", {"up.sql": "CREATE TABLE t2 (id INTEGER);\n"})
+    manifest_path = support.manifest(
+        tmp_path,
+        [
+            {
+                "id": first,
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": second,
+                "path": "m2",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+        ],
+    )
+    capture = stage(load_manifest(manifest_path))
+    try:
+        directories = [unit.source_dir for unit in capture.units]
+        assert directories[0] != directories[1]
+        assert (directories[0] / "up.sql").read_text() != (directories[1] / "up.sql").read_text()
+    finally:
+        cleanup(capture.staging_root)
+
+
+def test_a_long_python_id_imports_and_executes(tmp_path):
+    """The unit package name is derived from the id too; it is not a path component."""
+    support.unit(tmp_path, "m1", {"up.py": 'def migrate(ctx):\n    ctx.log("ran")\n'})
+    manifest_path = support.manifest(
+        tmp_path,
+        [
+            {
+                "id": MAX_ID,
+                "path": "m1",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "up.py",
+            }
+        ],
+    )
+    config = support.sqlite_config(tmp_path)
+    assert support.migrate(config, manifest_path) == Exit.OK

@@ -78,6 +78,13 @@ include = ["src", "tests", "docs", "examples", "testenv", "deploy", "migr8"]
 line-length = 100
 extend-exclude = [".venv"]
 
+[tool.ruff.format]
+# Example migrations are excluded from the *formatter* only; `ruff check` still
+# covers them. A staged migration is fingerprinted byte for byte, so a formatter
+# that rewrites one changes its identity, and a published example would stop
+# matching the history it has already been recorded in.
+exclude = ["examples/**/migrations/**"]
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
 ignore = [
@@ -99,8 +106,9 @@ warn_redundant_casts = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-# Neither driver ships type information. The adapters treat driver objects as
-# opaque handles, which is what the contract in adapters/base.py already says.
+# Both installed drivers ship py.typed. This override keeps the build working
+# where they are absent -- the adapters are optional extras, and `mypy src` must
+# still run without them installed.
 module = ["oracledb.*", "psycopg.*"]
 ignore_missing_imports = true
 
@@ -116,24 +124,20 @@ markers = [
 timeout = 300
 
 [tool.coverage.run]
-# BRANCH coverage, not line. The modules under the gate are almost entirely
-# decisions: a refusal whose false arm nothing takes is a rule the code states
-# and no test holds it to. Line coverage calls such a guard covered.
+# Measure branches. The modules under the gate are almost entirely decisions, and
+# line coverage counts a refusal as covered when nothing has taken its false arm.
 branch = true
 source = ["src/migr8"]
 
 [tool.coverage.report]
-# The gate is scoped, and the scope is an argument rather than a convenience.
-# These are the modules that decide whether a database's recorded history may be
-# continued: the canonical fingerprint encoding, the pure state validator, the
-# durable-state model, the unknown-outcome latch, and the exit-code contract.
-# They take no database and no I/O, so every branch in them is reachable from a
-# unit test, and a missed one is a rule that nothing holds the code to.
+# Require 100% branch coverage for the five modules listed below: the exit-code
+# contract, the canonical fingerprint encoding, the unknown-outcome latch, the
+# durable-state model and the pure state validator. They take no database and no
+# I/O, so every branch is reachable from a unit test.
 #
-# Deliberately NOT listed: the adapters, the engine and the CLI, whose branches
-# are reached through real databases and real subprocesses. In-process coverage
-# reads those far below what the live suites actually exercise, so a percentage
-# there would measure the harness rather than the tests.
+# Scope limit: the adapters, the engine and the CLI are not included, and their
+# coverage is not measured here. Covering latch.py does not show that the engine
+# enforces the latch; the tests in tests/test_outcome_authority.py do that.
 include = [
   "src/migr8/errors.py",
   "src/migr8/fingerprint.py",

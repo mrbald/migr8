@@ -137,7 +137,12 @@ def test_event_log_names_the_failing_migration_and_phase(project):
     assert end["outcome"] == "migration_failed"
     assert end["migration"] == "broken"
     assert end["phase"] == "migration_execution"
-    assert "absent_table" in end["detail"]
+    # The detail names the failure by type and engine error code. The driver's own
+    # message is not reproduced: it quotes the statement, and with it the values
+    # that produced the error (spec Section 11.5).
+    assert "sqlite3.OperationalError" in end["detail"]
+    assert "SQLITE_ERROR" in end["detail"]
+    assert "absent_table" not in end["detail"]
     # The run id is printed so the operator can find that log entry.
     assert end["run"] in result.stderr
 

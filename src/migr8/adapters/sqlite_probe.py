@@ -413,7 +413,7 @@ class SqliteProbeAdapter(Adapter):
         self._db.execute(_DDL[name])
         self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
 
-    def read_snapshot(self, *, consistent: bool) -> Snapshot:
+    def _read_snapshot(self, consistent: bool) -> Snapshot:
         db = self._db
         opened = False
         if consistent and not db.in_transaction:
@@ -444,12 +444,12 @@ class SqliteProbeAdapter(Adapter):
 
     # --- transaction control ----------------------------------------------------------------------
 
-    def has_open_transaction(self) -> bool:
+    def _has_open_transaction(self) -> bool:
         return bool(self._db.in_transaction)
 
     # --- transaction identity ---------------------------------------------------------------------
 
-    def establish_transaction_identity(self) -> str | None:
+    def _establish_transaction_identity(self) -> str | None:
         """SQLite has no server transaction id; the epoch plus native state is the guard."""
         if not self._db.in_transaction:
             # BEGIN IMMEDIATE already acquired a write lock, so the transaction
@@ -457,7 +457,7 @@ class SqliteProbeAdapter(Adapter):
             raise UsageError("no transaction is open when establishing atomic identity")
         return f"sqlite-txn:{self._txn_epoch}"
 
-    def read_transaction_identity(self) -> str | None:
+    def _read_transaction_identity(self) -> str | None:
         if not self._db.in_transaction:
             return None
         return f"sqlite-txn:{self._txn_epoch}"
@@ -483,6 +483,12 @@ class SqliteProbeAdapter(Adapter):
         if isinstance(exc, sqlite3.Error):
             return OutcomeClass.SERVER_REJECTION
         return OutcomeClass.COMMUNICATION_FAILURE
+
+    def error_code(self, exc: BaseException) -> str | None:
+        """SQLite's symbolic result code, which names the fault but not the row."""
+        if isinstance(exc, sqlite3.Error):
+            return getattr(exc, "sqlite_errorname", None)
+        return None
 
 
 def _bind(params: object | None):

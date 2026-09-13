@@ -22,6 +22,7 @@ from .config import Config
 from .context import build_context
 from .diagnostics import RunLog
 from .errors import (
+    OUTCOME_NAMES,
     ContractViolationError,
     Exit,
     MetadataDamagedError,
@@ -29,11 +30,12 @@ from .errors import (
     MigrationFailedError,
     RecoveryRequiredError,
     UnknownOutcomeError,
+    ValidationError,
 )
 from .latch import RunLatch
-from .loader import load_entry
+from .loader import check_result, load_entry
 from .manifest import Language, Mode
-from .model import Capture, CapturedUnit, MetadataState, Plan, Snapshot
+from .model import Capture, CapturedUnit, MetadataReport, MetadataState, Plan, Snapshot
 from .sqltext import StatementKind, normalize
 from .statevalidate import (
     build_plan,
@@ -76,23 +78,8 @@ class RunReport:
     def to_json(self) -> str:
         payload = asdict(self)
         payload["exit_code"] = int(self.exit_code)
-        payload["outcome"] = _OUTCOMES[Exit(self.exit_code)]
+        payload["outcome"] = OUTCOME_NAMES[Exit(self.exit_code)]
         return json.dumps(payload, indent=2)
-
-
-#: A one-word outcome per exit code, so an operator or a script does not have to
-#: map the number back to a meaning.
-_OUTCOMES = {
-    Exit.OK: "ok",
-    Exit.USAGE: "usage_error",
-    Exit.VALIDATION: "validation_failed",
-    Exit.MIGRATION_FAILED: "migration_failed",
-    Exit.UNKNOWN_OUTCOME: "outcome_unknown",
-    Exit.LOCK_NOT_ACQUIRED: "lock_not_acquired",
-    Exit.NOT_INITIALIZED: "not_initialized",
-    Exit.METADATA_DAMAGED: "metadata_damaged",
-    Exit.CONTRACT_VIOLATION: "contract_violation",
-}
 
 
 def runner_info(run_id: str) -> RunnerInfo:
@@ -159,35 +146,40 @@ class Engine:
             )
             self.adapter.acquire_lock()
             self.log.event("lock_acquired", binding=self.adapter.lock_binding())
+            metadata = self.adapter.inspect_metadata()
+            self._admit_recovery_namespace(metadata)
             self.adapter.prepare_storage()
-            self._initialize_if_needed()
+            self._initialize_if_needed(metadata)
             plan = self._build_plan()
             self._execute(plan)
-        except UnknownOutcomeError as exc:
-            # No retry, no reconnect, no cleanup SQL (spec Section 7.2).
-            self._fail(exc, Exit.UNKNOWN_OUTCOME, discarded=True)
-            if connected:
-                self.adapter.discard()
-            return self._finish(started)
-        except RecoveryRequiredError as exc:
-            self._fail(exc, exc.exit_code)
-            self.report.recovery_command = f"migr8 migrate --recover {exc.migration_id}"
-            if connected:
-                self._close_quietly()
-            return self._finish(started)
-        except Migr8Error as exc:
-            self._fail(exc, exc.exit_code)
-            if connected:
-                self._close_quietly()
-            return self._finish(started)
         except BaseException as exc:
-            # Ctrl-C, SIGTERM or an unexpected fault. A commit that was in flight
-            # has already latched the run, so honour that; otherwise nothing
-            # durable is in doubt and the ordinary failure rules apply.
-            return self._handle_interruption(exc, connected=connected, started=started)
+            return self._terminate(exc, connected=connected, started=started)
         if connected:
             self._close_quietly()
         self.log.event("run_end", outcome="ok", executed=list(self.report.executed))
+        return self._finish(started)
+
+    def _terminate(self, exc: BaseException, *, connected: bool, started: float) -> RunReport:
+        """Report one terminal failure, with the run latch deciding the outcome.
+
+        A latched unknown outcome or contract violation outranks whatever
+        exception arrived here.  Author code that catches the latched error and
+        returns, or replaces it with one of its own, must not be able to change
+        what the run reports (spec Sections 7.2 and 9.2).
+        """
+        error = self.latch.error or (exc if isinstance(exc, Migr8Error) else None)
+        if error is None:
+            return self._handle_interruption(exc, connected=connected, started=started)
+        code = Exit(error.exit_code)
+        # No retry, no reconnect and no cleanup SQL after an unknown outcome.
+        discarded = code is Exit.UNKNOWN_OUTCOME
+        self._fail(error, code, discarded=discarded)
+        if isinstance(error, RecoveryRequiredError):
+            self.report.recovery_command = f"migr8 migrate --recover {error.migration_id}"
+        if connected and discarded:
+            self.adapter.discard()
+        elif connected:
+            self._close_quietly()
         return self._finish(started)
 
     def _fail(self, error: Migr8Error, code: Exit, *, discarded: bool = False) -> None:
@@ -198,7 +190,7 @@ class Engine:
         self.report.connection_discarded = discarded
         self.log.event(
             "run_end",
-            outcome=_OUTCOMES[code],
+            outcome=OUTCOME_NAMES[code],
             exit_code=int(code),
             phase=error.phase,
             migration=error.migration_id,
@@ -209,34 +201,21 @@ class Engine:
     def _handle_interruption(
         self, exc: BaseException, *, connected: bool, started: float
     ) -> RunReport:
-        """Treat an interruption the way the durable state requires.
+        """Treat an unlatched interruption as an ordinary failure.
 
-        If a commit-capable operation was in flight its outcome is already
-        latched as unknown, and the connection must be discarded without further
-        SQL. Otherwise the interruption is an ordinary failure: uncommitted work
-        is rolled back and a restartable migration stays ACTIVE.
+        An interruption inside a commit-capable operation latches the run, and
+        :meth:`_terminate` reports that instead.  Reaching here means nothing
+        durable is in doubt: uncommitted work is rolled back and a restartable
+        migration stays ACTIVE.
         """
-        latched = self.latch.error
-        if latched is not None:
-            self._fail(
-                latched,
-                Exit(latched.exit_code),
-                discarded=latched.exit_code == Exit.UNKNOWN_OUTCOME,
-            )
-            if connected and self.report.connection_discarded:
-                self.adapter.discard()
-            elif connected:
-                self._close_quietly()
-            return self._finish(started)
-
         kind = type(exc).__name__
         interrupted = isinstance(exc, KeyboardInterrupt)
         error = MigrationFailedError(
             f"the run was interrupted ({kind}); uncommitted work was rolled back and any "
             "restartable migration remains ACTIVE. Rerun to continue."
             if interrupted
-            else f"the run failed unexpectedly ({kind}: {exc}); uncommitted work was rolled "
-            "back and any restartable migration remains ACTIVE",
+            else f"the run failed unexpectedly ({self._describe(exc)}); uncommitted work was "
+            "rolled back and any restartable migration remains ACTIVE",
             phase="interrupted" if interrupted else "internal_error",
         )
         if connected:
@@ -245,8 +224,21 @@ class Engine:
         if connected:
             self._close_quietly()
         if not interrupted:
-            LOGGER.exception("unexpected failure during migrate")
+            # The traceback carries the driver's own message, which quotes the
+            # data that produced it, so it is not part of default output.
+            LOGGER.debug("unexpected failure during migrate", exc_info=True)
         return self._finish(started)
+
+    def _describe(self, exc: BaseException) -> str:
+        """Name a failure without reproducing what the driver said.
+
+        The engine's own errors are written for an operator and carry no driver
+        text, so they pass through unchanged.  Anything else is named by type
+        and engine error code (spec Section 11.5).
+        """
+        if isinstance(exc, Migr8Error):
+            return exc.report()
+        return self.adapter.describe_exception(exc)
 
     def _finish(self, started: float) -> RunReport:
         self.report.duration_seconds = round(time.monotonic() - started, 4)
@@ -256,12 +248,36 @@ class Engine:
         try:
             self.adapter.close()
         except Exception as exc:  # pragma: no cover - best-effort teardown
-            LOGGER.warning("closing the session did not complete cleanly: %s", exc)
+            LOGGER.warning("closing the session did not complete cleanly: %s", self._describe(exc))
 
     # --- initialization ---------------------------------------------------------------------------
 
-    def _initialize_if_needed(self) -> None:
-        report = self.adapter.inspect_metadata()
+    def _admit_recovery_namespace(self, report: MetadataReport) -> None:
+        """Refuse an impossible ``--recover`` before any metadata exists (spec Section 10.1).
+
+        Section 10.1 requires missing ACTIVE state to fail before metadata
+        mutation.  A namespace without completed metadata holds no ACTIVE
+        identity at all, so the refusal belongs here, under the lock but ahead of
+        storage preparation and initialization: Oracle's initialization DDL
+        commits independently and would be left behind by a later refusal.
+        Plain ``migrate`` keeps its recoverable initialization.
+        """
+        if self.recover_id is None or report.state is MetadataState.COMPLETE:
+            return
+        if report.state is MetadataState.DAMAGED:
+            raise MetadataDamagedError(
+                f"migration metadata is damaged or incompatible, so --recover "
+                f"{self.recover_id} was not considered; nothing is recreated. "
+                + "; ".join(report.problems)
+            )
+        raise ValidationError(
+            f"--recover {self.recover_id} requires an ACTIVE restartable migration, and this "
+            f"namespace has no initialized migration metadata ({report.state.value}). No "
+            "metadata object was created and no migration ran; run migrate without --recover "
+            "to initialize."
+        )
+
+    def _initialize_if_needed(self, report: MetadataReport) -> None:
         if report.state is MetadataState.DAMAGED:
             raise MetadataDamagedError(
                 "migration metadata is damaged or incompatible; nothing is recreated. "
@@ -339,6 +355,10 @@ class Engine:
         identity = adapter.establish_transaction_identity()
         try:
             self._invoke(unit, attempt=None)
+            # A latched unknown outcome or contract violation cannot be cleared
+            # by author code catching its exception and returning normally
+            # (spec Sections 7.2 and 9.2).
+            self.latch.check()
             self._require_valid(unit)
             self._check_transaction_identity(unit, identity)
             adapter.insert_success_row(
@@ -361,12 +381,23 @@ class Engine:
             # rejection, is an ordinary migration failure: the transaction is
             # rolled back and no history row is written.
             self._rollback_quietly()
-            raise MigrationFailedError(
-                f"atomic migration {unit.id!r} failed and was rolled back: {exc}",
-                phase="migration_execution",
-                migration_id=unit.id,
+            raise self._latched_or(
+                MigrationFailedError(
+                    f"atomic migration {unit.id!r} failed and was rolled back: "
+                    f"{self._describe(exc)}",
+                    phase="migration_execution",
+                    migration_id=unit.id,
+                ),
             ) from exc
         adapter.durable_commit(Boundary.ATOMIC_COMPLETION, migration_id=unit.id)
+
+    def _latched_or(self, ordinary: Migr8Error) -> Migr8Error:
+        """The latched error if there is one, otherwise the ordinary failure.
+
+        Author code that swallows a latched failure and raises its own exception
+        does not get to downgrade the outcome.
+        """
+        return self.latch.error if self.latch.error is not None else ordinary
 
     def _check_transaction_identity(self, unit: CapturedUnit, established: str | None) -> None:
         if established is None:
@@ -391,7 +422,7 @@ class Engine:
         try:
             self.adapter.rollback()
         except Exception as exc:  # pragma: no cover
-            LOGGER.warning("rollback did not complete cleanly: %s", exc)
+            LOGGER.warning("rollback did not complete cleanly: %s", self._describe(exc))
 
     # --- restartable ------------------------------------------------------------------------------
 
@@ -427,11 +458,13 @@ class Engine:
             raise
         except Exception as exc:
             self._post_return_cleanup(unit)
-            raise MigrationFailedError(
-                f"restartable migration {unit.id!r} failed; it remains ACTIVE and will be "
-                f"re-entered from its entry point on the next run: {exc}",
-                phase="migration_execution",
-                migration_id=unit.id,
+            raise self._latched_or(
+                MigrationFailedError(
+                    f"restartable migration {unit.id!r} failed; it remains ACTIVE and will be "
+                    f"re-entered from its entry point on the next run: {self._describe(exc)}",
+                    phase="migration_execution",
+                    migration_id=unit.id,
+                ),
             ) from exc
 
         # A latched unknown outcome or contract violation cannot be cleared by
@@ -486,16 +519,24 @@ class Engine:
         return self._invoke_python(unit, attempt=attempt)
 
     def _invoke_sql(self, unit: CapturedUnit) -> None:
+        """Run a SQL entry file through the same operation guard as the facade.
+
+        Admission differs between the two entry paths; classification does not.
+        Whether a call can commit follows from the execution context the engine
+        established, not from the statement's leading token (spec Section 7.2).
+        """
         text = (unit.source_dir / unit.definition.entry).read_text(encoding="utf-8")
         statement = normalize(text)
         if unit.mode is Mode.ATOMIC:
             self.adapter.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
-            self.adapter.execute(statement, None)
+            self._guarded(unit, "execute", self.adapter.execute, statement, None)
             return
         if statement.kind is StatementKind.PLSQL_BLOCK:
             # A procedural block in restartable mode may own its transactions;
             # it is trusted to commit all intended work before returning.
-            self.adapter.execute(statement, None)
+            self._guarded(
+                unit, "execute", self.adapter.execute, statement, None, commit_capable=True
+            )
             return
         self.adapter.admit_ddl(statement)
         if self.adapter.has_open_transaction():
@@ -504,7 +545,32 @@ class Engine:
                 phase="migration_execution",
                 migration_id=unit.id,
             )
-        self.adapter.execute_ddl(statement)
+        self._guarded(
+            unit,
+            "DDL execution",
+            self.adapter.execute_ddl,
+            statement,
+            phase="restartable_ddl",
+            commit_capable=True,
+        )
+
+    def _guarded(
+        self,
+        unit: CapturedUnit,
+        operation: str,
+        func,
+        *args,
+        phase: str = "migration_execution",
+        commit_capable: bool = False,
+    ):
+        return self.adapter.guarded(
+            func,
+            *args,
+            operation=operation,
+            phase=phase,
+            migration_id=unit.id,
+            commit_capable=commit_capable,
+        )
 
     def _invoke_python(self, unit: CapturedUnit, *, attempt: int | None):
         loaded = load_entry(
@@ -518,7 +584,7 @@ class Engine:
             run_log=self.log,
         )
         try:
-            loaded.migrate(ctx)
+            check_result(loaded.migrate(ctx), migration_id=unit.id)
         finally:
             loaded.unload()
         return ctx

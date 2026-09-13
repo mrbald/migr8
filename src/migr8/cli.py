@@ -11,12 +11,18 @@ Two behaviours here exist for operations rather than for the specification:
   instead of an abrupt kill part-way through a commit.
 * every failure, including an unexpected one, leaves a defined exit code and a
   run id rather than a traceback.
+
+One rule holds the command's terminal result together: the value :func:`main`
+returns is decided once, before diagnostics are torn down.  Opening the event
+log is validated before any database work, and closing it can never replace an
+outcome the database already made durable.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import signal
 import sys
@@ -28,7 +34,7 @@ from .config import DEFAULT_CONFIG_NAME, Config
 from .config import load as load_config
 from .diagnostics import RunLog, default_log_path
 from .engine import Engine
-from .errors import Exit, Migr8Error, UsageError
+from .errors import OUTCOME_NAMES, Exit, Migr8Error, UsageError, describe_safely
 from .manifest import DEFAULT_MANIFEST_NAME
 from .manifest import load as load_manifest
 from .model import Capture
@@ -184,6 +190,56 @@ def _do_readonly(args: argparse.Namespace, command: str, log: RunLog) -> int:
     return report.exit_code
 
 
+def _render_failure(
+    args: argparse.Namespace,
+    run_id: str,
+    code: Exit,
+    message: str,
+    *,
+    phase: str | None = None,
+    migration: str | None = None,
+) -> int:
+    """Render one handled command failure and return its exit code.
+
+    ``--json`` gets a machine-readable record here too, carrying the same run id
+    and outcome name the engine's own report uses, so a script does not have to
+    parse stderr to learn what happened before the engine took over.
+    """
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "exit_code": int(code),
+                    "outcome": OUTCOME_NAMES[code],
+                    "run_id": run_id,
+                    "message": message,
+                    "phase": phase,
+                    "failed_migration": migration,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"error: {message}", file=sys.stderr)
+        print(f"run: {run_id}", file=sys.stderr)
+    return int(code)
+
+
+def _open_log(run_id: str, args: argparse.Namespace) -> RunLog:
+    """Open the event log, turning a setup failure into a defined usage error.
+
+    This runs before the command connects to anything, so a log path that cannot
+    be written fails with an exit code rather than escaping the handlers that
+    exist to produce one.
+    """
+    try:
+        return RunLog(run_id, default_log_path(args.log_file))
+    except OSError as exc:
+        raise UsageError(
+            f"the run log cannot be opened: {describe_safely(exc)}", phase="log_setup"
+        ) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -193,34 +249,59 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
     _install_signal_handlers()
-    log = RunLog(uuid.uuid4().hex, default_log_path(args.log_file))
+    run_id = uuid.uuid4().hex
+    try:
+        log = _open_log(run_id, args)
+    except Migr8Error as exc:
+        return _render_failure(args, run_id, exc.exit_code, exc.report(), phase=exc.phase)
     try:
         if args.command == "migrate":
             return _do_migrate(args, log)
         return _do_readonly(args, args.command, log)
     except Migr8Error as exc:
         log.event("run_end", exit_code=int(exc.exit_code), detail=exc.message, phase=exc.phase)
-        print(f"error: {exc.report()}", file=sys.stderr)
-        return int(exc.exit_code)
+        return _render_failure(
+            args,
+            run_id,
+            exc.exit_code,
+            exc.report(),
+            phase=exc.phase,
+            migration=exc.migration_id,
+        )
     except KeyboardInterrupt:
         # Reached only before the engine owns the run; once it does, it classifies
         # the interruption against the durable state itself.
         log.event("run_end", exit_code=int(Exit.MIGRATION_FAILED), detail="interrupted")
-        print("error: interrupted before any migration work began", file=sys.stderr)
-        return int(Exit.MIGRATION_FAILED)
-    except Exception as exc:
-        # A defect in this tool must still produce an actionable outcome.
-        log.event("run_end", exit_code=int(Exit.USAGE), detail=f"{type(exc).__name__}: {exc}")
-        LOGGER.exception("unexpected failure")
-        print(
-            f"error: unexpected failure ({type(exc).__name__}: {exc}). "
-            f"run: {log.run_id}. No migration was admitted by this failure path; "
-            "run status to confirm the database state.",
-            file=sys.stderr,
+        return _render_failure(
+            args,
+            run_id,
+            Exit.MIGRATION_FAILED,
+            "interrupted before any migration work began",
+            phase="interrupted",
         )
-        return int(Exit.USAGE)
+    except Exception as exc:
+        # A defect in this tool must still produce an actionable outcome.  The
+        # failure is named by type: an exception reaching here may carry driver
+        # text, and the traceback certainly does, so both stay at DEBUG.
+        described = describe_safely(exc)
+        log.event("run_end", exit_code=int(Exit.USAGE), detail=described)
+        LOGGER.debug("unexpected failure", exc_info=True)
+        return _render_failure(
+            args,
+            run_id,
+            Exit.USAGE,
+            f"unexpected failure ({described}). This reached the command's fallback "
+            "handler, which cannot say what the database did: the failure may have "
+            "arisen while reporting a completed run. Run status to confirm the state.",
+            phase="internal_error",
+        )
     finally:
-        log.close()
+        # Diagnostic teardown never replaces an outcome the database already made
+        # durable, so a failing close is a warning and not the command's result.
+        try:
+            log.close()
+        except Exception as exc:  # pragma: no cover - exercised with an injected handle
+            LOGGER.warning("the run log did not close cleanly: %s", describe_safely(exc))
 
 
 if __name__ == "__main__":  # pragma: no cover
