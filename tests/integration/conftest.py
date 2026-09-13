@@ -28,6 +28,83 @@ def _missing(names: tuple[str, ...]) -> list[str]:
 
 
 @pytest.fixture(scope="session")
+def oracle_tls_settings(oracle_settings):
+    """Where the certificate fixture lives, or a skip saying how to build it.
+
+    The fixture is what `testenv/provision_tls.sh` writes: a client TNS_ADMIN
+    holding a wallet, a sqlnet.ora and a TCPS alias.  A wallet is read by the
+    Oracle Client libraries, so these tests need Thick mode as well.
+    """
+    if not support.ORACLE_TLS_ADMIN:
+        pytest.skip(
+            "set MIGR8_ORACLE_TLS_ADMIN to a client TNS_ADMIN directory; "
+            "testenv/provision_tls.sh builds one"
+        )
+    if not support.ORACLE_CLIENT_LIB:
+        pytest.skip(
+            "a wallet is read by the Oracle Client libraries, so this needs Thick mode: "
+            "set MIGR8_ORACLE_CLIENT_LIB"
+        )
+    return {
+        "admin": support.ORACLE_TLS_ADMIN,
+        "alias": os.environ.get("MIGR8_ORACLE_TLS_ALIAS", "ORDERS_TLS"),
+        "schema": os.environ.get("MIGR8_ORACLE_TLS_SCHEMA", "MIGR8_TLS").upper(),
+    }
+
+
+@pytest.fixture
+def oracle_tls_project(tmp_path, oracle_tls_settings):
+    """A clean namespace reached by certificate, and a config with no password.
+
+    The cleanup connects the same way the run does, so nothing in this fixture
+    knows a password either.
+    """
+    import oracledb
+
+    schema = oracle_tls_settings["schema"]
+    connect = {
+        "user": f"[{schema}]",
+        "dsn": oracle_tls_settings["alias"],
+        "externalauth": True,
+    }
+    with oracledb.connect(**connect) as connection:
+        cursor = connection.cursor()
+        for name, kind in cursor.execute(
+            "SELECT object_name, object_type FROM all_objects WHERE owner = :owner "
+            "AND object_type IN ('TABLE','VIEW') ORDER BY object_type DESC",
+            owner=schema,
+        ).fetchall():
+            suffix = " CASCADE CONSTRAINTS PURGE" if kind == "TABLE" else ""
+            with contextlib.suppress(oracledb.DatabaseError):
+                cursor.execute(f'DROP {kind} "{schema}"."{name}"{suffix}')
+        connection.commit()
+
+    config = support.write(
+        tmp_path / "migr8.toml",
+        f"""
+        [database]
+        adapter = "oracle"
+        dsn = "{oracle_tls_settings["alias"]}"
+        user = "[{schema}]"
+
+        [oracle]
+        ddl_lock_timeout_seconds = 10
+        allow_thick_mode = true
+        client_lib_dir = "{support.ORACLE_CLIENT_LIB}"
+        config_dir = "{oracle_tls_settings["admin"]}"
+
+        [lock]
+        provider = "dbms_lock"
+        package = "SYS.DBMS_LOCK"
+        id = 4743
+        timeout_seconds = 20
+    """,
+    )
+    os.environ.pop("MIGR8_PASSWORD", None)
+    yield tmp_path, config, schema, connect
+
+
+@pytest.fixture(scope="session")
 def oracle_settings():
     missing = _missing(ORACLE_ENV)
     if missing:

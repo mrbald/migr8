@@ -19,3 +19,6 @@ testenv/.env
 testenv/secrets/
 .scratch/
 deploy/apple-container/generated/
+
+# Generated TLS fixture for the disposable Oracle test database
+testenv/tls/

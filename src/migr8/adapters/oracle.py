@@ -211,16 +211,27 @@ def _enable_thick_mode(lib_dir: str | None, config_dir: str | None) -> None:
     """
     global _THICK_MODE
     requested = (lib_dir, config_dir)
-    if _THICK_MODE is not None and requested != _THICK_MODE:
-        raise UsageError(
-            "thick mode was already initialized in this process with "
-            f"{_THICK_MODE}; the Oracle Client libraries cannot be reloaded"
-        )
+    if _THICK_MODE == _ELSEWHERE:
+        return
+    if _THICK_MODE is not None:
+        if requested != _THICK_MODE:
+            raise UsageError(
+                "thick mode was already initialized in this run with "
+                f"{_THICK_MODE}; the Oracle Client libraries cannot be reloaded, so "
+                "these directories cannot take effect"
+            )
+        return
     if not oracledb.is_thin_mode():
-        # Thick mode is already in force, here or in whatever started this
-        # process.  The driver's own state is the authority: initializing twice
-        # is an error, and it cannot be undone once a connection exists.
-        _THICK_MODE = requested
+        # Something else in this process loaded the client already -- an
+        # embedding application, or a harness.  Which directories it used cannot
+        # be read back from the driver, so the configured ones are reported as
+        # not in force rather than assumed to be.
+        _THICK_MODE = _ELSEWHERE
+        if lib_dir or config_dir:
+            LOGGER.warning(
+                "thick mode was already initialized before this run; "
+                "oracle.client_lib_dir and oracle.config_dir are not in force"
+            )
         return
     try:
         oracledb.init_oracle_client(lib_dir=lib_dir, config_dir=config_dir)
@@ -238,8 +249,13 @@ def _enable_thick_mode(lib_dir: str | None, config_dir: str | None) -> None:
     _THICK_MODE = requested
 
 
-#: The directories thick mode was initialized with, or None while the process is Thin.
-_THICK_MODE: tuple[str | None, str | None] | None = None
+#: Thick mode was initialized by something other than this adapter, so the
+#: directories in force are that caller's and cannot be read back.
+_ELSEWHERE = "elsewhere"
+
+#: The directories thick mode was initialized with, ``_ELSEWHERE`` when another
+#: caller did it, or None while the process is Thin.
+_THICK_MODE: tuple[str | None, str | None] | str | None = None
 
 
 def _require_identifier(value: str, what: str) -> str:

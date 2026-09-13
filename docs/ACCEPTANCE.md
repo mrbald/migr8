@@ -61,6 +61,9 @@ What this report claims, for the exact versions recorded below:
   a TNS alias from `tnsnames.ora` reaches the same namespace in both modes.
 - A proxy connect string, `RUNNER[OWNER]`, authenticates as the runner and runs
   as the owner against the real server, with the objects owned by the owner.
+- An initial install runs over TLS, authenticated by a client certificate and
+  proxying into the schema, with no password in the configuration or the
+  environment.
 
 What it does not claim: nothing about Oracle 19c, thick-mode drivers, wallet or
 external authentication, Windows, network filesystems, RAC, Data Guard,
@@ -164,14 +167,15 @@ and everything else.
 | Pure / unit | **PASS** | 278 | Deterministic fixtures, including malformed, colliding and corrupt definitions, and dictionary rows recorded from the live servers. No database. |
 | SQLite | **PASS** | 339 | Real SQLite files, real transactions, real cooperating OS processes, real signals and real `SIGKILL`s, in both supported journal modes. |
 | PostgreSQL integration | **PASS** | 63 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures, live metadata mutation. |
-| Oracle integration | **PASS** | 97 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures, live metadata mutation. |
+| Oracle integration | **PASS** | 99 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures, live metadata mutation. |
 | Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available. See [Open gates](#open-gates). |
 
-Total: **777 tests, 776 passed, 0 failed, 1 skipped** with both services up, run
-on 2026-09-13 against the versions recorded above. Run time about 82 s. The one
-skip is the filesystem-fills case, which needs a small bounded filesystem named
-in `MIGR8_SMALL_FS`; the command that supplies one is below, and the result of
-running it is recorded there too. Without the services, 617 run and the live
+Total: **779 tests, 776 passed, 0 failed, 3 skipped** with both services up, run
+on 2026-09-13 against the versions recorded above. Run time about 81 s. The three
+skips each name the fixture they need: the filesystem-fills case wants a small
+bounded filesystem in `MIGR8_SMALL_FS`, and the two certificate tests want the
+TLS fixture and the Oracle Client libraries. Both fixtures and the results of
+running with them are recorded below. Without the services, 617 run and the live
 suites skip with an explicit message naming the missing environment variables; a
 skip is never counted as coverage. The
 `databases` job in CI runs the whole suite against both servers on every push
@@ -216,6 +220,7 @@ against the parametrisation, so a new adapter cannot skip it.
 | `tests/integration/test_postgres.py` | 18 |
 | `tests/integration/test_metadata_damage.py` | 14 |
 | `tests/integration/test_oracle_concurrency.py` | 5 |
+| `tests/integration/test_oracle_tls.py` | 2 |
 
 ## Required scenario groups
 
@@ -328,6 +333,11 @@ against the same server. The suite runs in the configured mode end to end: the
 generated configs carry `allow_thick_mode` and `client_lib_dir`, so the runners
 the tests start in subprocesses load the client libraries too.
 
+The certificate tests need the TLS fixture as well, which adds
+`-v "$PWD/testenv/tls:/etc/oracle:ro" -e MIGR8_ORACLE_TLS_ADMIN=/etc/oracle` to
+the same command after `testenv/provision_tls.sh` has run. With the fixture in
+place the Oracle suite is **99 tests**, all passing.
+
 ```bash
 # Instant Client, once: unzip instantclient-basic-linux.arm64-23.9.0.25.07.zip
 docker run --rm --network migr8-testenv_default \
@@ -354,6 +364,23 @@ fresh schema: initial install through the alias in Thick mode (`status` exit 6,
 same alias in Thin mode, and validated again with a `host:port/service` DSN --
 the binding records the schema and the lock id, not the spelling of the address.
 
+**Certificate authentication over TLS.** `testenv/provision_tls.sh` builds the
+fixture: a server wallet and a client wallet, a TCPS endpoint on the listener
+demanding a client certificate, a database user whose identity is the client
+certificate's DN, and a proxy grant into a test schema. With it,
+`database.user = "[MIGR8_TLS]"`, no `MIGR8_PASSWORD` in the environment and no
+secret in the configuration, an initial install runs end to end: `status` exit 6,
+`migrate` exit 0, `validate` exit 0, and the session reports
+`NETWORK_PROTOCOL = tcps`, `AUTHENTICATION_METHOD = SSL_PROXY`, the certificate
+DN as `PROXY_USER` and the schema as `SESSION_USER`, with the application table
+and the `m8_*` metadata owned by that schema. A password supplied alongside such
+a connect string is refused, because the two say different things about who is
+connecting.
+
+Two self-signed certificates and one listener. A real estate's certificate
+authority, revocation, expiry and rotation are not exercised, and neither is TLS
+without client authentication.
+
 **Proxy authentication.** `database.user = "RUNNER[OWNER]"` authenticates as one
 user and runs as another. Covered against the real server: the migration applies
 and validates, `USER` in the session is the owner, `PROXY_USER` is the runner,
@@ -362,10 +389,12 @@ with the runner holding no `ANY` privilege for that path. The database grant is
 `ALTER USER OWNER GRANT CONNECT THROUGH RUNNER`, and `testenv/provision_oracle.py`
 now makes it for the disposable fixture pair.
 
-Not covered: a wallet, TLS (`TCPS`) and certificate authentication. The
-`[APP_DBA]` form -- a proxy target with no connecting user, which authenticates
-externally -- is accepted, refuses a password, and requires Thick mode, but no
-run here has authenticated with a wallet, so that form is untested.
+One property of Thick mode is worth recording, because the suite found it: the
+client is loaded once per process, and the directories given to the first call
+are the ones in force. When something else in the process loaded it already --
+an embedding application, or this suite's own harness -- `client_lib_dir` and
+`config_dir` cannot take effect, and the run logs that rather than reporting
+directories it is not using.
 
 ## Commit-acknowledgement failure evidence
 
@@ -437,8 +466,8 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 | Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle publishes no freely redistributable 19c container image, so this gate needs a licensed installation. Results on Free 23ai are results on Free 23ai; 19c support is not published on the strength of them. |
 | python-oracledb Thick mode | **PASS, one client** | All 97 Oracle tests pass in Thick mode with Instant Client 23.9.0.25.07 on Linux ARM64, recorded above. One client version, one architecture, one server release; and no Thick-mode-only feature is used, so this says the adapter works through that stack, not that it exercises it. |
 | TNS aliases and a driver configuration directory | **PASS, aliases only** | `oracle.config_dir` with a `tnsnames.ora` alias resolves in both modes against a real listener. `sqlnet.ora` settings, a wallet directory and Easy Connect Plus parameters are not exercised. |
-| Proxy-authenticated connect strings | **PASS with a password** | `RUNNER[OWNER]` migrates and validates against the real server, running as the owner with the objects owned by the owner. The `[APP_DBA]` form is accepted and routed to external authentication, and is untested for want of a wallet. |
-| Wallet and external authentication | **NOT RUN** | A fixture using a wallet over TLS, plus the supported-combination matrix. Every tested path uses a password. The pieces are in place -- an absent password selects external authentication, Thick mode loads the client that reads a wallet, and `oracle.config_dir` points at it -- so what is missing is a TLS listener, a wallet fixture and the evidence. |
+| Proxy-authenticated connect strings | **PASS** | `RUNNER[OWNER]` migrates and validates against the real server, running as the owner with the objects owned by the owner, and `[SCHEMA]` does the same authenticated by certificate. |
+| Wallet and external authentication | **PASS, one fixture** | An initial install over TCPS authenticated by client certificate, proxying into the schema, with no password anywhere; `testenv/provision_tls.sh` builds the fixture and `tests/integration/test_oracle_tls.py` runs it. Self-signed certificates, one listener, one client: no certificate authority, revocation, expiry or rotation, and no TLS-without-client-authentication case. |
 | Windows | **NOT SUPPORTED, NOT RUN** | The SQLite adapter refuses to start on Windows by design. Nothing has been run there. |
 | Network filesystems, hard-link aliases, shared in-memory SQLite | **OUT OF PROFILE** | Out of the SQLite profile by declaration, not by test. |
 | SQLite on Linux | **PASS, one distribution** | The service-free suite runs on Debian (`python:3.14-slim`, kernel 6.10.14-linuxkit, aarch64, SQLite 3.46.1) as an unprivileged user: 606 passed, 1 skipped. CI runs the same suite on ubuntu-latest, amd64, on every push. No other distribution, filesystem or kernel is recorded. |
