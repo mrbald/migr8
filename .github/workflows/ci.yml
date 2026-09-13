@@ -65,14 +65,22 @@ jobs:
         run: testenv/dbctl.sh up
       - name: record the server versions the run is evidence for
         run: testenv/dbctl.sh versions
-      # The fixtures skip when a service is unreachable, which is the failure
-      # this job exists to catch. Fail on any skip instead.
+      # A live fixture skips when its service is unreachable or unconfigured,
+      # which is the failure this job exists to catch. The skips that remain
+      # with both services up name a fixture no plain runner has: a bounded
+      # filesystem for the ENOSPC case, and an Oracle wallet plus Client
+      # libraries for the two certificate tests. docs/ACCEPTANCE.md records
+      # running those elsewhere. Print every skip, and fail on a service one.
       - name: full suite against both servers
         run: |
           set -euo pipefail
           testenv/dbctl.sh test -q | tee suite.log
-          if grep -qE '[0-9]+ skipped' suite.log; then
-            echo "a suite skipped with both services up; something is unreachable."
+          # pytest colours the summary even when stdout is a pipe.
+          skips="$(sed $'s/\x1b\\[[0-9;]*m//g' suite.log | grep '^SKIPPED' || true)"
+          echo "${skips:-nothing skipped}"
+          if printf '%s\n' "$skips" |
+             grep -E 'not reachable|not configured|is unset|could not import'; then
+            echo "a live suite skipped with both services up; something is unreachable."
             exit 1
           fi
       - name: service logs
