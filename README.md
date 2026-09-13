@@ -56,9 +56,9 @@ uv run migr8 validate --config migr8.toml --manifest manifest.toml
 ## Tests
 
 ```bash
-uv run pytest -m "not oracle and not postgres"   # 331 tests, no services needed
+uv run pytest -m "not oracle and not postgres"   # 400 tests, no services needed
 testenv/dbctl.sh up                              # disposable Oracle + PostgreSQL
-testenv/dbctl.sh test                            # all 476, with the databases
+testenv/dbctl.sh test                            # all 553, with the databases
 testenv/dbctl.sh down
 ```
 
@@ -78,7 +78,16 @@ migr8 migrate --json | jq '{outcome, failed_migration, phase}'
 
 Every run has a correlation id, printed on failure and present on every log line.
 The log records each phase with timings and ends with the outcome, the failing
-migration and the phase. Credentials and bind values are never written.
+migration and the phase.
+
+A failure is reported by exception type and engine error code — `ORA-00001`,
+`SQLSTATE 23505` — with the operation, phase and identity around it, on stderr,
+in `--json`, in the event log and under `--verbose` alike. The driver's own
+message is not reproduced, because it quotes the values that produced the error.
+Two exclusions are stated and there are no others: `ctx.log()` fields are the
+author's choice and the author's responsibility, and connection, session and
+privilege errors raised before any migration runs quote the server, because
+there the server's message is the diagnostic.
 
 ## Exit codes
 
@@ -104,14 +113,16 @@ src/migr8/
   engine.py context.py loader.py latch.py          orchestration and the author facade
   diagnostics.py                                   correlation id and event log
   cli.py readonly.py reporting.py                  three commands and their output
-  adapters/base.py                                 the contract plus every shared rule
+  adapters/base.py                                 the contract, the session rules, the operation guard
   adapters/{oracle,postgres,sqlite_probe}.py       dialect and engine-specific behaviour
 docs/  examples/  testenv/  deploy/  tests/
 migr8                                              thin entry point for a checkout
 ```
 
-The dependency direction is one-way: adapters import from the core, never the
-reverse, and the engine contains no engine-specific SQL.
+`adapters` imports from the core, and `engine`, `context` and `checks` import
+`adapters.base` for the `Adapter` contract. No core module imports a concrete
+driver: `oracle`, `postgres` and `sqlite_probe` are reached only through
+`adapters.create`, and the engine contains no engine-specific SQL.
 
 ## Licensing
 

@@ -1,11 +1,12 @@
 """The Python migration facade (spec Section 9.2).
 
-The driver connection, cursors and commit methods are not exposed.  That is API
-discipline, not sandboxing: migration code is trusted, and the engine's
-safeguards catch honest mistakes rather than proving arbitrary effects safe.
+The driver connection, cursors and commit methods are not exposed.  Migration
+code is trusted; the engine's safeguards catch honest mistakes and do not prove
+arbitrary effects safe.
 
 The atomic and restartable facades are separate classes, so ``ctx.transaction``
-and ``ctx.ddl`` genuinely do not exist in an atomic migration.
+and ``ctx.ddl`` are absent from an atomic migration rather than present and
+raising.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from .adapters.base import Adapter, Boundary, OutcomeClass
+from .adapters.base import Adapter, Boundary
 from .diagnostics import RunLog
 from .errors import MigrationFailedError, UnknownOutcomeError, UsageError
 from .latch import RunLatch
@@ -67,25 +68,31 @@ class _BaseContext:
         self._adapter.admit_statement(statement, mode=self._mode, in_batch=self._in_batch)
         return statement
 
-    def _guard_call(self, operation: str, func, *args, phase: str = "migration_execution"):
-        """Run a non-commit-capable driver call and classify any failure.
+    def _guard_call(
+        self,
+        operation: str,
+        func,
+        *args,
+        phase: str = "migration_execution",
+        commit_capable: bool | None = None,
+    ):
+        """Submit one facade call through the adapter's operation guard.
 
-        A call that is not commit-capable can still lose the transport.  When it
-        does, the outcome of *that call* is unknown, so the run is latched.
+        ``commit_capable`` defaults to the execution context rather than to the
+        statement: in atomic mode and inside a batch the engine owns the
+        transaction, while a call made in restartable mode outside a batch may
+        be a procedural block that commits its own work.
         """
-        try:
-            return func(*args)
-        except Exception as exc:
-            if self._adapter.classify_exception(exc) is OutcomeClass.COMMUNICATION_FAILURE:
-                raise self._latch.latch_unknown(
-                    UnknownOutcomeError(
-                        str(exc),
-                        operation=operation,
-                        phase=phase,
-                        migration_id=self.migration_id,
-                    )
-                ) from exc
-            raise
+        if commit_capable is None:
+            commit_capable = self._mode is Mode.RESTARTABLE and not self._in_batch
+        return self._adapter.guarded(
+            func,
+            *args,
+            operation=operation,
+            phase=phase,
+            migration_id=self.migration_id,
+            commit_capable=commit_capable,
+        )
 
     @property
     def batch_open(self) -> bool:
@@ -179,7 +186,13 @@ class ProgressFacade:
         ctx = self._context
         ctx._latch.check()
         _check_progress_key(key)
-        value = ctx._guard_call("progress_get", ctx._adapter.progress_get, ctx.migration_id, key)
+        value = ctx._guard_call(
+            "progress_get",
+            ctx._adapter.progress_get,
+            ctx.migration_id,
+            key,
+            commit_capable=False,
+        )
         return default if value is None else value
 
     def set(self, key: str, value: str) -> None:
@@ -198,7 +211,14 @@ class ProgressFacade:
                 "checkpoint always commits with the batch it describes",
                 migration_id=ctx.migration_id,
             )
-        ctx._guard_call("progress_set", ctx._adapter.progress_set, ctx.migration_id, key, value)
+        ctx._guard_call(
+            "progress_set",
+            ctx._adapter.progress_set,
+            ctx.migration_id,
+            key,
+            value,
+            commit_capable=False,
+        )
 
 
 def _check_progress_key(key: str) -> None:
@@ -299,7 +319,7 @@ class RestartableContext(_BaseContext):
             raise
         except Exception as exc:
             raise MigrationFailedError(
-                f"batch commit was rejected by the server: {exc}",
+                f"batch commit was rejected by the server: {self._adapter.describe_exception(exc)}",
                 phase="restartable_batch",
                 migration_id=self.migration_id,
             ) from exc
@@ -326,6 +346,7 @@ class RestartableContext(_BaseContext):
             self._adapter.execute_ddl,
             statement,
             phase="restartable_ddl",
+            commit_capable=True,
         )
         hooks.fire(Boundary.RESTARTABLE_DDL, hooks.AFTER_DDL)
 

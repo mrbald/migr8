@@ -285,7 +285,7 @@ Do not label an operation non-committing solely because its first token passed a
 A driver-side refusal raised *before* anything is submitted is as definite as a server rejection: no durable effect is possible. The implementation therefore treats an outcome as definite in exactly these cases, and everything else, including an unrecognized exception or an unlisted driver code, as unknown:
 
 - **Oracle:** an `ORA-` error number returned by the server that is not in the adapter's transport-failure list, or a driver code in the adapter's enumerated client-side list. An unlisted `DPY-` code stays unknown on purpose.
-- **PostgreSQL:** a SQLSTATE outside class `08`, the connection-exception class. A `psycopg` error with no SQLSTATE is unknown unless it is a `ProgrammingError` or `NotSupportedError`, which are raised client-side.
+- **PostgreSQL:** a SQLSTATE outside class `08`, the connection-exception class, and other than `40003` `statement_completion_unknown`, which is the server reporting that it does not know whether the statement completed. A `psycopg` error with no SQLSTATE is unknown unless it is a `ProgrammingError` or `NotSupportedError`, which are raised client-side.
 - **The SQLite probe:** every `sqlite3.Error` is definite, because the library runs in-process and there is no transport to lose. The probe therefore produces no unknown outcomes and is not evidence for this contract.
 
 An unknown batch outcome may be caught by user code accidentally. The facade must latch the run as unusable and refuse further calls or successful completion. Batch context cleanup must not issue a rollback after an unknown commit outcome. This prevents a caught exception from allowing execution to continue.
@@ -347,7 +347,15 @@ Current and first fingerprints are not a full attempt audit. If source changes A
 
 ### 8.3 Definition and row validation
 
-Validate metadata object types, columns, relevant lengths/precision/scale, nullability, constraints and their participating columns/expressions, enabled/validated state, and the one-active index's uniqueness and usability. Apply binary/case-sensitive identity semantics. Compare normalized semantic definitions rather than database-generated constraint names alone.
+Validate metadata object types, columns, relevant lengths/precision/scale, nullability, constraints and their participating columns/expressions, enabled/validated state, foreign-key targets, and the one-active index's uniqueness, usability and indexed expression. Apply binary/case-sensitive identity semantics. Compare normalized semantic definitions rather than database-generated constraint names alone.
+
+The one-active index needs its exact supported form, not a resemblance to it. Oracle indexes a constant, `CASE WHEN status = 'ACTIVE' THEN 1 END`, so two ACTIVE rows collide on the same key; PostgreSQL indexes `status` under the predicate `status = 'ACTIVE'`. An expression that merely mentions the column and the value can produce one key per row and enforce nothing, so it is damage. A key reported as disabled, not validated, or pointing at another table is damage for the same reason: the layout's guarantees rest on the server enforcing it. Compare normalized renderings of these narrow supported forms; do not implement general SQL equivalence.
+
+Check constraints are compared the same way, and the comparison is exact in both directions. Each supported condition is matched against the canonical rendering the server stores for it, and the set is closed: a condition that is missing, altered or added is damage. Containment of a required fragment is not a comparison — appending `OR 1=1` to every declared condition leaves each fragment present while the constraints enforce nothing. Fold whitespace and identifier spelling, an unquoted identifier by the engine's own case folding and a quoted one by its exact content; keep string literals exactly, because `'ACTIVE'` and `'active'` are different values. Refuse a condition the comparison does not recognise rather than deciding SQL equivalence by inspection. Take the supported renderings from the supported server releases and record which release they came from.
+
+A foreign key's target is the fully qualified object and its key columns in order. A same-named history table in another schema is a different table, and accepting it would link this namespace's progress to another namespace's history.
+
+Valid existing rows are not evidence about the definition. Every row the runner wrote satisfies a constraint that enforces nothing, so only the definition says what the next write will be held to.
 
 For Oracle, use `ALL_*` views filtered by exact target owner, even when the connection user differs. Probe inaccessible objects as an error, not as absent. Reserve metadata names and prohibit migration code from modifying them outside the supplied progress API.
 
@@ -388,7 +396,13 @@ The counter counts durable admissions, not proven executions: a crash may happen
 
 The entry module exposes a synchronous callable `migrate(ctx) -> None`. It may contain additional helpers; there is no requirement that it contain exactly one callable in total.
 
+Reject a coroutine function, a generator function, an async generator function, and any call that returns a coroutine, generator or async generator, including one a synchronous wrapper hands back. The runner starts no event loop and consumes no generator, so such a body never executes; accepting one would record a successful migration that did no work. Reject any other non-`None` return value as well. Dispose of a rejected deferred object without running its body. A rejection leaves no SUCCESS row and stops the run; an already-committed restartable admission stays ACTIVE.
+
 Register a private package for the staged unit, using an injective name such as `_migr8_unit_` plus hex-encoded UTF-8 id bytes. Relative sibling imports resolve inside that staged unit. Do not add units to global `sys.path`. Use a fresh module namespace for each run and remove its loaded modules when finished if the runner can be invoked repeatedly in one Python process.
+
+Enumerate what to remove when the unit finishes, not when it was loaded, and on failure paths as well: a helper imported inside `migrate` is not registered yet at load time, and a surviving copy shadows its own edited source on the next run in that process, which is exactly what a recovery run reloads. Match the unit's package name and its dot-prefixed descendants; hex-encoded names nest, so a bare prefix match would unload another unit. Separate runner processes share no module cache, so this rule bounds in-process reuse only.
+
+Staged directory names are internal and are not fingerprinted, but they are path components: keep them within the filesystem's limit for any id the manifest admits.
 
 Import only after atomic transaction establishment or acknowledged restartable admission. `validate`, `status`, fingerprinting, and planning do not import migration code. Import-time durable external effects, background mutation tasks, and changes to the staged unit violate the author contract.
 
@@ -458,6 +472,8 @@ An unchanged ACTIVE definition can be retried by plain `migrate`. If its fingerp
 
 `migrate --recover ID` is valid only for the existing active identity. Missing ACTIVE state, the wrong id, a changed position, changed restartable mode, or any mismatch in the successful prefix causes failure before metadata mutation. The flag does not admit edits to successful migrations or unrelated validation failures.
 
+"Before metadata mutation" includes initialization. A namespace with no completed metadata holds no ACTIVE identity, so `--recover` against an absent or partly created namespace is refused under the namespace lock and before storage preparation or object creation, leaving nothing behind. Oracle's initialization DDL commits independently, so a namespace initialized on the way to that refusal could not be undone. Plain `migrate` keeps its recoverable initialization: the refusal is specific to the flag.
+
 For admitted recovery, preserve id, position, mode, first fingerprint, and original start time. Atomically update current fingerprint, current language, attempt count, and latest-attempt diagnostics. SQL-to-Python recovery is allowed; switching to atomic is not. The staged definition and static required set govern the new attempt.
 
 Recovery edits must converge from durable states produced by every earlier admitted source version, not just the first one. Existing progress rows remain and must be understood or safely adapted by the amended migration inside its transaction contracts. A progress format change is part of recovery logic.
@@ -485,7 +501,7 @@ migr8 migrate [--config PATH] [--manifest PATH] [--recover ID]
 1. Load and structurally validate configuration and manifest. Validate supported modes, required-object declarations, paths, and lexical rules that can be checked without executing code.
 2. Capture the manifest, stage all units, and fingerprint them. No migration code runs.
 3. Connect, establish adapter session settings, and acquire the namespace lock.
-4. Inspect or complete allowed initialization. Verify namespace and lock binding.
+4. Inspect the namespace. Refuse `--recover` here if no completed metadata exists, before anything is created. Otherwise complete allowed initialization, then verify namespace and lock binding.
 5. Read consistent metadata and validate the successful prefix, active state, progress, and fingerprints. Resolve recovery admission without changing an invalid state to make it pass.
 6. Execute the pending suffix in order, starting with ACTIVE if present, using the protocols in §5 and §7.
 7. On ordinary completion/failure, release resources and remove staging. On unknown outcome, discard the connection without further SQL.
@@ -531,7 +547,11 @@ Session-liveness diagnostics are optional and separate from the consistent histo
 | 7 | Metadata damaged or incompatible with the supported layout. |
 | 8 | Detected transaction-contract violation; durable effects may require human remediation. |
 
-Do not silently retry failed migrations within one run. Exit 4 permits a fresh invocation under the recovery protocol; it does not authorize repeating the last statement. Failure diagnostics name the phase and identity without exposing credentials or sensitive bind values.
+Do not silently retry failed migrations within one run. Exit 4 permits a fresh invocation under the recovery protocol; it does not authorize repeating the last statement. Failure diagnostics name the phase and identity, and report the failure by engine error code rather than by driver message text, under Section 11.5.
+
+Once the run latch holds an unknown outcome or a detected contract violation, that latched failure is what the run reports. Author code that catches the latched exception and returns, or replaces it with an exception of its own, does not change the exit code, the cleanup taken, or whether a history row is written. Check the latch after migration code returns and at every terminal path, before choosing between discarding the connection and closing it normally.
+
+One place decides the command's exit code, and diagnostics do not participate. Validate explicit diagnostic setup before any database work, so a log file that cannot be opened produces a defined result instead of escaping the command's error handling. After execution, diagnostic teardown must preserve the outcome the database already produced and the operator has already been shown; a failing log close is not a command failure. Render a handled failure the same way whether or not the engine was reached, including the machine-readable form and the run id. An unexpected exception reaching the command's fallback handler is not evidence that no migration was admitted: such a failure can also arise while reporting a run that completed, and the report must say so rather than claim otherwise.
 
 ### 11.4 Configuration
 
@@ -572,17 +592,29 @@ Three facilities, none of which changes the protocol or the database layout:
   preflight, connection, lock acquisition, the plan, per-migration start and
   completion with timings, each admission, and a terminal record carrying the
   outcome, exit code, failing identity and phase. `ctx.log()` writes into the same
-  stream. Credentials, connection strings and bind values are excluded by field
-  name.
+  stream.
 - **A machine-readable outcome.** `--json` emits the run report, including the
   failing identity, the phase, the recovery command where one applies, and the
   duration.
 
-Three constraints are part of the requirement. Nothing is written unless a log
+Four constraints are part of the requirement. Nothing is written unless a log
 file is configured, so default behaviour is unchanged. No database object is
 added: an audit table would change the metadata layout and enlarge this
-specification's scope. And the log is diagnostic only -- no correctness rule may
+specification's scope. The log is diagnostic only -- no correctness rule may
 depend on it, exactly as Section 8.2 says of intermediate fingerprints.
+
+And failures are reported by code, not by driver text. A driver message quotes
+the data that produced it, so every surface the runner writes -- stderr,
+`--verbose` logging, `--json` and the event log -- names a failure by exception
+type, engine error code, operation, phase and identity, and does not reproduce
+the driver's message or a traceback. Do not attempt to sanitize arbitrary text
+with pattern replacement. Two things stay outside this boundary and are stated
+once, where the API and the setup path are described: fields an author passes to
+`ctx.log()`, and connection, session-configuration and privilege errors raised
+before any migration runs, whose server message is the diagnostic and carries no
+migration data. Excluding field names named `password`, `secret`, `dsn`,
+`credential` or `params` from event fields is a further guard, not the boundary
+itself.
 
 ## 12. Oracle adapter requirements
 
@@ -693,19 +725,28 @@ Use hooks or a test wrapper that actually obtains a successful server commit and
 
 Keep a small separation between manifest/fingerprint/staging, pure state validation, execution orchestration, database adapters, and CLI/reporting. No plugin discovery framework, ORM, distributed job system, or universal SQL AST is required.
 
-The separation runs *through* the adapter layer as well, and the line is between rule and dialect. Every rule this specification states belongs in the shared adapter base and must exist exactly once:
+The separation runs *through* the adapter layer as well, and the line is between rule and dialect. A rule this specification states about the database session belongs in the shared adapter base and must exist exactly once there:
 
+- which database calls are submitted through the operation guard, and that a failed call is classified once, wherever it was reached from;
 - which columns an attempt or completion update may touch, and which are permanent;
 - that an affected-row count other than one is metadata damage;
 - the progress store's shape and its batch-transaction precondition;
-- which statement contexts exist, and that a context admits a declared token set.
+- which statement contexts exist, and that a context admits a declared token set;
+- that a metadata table's check constraints are compared against the complete supported set, exactly and in both directions.
+
+Rules about other subjects exist once too, in the layer that owns the subject rather than in the adapter base: durable state and the plan, the order of durable transitions and which terminal path an outcome takes, the artifact and fingerprint rules, the lexical rules, and the command's terminal result.
 
 An adapter supplies only what differs: placeholder style, the engine's timestamp
 expression, identifier folding and quoting, the upsert form, the token sets
 themselves, and a path for engine-owned SQL separate from the migration facade.
-Metadata *inspection* stays per-adapter, because dictionary views differ in
+Reading the dictionary stays per-adapter, because dictionary views differ in
 substance rather than in spelling, and forcing them together would obscure all of
-them.
+them; how the answers are compared is shared, because that is a rule.
+
+A shared rule is enforced by keeping the raw driver methods private and putting
+the public entry point above them. An adapter implements `_metadata_execute`,
+`_do_begin` and the transaction-state probe; the base's public methods supply
+the guard. A rule callers can bypass is not enforced.
 
 Two rules follow from this. Engine transaction state is tracked by the adapter
 base rather than inferred from the database, because Oracle assigns a local

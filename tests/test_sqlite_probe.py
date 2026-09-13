@@ -28,6 +28,88 @@ def project(tmp_path):
 # --- initialization ---------------------------------------------------------------
 
 
+def _objects(db: Path) -> list[str]:
+    if not db.exists():
+        return []
+    return [
+        row[0]
+        for row in support.db_query(
+            db, "SELECT name FROM sqlite_master WHERE name LIKE 'm8_%' ORDER BY name"
+        )
+    ]
+
+
+def _one_migration(root):
+    support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
+    return support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            }
+        ],
+    )
+
+
+def test_recover_on_an_absent_namespace_creates_nothing(project):
+    """Spec Section 10.1: missing ACTIVE state fails before metadata mutation.
+
+    The refusal has to come first. Oracle's initialization DDL commits
+    independently, so a namespace initialized on the way to an exit 2 could not
+    be undone afterwards.
+    """
+    root, config, db = project
+    manifest = _one_migration(root)
+    assert support.migrate(config, manifest, recover="create-t") == Exit.VALIDATION
+    assert _objects(db) == []
+    assert support.db_query(db, "SELECT name FROM sqlite_master WHERE name = 't'") == []
+
+
+def test_recover_on_an_incomplete_namespace_completes_nothing(project):
+    """A prefix left by an interrupted initialization holds no ACTIVE identity either."""
+    from migr8.adapters.sqlite_probe import _DDL
+    from migr8.model import HISTORY_TABLE
+
+    root, config, db = project
+    manifest = _one_migration(root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    support.db_exec(db, _DDL[HISTORY_TABLE])
+    assert support.migrate(config, manifest, recover="create-t") == Exit.VALIDATION
+    # The prefix is untouched: nothing was created and no marker was written.
+    assert _objects(db) == [HISTORY_TABLE]
+    assert support.db_query(db, "SELECT name FROM sqlite_master WHERE name = 't'") == []
+
+
+def test_plain_migrate_still_completes_an_incomplete_namespace(project):
+    """The refusal is specific to --recover; ordinary initialization is recoverable."""
+    from migr8.adapters import metadata as md
+    from migr8.adapters.sqlite_probe import _DDL
+    from migr8.model import HISTORY_TABLE
+
+    root, config, db = project
+    manifest = _one_migration(root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    support.db_exec(db, _DDL[HISTORY_TABLE])
+    assert support.migrate(config, manifest) == Exit.OK
+    assert set(_objects(db)) == set(md.CREATION_ORDER)
+
+
+def test_recover_with_the_wrong_id_still_reaches_the_admission_rules(project):
+    """An initialized namespace keeps the existing identity checks."""
+    root, config, db = project
+    manifest = _one_migration(root)
+    assert support.migrate(config, manifest) == Exit.OK
+    report = support.migrate_report(config, manifest, recover="not-that-one")
+    assert report.exit_code == Exit.VALIDATION
+    assert "does not match the active migration" in (
+        report.message or ""
+    ) or "requires an ACTIVE restartable migration" in (report.message or "")
+
+
 def test_first_migrate_initializes_and_applies(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})

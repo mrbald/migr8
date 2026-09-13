@@ -1,30 +1,30 @@
 """The database adapter contract.
 
-The engine owns the state machine; the adapter owns what is genuinely
-engine-specific: session setup, the namespace lock, the physical metadata
-layout, transaction identity, execution and error classification.
+The adapter owns the database session: connecting, the namespace lock, the
+physical metadata layout, transaction identity, execution and error
+classification.  The engine owns the state machine.
 
-Everything that is a *rule* rather than a dialect lives here and exists once.
-The history transitions, the progress store and statement admission are
-implemented in this class, so three adapters cannot drift on which columns a
-recovery may touch, whether an affected-row count was checked, or which leading
-tokens a batch admits. An adapter supplies the dialect, not the policy:
+The history transitions, the progress store, statement admission and the
+operation guard are implemented in this class rather than in each adapter, so
+three adapters cannot drift on which columns a recovery may touch, whether an
+affected-row count was checked, which leading tokens a batch admits, or whether
+a failure left the outcome unknown.  An adapter supplies the dialect:
 
-* ``paramstyle``, ``now_expression``, ``supports_on_conflict``, ``quote_char``,
-  ``metadata_schema`` and ``column_overrides`` describe how to write the SQL;
+* ``paramstyle``, ``now_expression``, ``supports_on_conflict``, ``quote_char``
+  and ``identifier_case`` describe how to write the SQL;
 * ``statement_policy`` describes which statements are admitted where;
+* ``classify_exception`` and ``error_code`` interpret this engine's errors;
 * ``_metadata_execute`` and ``_metadata_query`` run engine-owned SQL on a path
   separate from the migration facade, as the specification requires.
 
-Nothing Oracle-specific belongs in the engine, and no adapter may emulate
-another engine's behaviour to make a shared test pass.
+No adapter emulates another engine's behaviour to make a shared test pass.
 """
 
 from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, ClassVar
@@ -32,6 +32,7 @@ from typing import Any, ClassVar
 from ..config import Config
 from ..errors import (
     MetadataDamagedError,
+    Migr8Error,
     UnknownOutcomeError,
     UnsupportedCapabilityError,
     UsageError,
@@ -172,6 +173,91 @@ class Adapter(ABC):
         self.metadata_schema: str | None = None
         self._engine_transaction = False
 
+    # --- the operation guard ----------------------------------------------------------------------
+
+    def guarded(
+        self,
+        func: Callable[..., Any],
+        *args: object,
+        operation: str,
+        phase: str,
+        migration_id: str | None = None,
+        commit_capable: bool,
+    ) -> Any:
+        """Submit one operation and classify its failure exactly once.
+
+        Every database call a run makes goes through here: the SQL entry point,
+        the Python facade, engine-owned DDL and the durable commits, and equally
+        the engine-owned metadata reads and writes, namespace inspection, the
+        snapshot read, ``begin`` and the transaction-state probe.  The required
+        behaviour for a failed call must not depend on which public method
+        reached it, so the raw driver methods stay private and the public method
+        above each one calls this.  Setup and teardown are the exceptions: they
+        run outside a migration's outcome and ask the driver directly.
+
+        A communication failure always leaves the outcome of *that call*
+        unknown, whether or not the call could commit.
+
+        ``commit_capable`` says whether this call can make work durable: a
+        commit, DDL on an engine whose DDL commits implicitly, or a procedural
+        block trusted to own its transactions.  It comes from the execution
+        context the engine established, never from a statement's leading token
+        (spec Section 7.2).  It decides only how an *interruption* is read: a
+        Ctrl-C inside a commit-capable call leaves the same doubt as a lost
+        acknowledgement and latches the run, while one outside such a call stays
+        an ordinary failure.
+        """
+        if self.latch is not None:
+            self.latch.check()
+        try:
+            return func(*args)
+        except Migr8Error:
+            # Already classified further down, with its own operation and phase.
+            raise
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                if self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION:
+                    raise
+            elif not commit_capable:
+                raise
+            error = UnknownOutcomeError(
+                self.describe_exception(exc),
+                operation=operation,
+                phase=phase,
+                migration_id=migration_id,
+            )
+            if self.latch is not None:
+                self.latch.latch_unknown(error)
+            raise error from exc
+
+    def _guard_metadata(
+        self,
+        func: Callable[..., Any],
+        *args: object,
+        operation: str,
+        phase: str = "metadata",
+        migration_id: str | None = None,
+        commit_capable: bool = False,
+    ) -> Any:
+        """Submit one engine-owned database operation through the operation guard.
+
+        Metadata reads and writes, the transaction-state probe and ``begin``
+        reach the same driver as migration SQL, so a lost reply on any of them
+        leaves the same doubt and must latch the run.  Routing them here is what
+        keeps the raw driver methods -- ``_metadata_execute``, ``_do_begin`` and
+        each adapter's dictionary queries -- behind a guarded entry point, so
+        the required behaviour does not depend on which public method was called
+        (spec Section 7.2).
+        """
+        return self.guarded(
+            func,
+            *args,
+            operation=operation,
+            phase=phase,
+            migration_id=migration_id,
+            commit_capable=commit_capable,
+        )
+
     # --- engine-owned durable commit --------------------------------------------------------------
 
     def durable_commit(self, boundary: Boundary, *, migration_id: str | None = None) -> None:
@@ -182,26 +268,13 @@ class Adapter(ABC):
         without issuing further SQL.
         """
         hooks.fire(boundary, hooks.BEFORE_COMMIT)
-        try:
-            self.commit()
-        except BaseException as exc:
-            # An interruption while a commit is in flight is as unknown as a lost
-            # acknowledgement: the request may already be durable. Only a
-            # positively identified definite failure escapes as itself.
-            if (
-                isinstance(exc, Exception)
-                and self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION
-            ):
-                raise
-            error = UnknownOutcomeError(
-                f"{type(exc).__name__}: {exc}" if not isinstance(exc, Exception) else str(exc),
-                operation=f"{boundary.value} commit",
-                phase=boundary.value,
-                migration_id=migration_id,
-            )
-            if self.latch is not None:
-                self.latch.latch_unknown(error)
-            raise error from exc
+        self.guarded(
+            self.commit,
+            operation=f"{boundary.value} commit",
+            phase=boundary.value,
+            migration_id=migration_id,
+            commit_capable=True,
+        )
         hooks.fire(boundary, hooks.AFTER_COMMIT)
 
     # --- capability reporting ---------------------------------------------------------------------
@@ -233,6 +306,15 @@ class Adapter(ABC):
         not a reusable session number alone, and session existence is never
         proof that a migration is executing or holding the lock.
         """
+        return self._guard_metadata(
+            self._probe_session_liveness,
+            db_session,
+            operation="session-liveness probe",
+            phase="session_liveness",
+        )
+
+    def _probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
+        """Answer the liveness question on this engine; the caller supplies the guard."""
         return ("unknown", f"the {self.name} adapter provides no session-liveness diagnostic")
 
     # --- lifecycle --------------------------------------------------------------------------------
@@ -280,14 +362,27 @@ class Adapter(ABC):
         behind :meth:`_objects_present` and :meth:`_definition_problems` are
         engine-specific, and forcing those into one shape would obscure all three.
         """
-        present = self._objects_present()
-        problems = self._definition_problems(present)
+        present = self._guard_metadata(
+            self._objects_present,
+            operation="metadata object inspection",
+            phase="metadata_inspection",
+        )
+        problems = self._guard_metadata(
+            self._definition_problems,
+            present,
+            operation="metadata definition inspection",
+            phase="metadata_inspection",
+        )
         meta = None
         if META_TABLE in present:
             try:
                 meta, rows = self._read_meta()
             except self.driver_error as exc:
-                problems.append(f"{META_TABLE} cannot be read: {exc}")
+                # Reaching here is a definite rejection: a communication failure
+                # has already been classified and raised by the guard.  The
+                # report names the fault by type and code, because the driver's
+                # own text quotes the row that produced it (spec Section 11.5).
+                problems.append(f"{META_TABLE} cannot be read: {self.describe_exception(exc)}")
             else:
                 if meta is not None and rows != 1:
                     problems.append(f"{META_TABLE} holds {rows} rows; exactly one is expected")
@@ -307,14 +402,31 @@ class Adapter(ABC):
         a namespace that claims to be initialized.  This exists once because it
         is the rule; only the physical creation is delegated.
         """
-        present = self._objects_present()
+        present = self._guard_metadata(
+            self._objects_present, operation="metadata object inspection", phase="initialization"
+        )
         for name in md.CREATION_ORDER:
             if name not in present:
-                self._create_metadata_object(name)
+                # Oracle's DDL commits by itself, so creating an object is
+                # commit-capable even where the adapter wraps it in a transaction.
+                self._guard_metadata(
+                    self._create_metadata_object,
+                    name,
+                    operation=f"creating {name}",
+                    phase=Boundary.METADATA_OBJECT_CREATED.value,
+                    commit_capable=True,
+                )
 
-        present = self._objects_present()
+        present = self._guard_metadata(
+            self._objects_present, operation="metadata object inspection", phase="initialization"
+        )
         missing = sorted(set(md.CREATION_ORDER) - present)
-        problems = self._definition_problems(present)
+        problems = self._guard_metadata(
+            self._definition_problems,
+            present,
+            operation="metadata definition inspection",
+            phase="initialization",
+        )
         if missing or problems:
             raise MetadataDamagedError(
                 "metadata layout is not complete after creating objects: "
@@ -335,17 +447,28 @@ class Adapter(ABC):
                 "lock_binding": self.lock_binding(),
                 "target_namespace": self.normalized_namespace(),
             },
+            operation="initialization marker insert",
+            phase=Boundary.INITIALIZATION_COMPLETE.value,
         )
         self.durable_commit(Boundary.INITIALIZATION_COMPLETE)
 
     def _read_meta(self) -> tuple[MetaRow | None, int]:
         """Read the singleton marker and the marker table's row count."""
         meta_table = self.metadata_name(META_TABLE)
-        count = int(self._fetch(f"SELECT COUNT(*) FROM {meta_table}", {})[0][0])
+        count = int(
+            self._fetch(
+                f"SELECT COUNT(*) FROM {meta_table}",
+                {},
+                operation=f"counting {META_TABLE}",
+                phase="metadata_inspection",
+            )[0][0]
+        )
         rows = self._fetch(
             f"SELECT {self._columns(*md.META_COLUMNS)} FROM {meta_table} "
             f"WHERE {self.metadata_column('meta_key')} = :meta_key",
             {"meta_key": META_SINGLETON_KEY},
+            operation="reading the initialization marker",
+            phase="metadata_inspection",
         )
         if not rows:
             return None, count
@@ -355,7 +478,14 @@ class Adapter(ABC):
         """Row count of a metadata table, or None when it does not exist."""
         if table not in present:
             return None
-        return int(self._fetch(f"SELECT COUNT(*) FROM {self.metadata_name(table)}", {})[0][0])
+        return int(
+            self._fetch(
+                f"SELECT COUNT(*) FROM {self.metadata_name(table)}",
+                {},
+                operation=f"counting {table}",
+                phase="metadata_inspection",
+            )[0][0]
+        )
 
     @abstractmethod
     def _objects_present(self) -> set[str]:
@@ -378,9 +508,18 @@ class Adapter(ABC):
         ``METADATA_OBJECT_CREATED`` commit; Oracle's DDL commits by itself.
         """
 
-    @abstractmethod
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         """Read history, progress and the marker as one consistent view."""
+        return self._guard_metadata(
+            self._read_snapshot,
+            consistent,
+            operation="metadata snapshot read",
+            phase="metadata_read",
+        )
+
+    @abstractmethod
+    def _read_snapshot(self, consistent: bool) -> Snapshot:
+        """Read the snapshot on this engine; the caller supplies the guard."""
 
     # --- engine-owned SQL path --------------------------------------------------------------------
 
@@ -467,13 +606,43 @@ class Adapter(ABC):
             raise UsageError(f"engine-owned SQL is missing bind values for: {', '.join(missing)}")
         return {name: params[name] for name in names}
 
-    def _exec(self, sql: str, params: Mapping[str, object]) -> int:
-        """Render and run one engine-owned metadata statement."""
-        return self._metadata_execute(self._render(sql), self._binds(sql, params))
+    def _exec(
+        self,
+        sql: str,
+        params: Mapping[str, object],
+        *,
+        operation: str = "metadata write",
+        phase: str = "metadata",
+        migration_id: str | None = None,
+    ) -> int:
+        """Render and run one engine-owned metadata statement under the guard."""
+        return self._guard_metadata(
+            self._metadata_execute,
+            self._render(sql),
+            self._binds(sql, params),
+            operation=operation,
+            phase=phase,
+            migration_id=migration_id,
+        )
 
-    def _fetch(self, sql: str, params: Mapping[str, object]) -> list[tuple]:
-        """Render and run one engine-owned metadata query."""
-        return self._metadata_query(self._render(sql), self._binds(sql, params))
+    def _fetch(
+        self,
+        sql: str,
+        params: Mapping[str, object],
+        *,
+        operation: str = "metadata read",
+        phase: str = "metadata",
+        migration_id: str | None = None,
+    ) -> list[tuple]:
+        """Render and run one engine-owned metadata query under the guard."""
+        return self._guard_metadata(
+            self._metadata_query,
+            self._render(sql),
+            self._binds(sql, params),
+            operation=operation,
+            phase=phase,
+            migration_id=migration_id,
+        )
 
     # --- history transitions (shared; spec Sections 8.2, 8.5 and 10.1) ----------------------------
 
@@ -532,6 +701,9 @@ class Adapter(ABC):
                 "exec_mode": mode.value,
                 **self._runner_binds(),
             },
+            operation="history SUCCESS insert",
+            phase=Boundary.ATOMIC_COMPLETION.value,
+            migration_id=migration_id,
         )
 
     def insert_active_row(
@@ -553,6 +725,9 @@ class Adapter(ABC):
                 "exec_mode": Mode.RESTARTABLE.value,
                 **self._runner_binds(),
             },
+            operation="history ACTIVE insert",
+            phase=Boundary.RESTARTABLE_ADMISSION.value,
+            migration_id=migration_id,
         )
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
 
@@ -590,6 +765,9 @@ class Adapter(ABC):
                 **self._runner_binds(),
             },
             what=f"admitting a new attempt for {migration_id!r}",
+            operation="history attempt update",
+            phase=Boundary.RESTARTABLE_ADMISSION.value,
+            migration_id=migration_id,
         )
         self.durable_commit(Boundary.RESTARTABLE_ADMISSION, migration_id=migration_id)
 
@@ -604,16 +782,29 @@ class Adapter(ABC):
             f"AND {self.metadata_column('status')} = 'ACTIVE'",
             {"tool_version": self._runner_binds()["tool_version"], "migration_id": migration_id},
             what=f"completing {migration_id!r}",
+            operation="history SUCCESS update",
+            phase=Boundary.RESTARTABLE_COMPLETION.value,
+            migration_id=migration_id,
         )
         self._exec(
             f"DELETE FROM {self.metadata_name(PROGRESS_TABLE)} "
             f"WHERE {self.metadata_column('migration_id')} = :migration_id",
             {"migration_id": migration_id},
+            operation="progress deletion",
+            phase=Boundary.RESTARTABLE_COMPLETION.value,
+            migration_id=migration_id,
         )
         self.durable_commit(Boundary.RESTARTABLE_COMPLETION, migration_id=migration_id)
 
     def _metadata_execute_in_transaction(
-        self, sql: str, params: Mapping[str, object], *, what: str
+        self,
+        sql: str,
+        params: Mapping[str, object],
+        *,
+        what: str,
+        operation: str,
+        phase: str,
+        migration_id: str | None = None,
     ) -> None:
         """Open a transaction, run one update, and require exactly one affected row.
 
@@ -621,7 +812,9 @@ class Adapter(ABC):
         no further check.
         """
         self.begin()
-        affected = self._exec(sql, params)
+        affected = self._exec(
+            sql, params, operation=operation, phase=phase, migration_id=migration_id
+        )
         if affected != 1:
             self.rollback()
             raise MetadataDamagedError(
@@ -637,6 +830,9 @@ class Adapter(ABC):
             f"WHERE {self.metadata_column('migration_id')} = :migration_id "
             f"AND {self.metadata_column('prog_key')} = :prog_key",
             {"migration_id": migration_id, "prog_key": key},
+            operation="progress read",
+            phase="progress",
+            migration_id=migration_id,
         )
         return None if not rows else str(rows[0][0])
 
@@ -672,7 +868,13 @@ class Adapter(ABC):
                 f"WHEN NOT MATCHED THEN INSERT ({columns}) "
                 f"VALUES (:migration_id, :prog_key, :prog_value, {{now}})"
             )
-        self._exec(sql, {"migration_id": migration_id, "prog_key": key, "prog_value": value})
+        self._exec(
+            sql,
+            {"migration_id": migration_id, "prog_key": key, "prog_value": value},
+            operation="progress write",
+            phase="progress",
+            migration_id=migration_id,
+        )
 
     # --- transaction control (engine-owned) -------------------------------------------------------
 
@@ -693,7 +895,9 @@ class Adapter(ABC):
             raise UsageError("an engine transaction is already open")
         if self.has_open_transaction():
             raise UsageError("a transaction is already open with uncommitted work")
-        self._do_begin()
+        self._guard_metadata(
+            self._do_begin, operation="transaction begin", phase="transaction_begin"
+        )
         self._engine_transaction = True
 
     def commit(self) -> None:
@@ -714,23 +918,54 @@ class Adapter(ABC):
     @abstractmethod
     def _do_rollback(self) -> None: ...
 
-    @abstractmethod
     def has_open_transaction(self) -> bool:
-        """True when a writable transaction is open, by actual driver/server state."""
+        """True when a writable transaction is open, by actual driver/server state.
+
+        Oracle answers this with a round trip, so the probe is a database call
+        like any other and is classified by the same guard.  A lost reply here
+        must not be read as "no transaction is open".
+        """
+        return bool(
+            self._guard_metadata(
+                self._has_open_transaction,
+                operation="transaction-state probe",
+                phase="transaction_state",
+            )
+        )
+
+    @abstractmethod
+    def _has_open_transaction(self) -> bool:
+        """Ask the driver or server; the caller supplies the guard."""
 
     # --- atomic transaction identity --------------------------------------------------------------
 
-    @abstractmethod
     def establish_transaction_identity(self) -> str | None:
         """Create and capture the transaction identity before any migration code runs.
 
         Returning ``None`` means this adapter provides a different guard; see
         :meth:`capabilities`.
         """
+        return self._guard_metadata(
+            self._establish_transaction_identity,
+            operation="establishing the transaction identity",
+            phase="transaction_identity",
+        )
 
-    @abstractmethod
     def read_transaction_identity(self) -> str | None:
         """Read the current identity without creating a transaction."""
+        return self._guard_metadata(
+            self._read_transaction_identity,
+            operation="reading the transaction identity",
+            phase="transaction_identity",
+        )
+
+    @abstractmethod
+    def _establish_transaction_identity(self) -> str | None:
+        """Create and capture the identity; the caller supplies the guard."""
+
+    @abstractmethod
+    def _read_transaction_identity(self) -> str | None:
+        """Read the current identity; the caller supplies the guard."""
 
     # --- statement admission (shared; spec Section 5.3) -------------------------------------------
 
@@ -864,12 +1099,20 @@ class Adapter(ABC):
 
         Oracle's implicit DDL commits are not emulated; that adapter overrides
         this with a plain submission.
+
+        The rollback is issued only for a definite rejection.  After anything
+        else the statement's outcome is unknown, and no further SQL may be sent
+        (spec Section 7.2); the guard above this call latches the run.
         """
         self.begin()
         try:
             self._run(statement.text, None)
-        except self.driver_error:
-            self.rollback()
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION
+            ):
+                self.rollback()
             raise
         self.durable_commit(Boundary.RESTARTABLE_DDL)
 
@@ -878,14 +1121,26 @@ class Adapter(ABC):
     def check_required_objects(self, required: tuple[RequiredObject, ...]) -> ValidityResult:
         """Read-only check of every declaration.  No compilation is performed.
 
-        The default reports failure for a nonempty set, matching
-        :meth:`admit_required_objects`; preflight should already have refused it.
+        An empty set needs no database call, so it does not make one.
         """
-        if required:
-            return ValidityResult(
-                failures=(f"the {self.name} adapter cannot check required-object declarations",)
-            )
-        return ValidityResult()
+        if not required:
+            return ValidityResult()
+        return self._guard_metadata(
+            self._check_required_objects,
+            required,
+            operation="required-object validity check",
+            phase="final_validity",
+        )
+
+    def _check_required_objects(self, required: tuple[RequiredObject, ...]) -> ValidityResult:
+        """Check a nonempty declared set on this engine.
+
+        The default reports failure, matching :meth:`admit_required_objects`;
+        preflight should already have refused it.
+        """
+        return ValidityResult(
+            failures=(f"the {self.name} adapter cannot check required-object declarations",)
+        )
 
     # --- error classification ---------------------------------------------------------------------
 
@@ -898,6 +1153,27 @@ class Adapter(ABC):
         Anything else, including an unrecognised error, is a communication
         failure and therefore an unknown outcome from a commit-capable call.
         """
+
+    def error_code(self, exc: BaseException) -> str | None:
+        """This engine's code for *exc*, or ``None`` when it has none.
+
+        A code only: ``ORA-00001``, ``SQLSTATE 23505``.  Never message text,
+        which routinely quotes the bound values that produced the error.
+        """
+        return None
+
+    def describe_exception(self, exc: BaseException) -> str:
+        """Name a driver failure without reproducing what the driver said.
+
+        Driver messages quote the offending row: PostgreSQL echoes the literal
+        in ``invalid input syntax for type integer: "..."``, and Oracle's
+        constraint errors name the object.  The engine reports failures by
+        exception type and engine error code, which identify the fault without
+        carrying the data into a report, an event log or a terminal.
+        """
+        name = f"{type(exc).__module__}.{type(exc).__qualname__}"
+        code = self.error_code(exc)
+        return f"{name} [{code}]" if code else name
 
 
 def _listed(tokens: frozenset[str]) -> str:

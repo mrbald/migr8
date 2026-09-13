@@ -64,9 +64,15 @@ def capture_in_place(manifest: Manifest) -> Capture:
 
 
 def _staged_dir_name(definition: MigrationDef) -> str:
-    """An injective, filesystem-safe directory name for one staged unit."""
-    encoded = definition.id.encode("utf-8").hex()
-    return f"{definition.position:05d}_{encoded}"
+    """A bounded, injective directory name for one staged unit.
+
+    The position alone identifies the unit: it is unique within a manifest, and
+    the directory is private to one run.  Hex-encoding the id instead would be
+    injective too, but it doubles a length the manifest allows to reach 200
+    characters, and a 400-character path component exceeds the limit on every
+    filesystem this runs on.  The name is internal and is not fingerprinted.
+    """
+    return f"{definition.position:05d}"
 
 
 def stage(manifest: Manifest, *, parent: Path | None = None) -> Capture:

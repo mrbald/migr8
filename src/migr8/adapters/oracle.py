@@ -39,6 +39,7 @@ from ..sqltext import Statement
 from . import metadata as md
 from .base import (
     Adapter,
+    Boundary,
     Capabilities,
     OutcomeClass,
     StatementPolicy,
@@ -276,7 +277,12 @@ class OracleAdapter(Adapter):
                 # Thin mode implements neither; see the thick-mode check below.
             )
         except oracledb.Error as exc:
-            raise UsageError(f"cannot connect to Oracle: {exc}") from exc
+            # The driver's connection message repeats the DSN, so it is reported
+            # by code and the operator is pointed at the settings instead.
+            raise UsageError(
+                f"cannot connect to Oracle: {self.describe_exception(exc)}. Check "
+                "database.dsn, database.user and the MIGR8_PASSWORD environment variable."
+            ) from exc
         if not self._conn.thin and not self._allow_thick:
             self._conn.close()
             self._conn = None
@@ -384,7 +390,9 @@ class OracleAdapter(Adapter):
         if self._conn is None:
             return
         try:
-            if self.has_open_transaction():
+            # Teardown asks the driver directly: a failure while closing must not
+            # be reclassified as an unknown migration outcome.
+            if self._has_open_transaction():
                 self._conn.rollback()
             self.release_lock()
         finally:
@@ -596,7 +604,13 @@ class OracleAdapter(Adapter):
                     "SELECT c.constraint_type, c.status, c.validated, c.search_condition, "
                     "  (SELECT LISTAGG(cc.column_name, ',') WITHIN GROUP (ORDER BY cc.position) "
                     "     FROM all_cons_columns cc "
-                    "    WHERE cc.owner = c.owner AND cc.constraint_name = c.constraint_name) "
+                    "    WHERE cc.owner = c.owner AND cc.constraint_name = c.constraint_name), "
+                    "  c.r_owner, "
+                    "  (SELECT r.table_name FROM all_constraints r "
+                    "    WHERE r.owner = c.r_owner AND r.constraint_name = c.r_constraint_name), "
+                    "  (SELECT LISTAGG(rc.column_name, ',') WITHIN GROUP (ORDER BY rc.position) "
+                    "     FROM all_cons_columns rc "
+                    "    WHERE rc.owner = c.r_owner AND rc.constraint_name = c.r_constraint_name) "
                     "FROM all_constraints c "
                     "WHERE c.owner = :owner AND c.table_name = :name",
                     owner=self._schema,
@@ -605,35 +619,70 @@ class OracleAdapter(Adapter):
                 .fetchall()
             )
             # Compare normalised semantics, not database-generated names.
-            found_keys = {
-                (row[0], (row[4] or "").upper()) for row in rows if row[0] in ("P", "U", "R")
-            }
-            for kind, columns in expected["keys"]:
-                if (kind, columns) not in found_keys:
+            found_keys: dict[tuple[str, str], list[tuple]] = {}
+            for row in rows:
+                if row[0] in ("P", "U", "R"):
+                    found_keys.setdefault((row[0], (row[4] or "").upper()), []).append(row)
+            for expected_key in expected["keys"]:
+                kind, columns, references = expected_key
+                matches = found_keys.get((kind, columns))
+                if not matches:
                     problems.append(
                         f"{table} is missing a {_KIND_NAMES[kind]} on ({columns}); found "
                         f"{sorted(found_keys)}"
                     )
-            checks = []
-            for row in rows:
-                if row[0] != "C":
                     continue
-                condition = row[3]
-                text = condition.read() if hasattr(condition, "read") else (condition or "")
-                checks.append((md.normalise_definition(text), row[1], row[2]))
-            for fragment in expected["checks"]:
-                matches = [c for c in checks if fragment in c[0]]
-                if not matches:
-                    problems.append(
-                        f"{table} is missing a check constraint containing {fragment!r}"
-                    )
-                    continue
-                for _, status, validated in matches:
+                for (
+                    _type,
+                    status,
+                    validated,
+                    _condition,
+                    _columns,
+                    target_owner,
+                    target,
+                    target_columns,
+                ) in matches:
+                    # A key the server is not enforcing does not hold the layout up.
                     if status != "ENABLED" or validated != "VALIDATED":
                         problems.append(
-                            f"{table} check constraint for {fragment!r} is "
+                            f"{table} {_KIND_NAMES[kind]} on ({columns}) is "
                             f"{status}/{validated}, not ENABLED/VALIDATED"
                         )
+                    if references is None:
+                        continue
+                    wanted_table, wanted_columns = references
+                    # The owner is part of the target identity.  Oracle resolves
+                    # the referenced constraint through R_OWNER, so a same-named
+                    # history table in another schema would otherwise satisfy
+                    # this check while linking progress to that schema's history.
+                    expected_target = (
+                        f"{self.metadata_schema}."
+                        f"{self._physical_object_name(wanted_table).upper()}({wanted_columns})"
+                    )
+                    actual = (
+                        f"{target_owner}.{target}({target_columns or ''})" if target else "nothing"
+                    )
+                    if actual != expected_target:
+                        problems.append(
+                            f"{table} {_KIND_NAMES[kind]} on ({columns}) references {actual}, "
+                            f"not {expected_target}"
+                        )
+            problems.extend(
+                md.check_problems(
+                    table,
+                    (
+                        (
+                            row[3],
+                            row[1] == "ENABLED" and row[2] == "VALIDATED",
+                            f"{row[1]}/{row[2]}, not ENABLED/VALIDATED",
+                        )
+                        for row in rows
+                        if row[0] == "C"
+                    ),
+                    expected["checks"],
+                    fold=self._fold,
+                )
+            )
         return problems
 
     def _index_problems(self, present: set[str]) -> list[str]:
@@ -675,25 +724,51 @@ class OracleAdapter(Adapter):
             (value[0].read() if hasattr(value[0], "read") else str(value[0]))
             for value in expression
         )
-        normalised = md.normalise_definition(rendered)
-        if "STATUS" not in normalised or "ACTIVE" not in normalised:
+        column_count = (
+            self._cursor()
+            .execute(
+                "SELECT COUNT(*) FROM all_ind_columns "
+                "WHERE index_owner = :owner AND index_name = :name",
+                owner=self._schema,
+                name=ACTIVE_INDEX.upper(),
+            )
+            .fetchone()[0]
+        )
+        if int(column_count) != 1 or len(expression) != 1:
             problems.append(
-                f"{ACTIVE_INDEX} expression does not restrict to status='ACTIVE': {rendered!r}"
+                f"{ACTIVE_INDEX} indexes {column_count} column(s) over {len(expression)} "
+                "expression(s); the supported layout indexes exactly one expression"
+            )
+        if md.compact_definition(rendered) not in _SUPPORTED_ACTIVE_INDEX_EXPRESSIONS:
+            problems.append(
+                f"{ACTIVE_INDEX} does not carry the supported one-ACTIVE expression "
+                f"({ACTIVE_INDEX_EXPRESSION}): {rendered!r}. Only a constant key makes two "
+                "ACTIVE rows collide; an expression that merely mentions the column and the "
+                "value can yield a distinct key per row and enforce nothing."
             )
         return problems
 
     def _create_metadata_object(self, name: str) -> None:
-        """Oracle DDL commits independently, so the CREATE is its own durable step."""
-        self._cursor().execute(
-            _DDL[name].format(
-                history=self._q(HISTORY_TABLE),
-                progress=self._q(PROGRESS_TABLE),
-                meta=self._q(META_TABLE),
-                index=self._q(ACTIVE_INDEX),
-            )
+        """Oracle DDL commits independently, so the CREATE is its own durable step.
+
+        Being durable on its own makes it commit-capable, so it goes through the
+        operation guard: a lost reply here leaves the object's existence unknown
+        and must stop the run rather than fall through to the next object.
+        """
+        sql = _DDL[name].format(
+            history=self._q(HISTORY_TABLE),
+            progress=self._q(PROGRESS_TABLE),
+            meta=self._q(META_TABLE),
+            index=self._q(ACTIVE_INDEX),
+        )
+        self.guarded(
+            lambda: self._cursor().execute(sql),
+            operation=f"create metadata object {name}",
+            phase=Boundary.METADATA_OBJECT_CREATED.value,
+            commit_capable=True,
         )
 
-    def read_snapshot(self, *, consistent: bool) -> Snapshot:
+    def _read_snapshot(self, consistent: bool) -> Snapshot:
         """Read history, progress and the marker in one statement.
 
         A single SQL statement is read-consistent in Oracle, so no transaction is
@@ -776,7 +851,7 @@ class OracleAdapter(Adapter):
 
     # --- transaction control ----------------------------------------------------------------------
 
-    def has_open_transaction(self) -> bool:
+    def _has_open_transaction(self) -> bool:
         """Oracle assigns a local transaction id only once a write happens.
 
         That makes this an accurate answer to "is there uncommitted work", which
@@ -784,11 +859,11 @@ class OracleAdapter(Adapter):
         *not* an answer to "am I inside an engine-opened batch"; the base tracks
         that separately, because a batch's first write is often the checkpoint.
         """
-        return self.read_transaction_identity() is not None
+        return self._read_transaction_identity() is not None
 
     # --- transaction identity ---------------------------------------------------------------------
 
-    def establish_transaction_identity(self) -> str | None:
+    def _establish_transaction_identity(self) -> str | None:
         cursor = self._cursor()
         holder = cursor.var(str)
         cursor.execute(
@@ -802,7 +877,7 @@ class OracleAdapter(Adapter):
             )
         return value
 
-    def read_transaction_identity(self) -> str | None:
+    def _read_transaction_identity(self) -> str | None:
         cursor = self._cursor()
         holder = cursor.var(str)
         cursor.execute(
@@ -850,15 +925,14 @@ class OracleAdapter(Adapter):
 
     # --- final validity ---------------------------------------------------------------------------
 
-    def check_required_objects(self, required: tuple[RequiredObject, ...]) -> ValidityResult:
+    def _check_required_objects(self, required: tuple[RequiredObject, ...]) -> ValidityResult:
         """Read-only check of every declaration (spec Section 6).
 
         The verdict for the whole declared set comes from one statement, so it is
         a consistent read.  No compilation is performed, no object is touched,
-        and compiler warnings are reported without failing.
+        and compiler warnings are reported without failing.  The set is never
+        empty here: the base returns before making a database call for that.
         """
-        if not required:
-            return ValidityResult()
         failures: list[str] = []
         warnings: list[str] = []
         branches = " UNION ALL ".join(
@@ -875,7 +949,8 @@ class OracleAdapter(Adapter):
         except oracledb.Error as exc:
             return ValidityResult(
                 failures=(
-                    f"required-object inspection failed: {exc}. An inaccessible probe is an "
+                    "required-object inspection failed: "
+                    f"{self.describe_exception(exc)}. An inaccessible probe is an "
                     "error, not evidence that the object is absent.",
                 )
             )
@@ -942,7 +1017,7 @@ class OracleAdapter(Adapter):
 
     # --- diagnostics ------------------------------------------------------------------------------
 
-    def probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
+    def _probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
         if not db_session:
             return ("unknown", "no session identity was recorded for the latest attempt")
         fields = dict(part.split("=", 1) for part in db_session.split(",") if "=" in part)
@@ -963,7 +1038,11 @@ class OracleAdapter(Adapter):
                 .fetchone()
             )
         except oracledb.Error as exc:
-            return ("unknown", f"v$session is not readable with the current privileges: {exc}")
+            return (
+                "unknown",
+                "v$session is not readable with the current privileges: "
+                f"{self.describe_exception(exc)}",
+            )
         verdict = "present" if row and row[0] else "absent"
         return (
             verdict,
@@ -1002,10 +1081,31 @@ class OracleAdapter(Adapter):
                 return OutcomeClass.SERVER_REJECTION
         return OutcomeClass.COMMUNICATION_FAILURE
 
+    def error_code(self, exc: BaseException) -> str | None:
+        """The ``ORA-`` or ``DPY-`` code alone, without the message that follows it."""
+        if isinstance(exc, oracledb.Error) and exc.args:
+            return getattr(exc.args[0], "full_code", None) or None
+        return None
+
 
 # --- helpers --------------------------------------------------------------------------------------
 
 _KIND_NAMES = {"P": "primary key", "U": "unique key", "R": "foreign key"}
+
+#: The expression the one-ACTIVE index is created with.  A constant key is the
+#: whole point: two ACTIVE rows must collide on it.
+ACTIVE_INDEX_EXPRESSION = "CASE WHEN status = 'ACTIVE' THEN 1 END"
+
+#: How the supported expression comes back from ALL_IND_EXPRESSIONS.  Oracle 23ai
+#: rewrites the searched CASE above into the simple form, so both are accepted:
+#: they are the same expression, and a future release need not keep rewriting.
+_SUPPORTED_ACTIVE_INDEX_EXPRESSIONS = frozenset(
+    md.compact_definition(text)
+    for text in (
+        ACTIVE_INDEX_EXPRESSION,
+        "CASE \"STATUS\" WHEN 'ACTIVE' THEN 1 END",
+    )
+)
 
 
 def _lob(value):
@@ -1105,8 +1205,8 @@ _DDL = {
                 CHECK (status <> 'SUCCESS' OR finished_at IS NOT NULL)
         )
     """,
-    ACTIVE_INDEX: """
-        CREATE UNIQUE INDEX {index} ON {history} (CASE WHEN status = 'ACTIVE' THEN 1 END)
+    ACTIVE_INDEX: f"""
+        CREATE UNIQUE INDEX {{index}} ON {{history}} ({ACTIVE_INDEX_EXPRESSION})
     """,
     PROGRESS_TABLE: """
         CREATE TABLE {progress} (
@@ -1173,22 +1273,38 @@ _EXPECTED_COLUMNS = {
     ),
 }
 
+#: The complete supported constraint shape, one entry per metadata table.  Each
+#: check is the canonical form of the condition ALL_CONSTRAINTS holds for the
+#: DDL above; Oracle stores the condition as written, so these were recorded
+#: from Oracle Database 23ai Free 23.9.0.25.7 on 2026-09-13 rather than guessed.
+#: Oracle's NOT NULL constraints are check rows too; they are recognised by
+#: shape and compared against the column layout instead.
 _EXPECTED_CONSTRAINTS: dict[str, md.ExpectedConstraints] = {
     HISTORY_TABLE: {
-        "keys": (("P", "MIGRATION_ID"), ("U", "SEQ")),
+        "keys": (md.ExpectedKey("P", "MIGRATION_ID"), md.ExpectedKey("U", "SEQ")),
         "checks": (
             "SEQ > 0",
-            "LANGUAGE IN ('SQL','PYTHON')",
-            "MODE IN ('ATOMIC','RESTARTABLE')",
-            "STATUS IN ('ACTIVE','SUCCESS')",
+            "LANGUAGE IN ( 'sql' , 'python' )",
+            "MODE IN ( 'atomic' , 'restartable' )",
+            "STATUS IN ( 'ACTIVE' , 'SUCCESS' )",
+            "ATTEMPT IS NULL OR ATTEMPT > 0",
+            "STATUS <> 'ACTIVE' OR ( MODE = 'restartable' AND ATTEMPT IS NOT NULL "
+            "AND FINISHED_AT IS NULL )",
+            "STATUS <> 'SUCCESS' OR FINISHED_AT IS NOT NULL",
         ),
     },
     PROGRESS_TABLE: {
-        "keys": (("P", "MIGRATION_ID,PROG_KEY"), ("R", "MIGRATION_ID")),
-        "checks": (),
+        "keys": (
+            md.ExpectedKey("P", "MIGRATION_ID,PROG_KEY"),
+            md.ExpectedKey("R", "MIGRATION_ID", (HISTORY_TABLE, "MIGRATION_ID")),
+        ),
+        "checks": (
+            "LENGTH ( PROG_KEY ) BETWEEN 1 AND 128",
+            "LENGTH ( PROG_VALUE ) >= 1",
+        ),
     },
     META_TABLE: {
-        "keys": (("P", "META_KEY"),),
-        "checks": ("META_KEY = 'SINGLETON'",),
+        "keys": (md.ExpectedKey("P", "META_KEY"),),
+        "checks": ("META_KEY = 'singleton'",),
     },
 }
