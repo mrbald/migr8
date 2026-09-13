@@ -290,7 +290,7 @@ def test_session_liveness_is_unknown_without_privileges(oracle_project, oracle_s
 
         [oracle]
         ddl_lock_timeout_seconds = 10
-
+{support.oracle_mode_options()}
         [lock]
         provider = "dbms_lock"
         package = "SYS.DBMS_LOCK"

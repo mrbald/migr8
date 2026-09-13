@@ -37,6 +37,11 @@ def oracle_settings():
             + ". Start it with testenv/dbctl.sh up and use testenv/dbctl.sh test."
         )
     oracledb = pytest.importorskip("oracledb")
+    # Thick mode is a process-wide decision that has to be made before the first
+    # connection: python-oracledb refuses to load the client libraries once a
+    # Thin connection exists.  The observer connections in this file are
+    # connections too, so the switch is thrown here, ahead of all of them.
+    support.enable_oracle_thick_mode(oracledb)
     settings = {
         "dsn": os.environ["MIGR8_ORACLE_DSN"],
         "user": os.environ["MIGR8_ORACLE_USER"].upper(),
@@ -93,7 +98,7 @@ def oracle_project(tmp_path, oracle_settings):
 
         [oracle]
         ddl_lock_timeout_seconds = 10
-
+{support.oracle_mode_options()}
         [lock]
         provider = "dbms_lock"
         package = "SYS.DBMS_LOCK"
