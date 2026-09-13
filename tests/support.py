@@ -119,10 +119,20 @@ def oracle_mode_options() -> str:
     return f'        allow_thick_mode = true\n        client_lib_dir = "{ORACLE_CLIENT_LIB}"\n'
 
 
+#: The client TNS_ADMIN of the TLS fixture, when one has been built.
+ORACLE_TLS_ADMIN = os.environ.get("MIGR8_ORACLE_TLS_ADMIN")
+
+
 def enable_oracle_thick_mode(oracledb) -> None:
-    """Load the Oracle Client libraries for this process, if the suite asks for it."""
+    """Load the Oracle Client libraries for this process, if the suite asks for it.
+
+    The first call decides the driver configuration directory for the whole
+    process, so the TLS fixture's directory is passed here rather than left to
+    the adapter under test: the adapter's own call finds Thick mode already in
+    force and returns, which is what happens in any embedding process too.
+    """
     if ORACLE_CLIENT_LIB and oracledb.is_thin_mode():
-        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB)
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB, config_dir=ORACLE_TLS_ADMIN)
 
 
 def run_cli(argv: list[str], *, cwd: Path | None = None) -> int:

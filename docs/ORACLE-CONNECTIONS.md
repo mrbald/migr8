@@ -158,6 +158,15 @@ With that in place, `database.user = "[APP_DBA]"` and no `MIGR8_PASSWORD`: the
 certificate says who is connecting, the proxy grant says who it may become, and
 no secret is configured anywhere in the runner.
 
+`testenv/provision_tls.sh` builds exactly this against the disposable test
+database, which is the shortest way to see the whole path working: two wallets,
+a TCPS endpoint on the listener, a certificate identity mapped to a user, and a
+proxy grant into a test schema. It writes a client `TNS_ADMIN` to `testenv/tls/`.
+Two things about that script are worth knowing before you copy it. `orapki` is a
+Java program, and the slim database image ships neither a JRE nor the PKI jars,
+so the script adds both to the container; and a listener endpoint is added by a
+restart, not by `lsnrctl reload`.
+
 Wallets are read by the client libraries, so this whole path is thick-mode only.
 `SSL_SERVER_DN_MATCH` is worth leaving on: without it a client will complete a
 handshake with any certificate the chain accepts, whoever the host turns out to
@@ -196,11 +205,21 @@ without thick mode.
 | Thick, Easy Connect, password | tested, Instant Client 23.9 on Linux ARM64 |
 | TNS alias, both modes | tested |
 | Proxy connect string with a password | tested against a real server |
-| `[TARGET]` with a wallet, TCPS, certificate identity | **accepted by the configuration, not yet tested** |
+| `[TARGET]` with a wallet, TCPS, certificate identity | tested against a real listener |
 
-The last row is the one to be careful with: the configuration admits it and the
-adapter routes it to external authentication, but no run here has authenticated
-with a certificate. [`ACCEPTANCE.md`](ACCEPTANCE.md) records what would close it.
+The last row was rehearsed end to end: an initial install over TLS with no
+password in the environment or the configuration, the session authenticated as
+the certificate's DN and running as the schema it may become
+(`AUTHENTICATION_METHOD` is `SSL_PROXY`). One self-signed certificate pair and
+one server; a real estate's CA, revocation, expiry and rotation are its own
+subject. [`ACCEPTANCE.md`](ACCEPTANCE.md) records the run and what is still open.
+
+One property of thick mode deserves repeating here, because it is the thing that
+surprises people: `init_oracle_client()` happens once per process, and the
+directories given to the *first* call are the ones in force. If something else in
+the process loaded the client already — an application embedding this engine, or
+a test harness — then `client_lib_dir` and `config_dir` cannot take effect, and
+the run says so rather than pretending otherwise.
 
 ## Sources
 
