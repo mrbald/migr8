@@ -2,7 +2,9 @@
 
 Three commands, no more: ``migrate``, ``validate`` and ``status``. There is no
 undo, clean, baseline, repair or forced unlock, and adding one would change the
-protocol rather than the tool.
+protocol rather than the tool.  ``validate --offline`` is the same command with
+its database half removed, not a fourth one: it runs the checks that need only
+the plan, so a pipeline can make them before a target exists.
 
 Two behaviours here exist for operations rather than for the specification:
 
@@ -38,7 +40,7 @@ from .errors import OUTCOME_NAMES, Exit, Migr8Error, UsageError, describe_safely
 from .manifest import DEFAULT_MANIFEST_NAME
 from .manifest import load as load_manifest
 from .model import Capture
-from .readonly import run_status, run_validate
+from .readonly import run_offline, run_status, run_validate
 from .staging import capture_in_place, cleanup, stage
 from .version import TOOL_NAME, TOOL_VERSION
 
@@ -92,7 +94,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="admit amended source for the existing ACTIVE restartable migration",
     )
 
-    common(sub.add_parser("validate", help="check the manifest and history contracts"))
+    validate = sub.add_parser("validate", help="check the manifest and history contracts")
+    common(validate)
+    validate.add_argument(
+        "--offline",
+        action="store_true",
+        help="lint the plan without connecting to a database",
+    )
+    validate.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="a previously approved --json plan; published entries must still match it",
+    )
     common(sub.add_parser("status", help="report migration state"))
     return parser
 
@@ -175,15 +190,24 @@ def _do_readonly(args: argparse.Namespace, command: str, log: RunLog) -> int:
     manifest = load_manifest(manifest_path)
     capture = capture_in_place(manifest)
     adapter = adapters.create(config)
+    offline = command == "validate" and args.offline
+    baseline = (
+        _resolve(args.baseline, "", "baseline plan") if getattr(args, "baseline", None) else None
+    )
     log.event(
         "run_start",
         command=command,
         adapter=adapter.name,
         manifest=str(manifest_path),
         units=len(capture.units),
+        offline=offline,
     )
-    runner = run_status if command == "status" else run_validate
-    report = runner(adapter, capture)
+    if offline:
+        report = run_offline(adapter, capture, baseline=baseline)
+    elif command == "status":
+        report = run_status(adapter, capture)
+    else:
+        report = run_validate(adapter, capture, baseline=baseline)
     report.run_id = log.run_id
     log.event("run_end", command=command, exit_code=report.exit_code, problem=report.problem_kind)
     print(report.to_json() if args.json else report.to_text())

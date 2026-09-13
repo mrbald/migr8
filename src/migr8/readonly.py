@@ -3,20 +3,32 @@
 Neither command initializes metadata, stages units, imports migration code,
 executes migration SQL, recompiles anything, or takes the migration lock.  Both
 use one short consistent metadata read.
+
+``validate --offline`` makes no connection at all.  It is the plan lint a
+pipeline can run before a target exists, and it answers a strictly smaller
+question: whether this plan is well formed and admissible on the selected
+backend.  It cannot say that the SQL is valid on the server, that the privileges
+are there, or that a restartable migration converges.  Only the engine's own
+check, under the namespace lock, decides whether a plan may be applied.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from .adapters.base import Adapter
-from .checks import preflight, verify_bindings
+from .checks import CHECKS, preflight, verify_bindings
 from .errors import (
     Exit,
     MetadataDamagedError,
     Migr8Error,
     RecoveryRequiredError,
+    UsageError,
+    ValidationError,
 )
 from .model import Capture, MetadataState, Snapshot
-from .reporting import Report, status_from_row
+from .reporting import MigrationStatus, Report, status_from_row
 from .statevalidate import build_plan, require_no_recovery_needed
 
 
@@ -116,6 +128,104 @@ def _prepare(command: str, adapter: Adapter, capture: Capture) -> tuple[Report, 
     return report, snapshot
 
 
+def verify_baseline(capture: Capture, baseline: Path) -> None:
+    """Compare the plan against a previously approved plan artifact.
+
+    A single manifest cannot show that a published migration was edited: the
+    manifest and the unit change together, and the result is internally
+    consistent.  The approved artifact is the other side of that comparison, so
+    a pipeline holds published identity, order and fingerprint by keeping one
+    and checking against it.
+
+    Every entry the artifact records must appear at the same position, with the
+    same id and the same fingerprint.  Entries after them are new work and are
+    not constrained.  This is a source-to-source check: it says nothing about
+    what any database has recorded, and an ACTIVE migration amended through
+    ``migrate --recover`` is a deliberate operator action that changes the
+    artifact once it is approved again.
+    """
+    try:
+        document = json.loads(baseline.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise UsageError(
+            f"the baseline plan {baseline} cannot be read: {exc.strerror or type(exc).__name__}"
+        ) from exc
+    except ValueError as exc:
+        raise UsageError(f"the baseline plan {baseline} is not JSON") from exc
+    recorded = document.get("migrations") if isinstance(document, dict) else None
+    if not isinstance(recorded, list) or not all(isinstance(item, dict) for item in recorded):
+        raise UsageError(
+            f"the baseline plan {baseline} is not a migr8 JSON report with a migrations list"
+        )
+
+    differences = []
+    for entry in recorded:
+        position = entry.get("position")
+        unit = capture.at_position(position) if isinstance(position, int) else None
+        if unit is None:
+            differences.append(
+                f"position {position} holds {entry.get('id')!r} in the approved plan and "
+                "nothing here"
+            )
+            continue
+        if unit.id != entry.get("id"):
+            differences.append(
+                f"position {position} is {unit.id!r} here and {entry.get('id')!r} in the "
+                "approved plan"
+            )
+        elif unit.fingerprint != entry.get("current_fingerprint"):
+            differences.append(
+                f"{unit.id!r} has fingerprint {unit.fingerprint} here and "
+                f"{entry.get('current_fingerprint')} in the approved plan"
+            )
+    if differences:
+        raise ValidationError(
+            f"the plan differs from the approved plan {baseline}: " + "; ".join(differences),
+            phase="baseline",
+        )
+
+
+def run_offline(adapter: Adapter, capture: Capture, *, baseline: Path | None = None) -> Report:
+    """Lint the plan with no database connection and no secret.
+
+    Nothing is imported, executed or compiled into bytecode, and no namespace is
+    touched.  Exit 0 here means the plan is well formed and admissible on this
+    backend; it is not a statement about any target.
+    """
+    report = Report(
+        command="validate --offline",
+        adapter=adapter.name,
+        server="not connected",
+        namespace=adapter.normalized_namespace(),
+        metadata_state="not read",
+        initialized=False,
+        pending_count=0,
+    )
+    report.checks = list(CHECKS)
+    report.migrations = [
+        MigrationStatus(
+            position=unit.position,
+            id=unit.id,
+            state="UNREAD",
+            mode=unit.mode.value,
+            language=unit.language.value,
+            current_fingerprint=unit.fingerprint,
+        )
+        for unit in capture.units
+    ]
+    if baseline is not None:
+        report.checks.append(f"published identity, order and fingerprints against {baseline}")
+    try:
+        preflight(capture, adapter)
+        if baseline is not None:
+            verify_baseline(capture, baseline)
+    except Migr8Error as exc:
+        report.problem_kind = "validation"
+        report.problem = exc.report()
+        report.exit_code = int(exc.exit_code)
+    return report
+
+
 def _run(
     command: str,
     adapter: Adapter,
@@ -123,6 +233,7 @@ def _run(
     *,
     with_liveness: bool,
     recovery_suffix: str = "",
+    baseline: Path | None = None,
 ) -> Report:
     """The shared body of both read-only commands.
 
@@ -132,6 +243,8 @@ def _run(
     without acting on it.
     """
     preflight(capture, adapter)
+    if baseline is not None:
+        verify_baseline(capture, baseline)
     adapter.connect()
     try:
         report, snapshot = _prepare(command, adapter, capture)
@@ -162,17 +275,18 @@ def run_status(adapter: Adapter, capture: Capture) -> Report:
     return _run("status", adapter, capture, with_liveness=True)
 
 
-def run_validate(adapter: Adapter, capture: Capture) -> Report:
+def run_validate(adapter: Adapter, capture: Capture, *, baseline: Path | None = None) -> Report:
     """Check the manifest and history contracts.  Modifies nothing."""
     return _run(
         "validate",
         adapter,
         capture,
         with_liveness=False,
+        baseline=baseline,
         recovery_suffix=(
             " This is a recovery-required condition, not permission to modify the active marker."
         ),
     )
 
 
-__all__ = ["run_status", "run_validate"]
+__all__ = ["run_offline", "run_status", "run_validate", "verify_baseline"]

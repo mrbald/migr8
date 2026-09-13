@@ -53,6 +53,9 @@ class Report:
     problem: str | None = None
     problem_kind: str | None = None
     recovery_command: str | None = None
+    #: What the command actually checked.  A report that passed is only as
+    #: strong as this list, and the offline lint's list is deliberately short.
+    checks: list[str] = field(default_factory=list)
     exit_code: int = int(Exit.OK)
     #: Correlation id shared with the event log, so a report and its log line up.
     run_id: str = ""
@@ -106,6 +109,10 @@ class Report:
                         )
                         if item.session_liveness_detail:
                             lines.append(f"        note: {item.session_liveness_detail}")
+        if self.checks:
+            lines.append("")
+            lines.append("checked:")
+            lines.extend(f"  - {item}" for item in self.checks)
         if self.problem:
             lines.append("")
             lines.append(f"{self.problem_kind or 'problem'}: {self.problem}")

@@ -97,6 +97,10 @@ class SqlSyntaxError(ValidationError):
     """The lexical scanner refused to classify a statement (spec Section 5.3)."""
 
 
+class PythonSyntaxError(ValidationError):
+    """A Python unit does not compile.  Detected before anything is executed."""
+
+
 class RecoveryRequiredError(ValidationError):
     """An ACTIVE migration's source changed; `migrate --recover ID` is required."""
 
