@@ -517,32 +517,6 @@ Status remains useful during a long migration. Oracle and PostgreSQL should retu
 
 Session-liveness diagnostics are optional and separate from the consistent history snapshot. A session match requires a full usable identity, not a reusable SID alone; include Oracle instance/SID/serial information where available. Without adequate privileges, report unknown. Session existence is not proof that the migration is currently executing or holding the lock.
 
-### 11.3a Run diagnostics
-
-A failure is usually diagnosed later, by someone who was not watching. The
-implementation therefore provides three things, none of which changes the
-protocol or the database layout:
-
-- **A run correlation id.** Generated per invocation, printed on every failure, and
-  included in `status` and `validate` output.
-- **An optional append-only event log.** `--log-file PATH`, or `MIGR8_LOG_FILE`,
-  appends one JSON object per line, flushed as written, so an interruption still
-  leaves the log usable to the last event. Recorded phases are run start,
-  preflight, connection, lock acquisition, the plan, per-migration start and
-  completion with timings, each admission, and a terminal record carrying the
-  outcome, exit code, failing identity and phase. `ctx.log()` writes into the same
-  stream. Credentials, connection strings and bind values are excluded by field
-  name.
-- **A machine-readable outcome.** `--json` emits the run report, including the
-  failing identity, the phase, the recovery command where one applies, and the
-  duration.
-
-Three constraints are part of the requirement. Nothing is written unless a log
-file is configured, so default behaviour is unchanged. No database object is
-added: an audit table would change the metadata layout and enlarge this
-specification's scope. And the log is diagnostic only -- no correctness rule may
-depend on it, exactly as Section 8.2 says of intermediate fingerprints.
-
 ### 11.3 Exit codes
 
 | Code | Meaning |
@@ -585,6 +559,30 @@ Credentials come from `MIGR8_PASSWORD`, supported wallet/external authentication
 Resolve config/manifest paths once relative to explicit CLI paths or documented defaults. Validate identifier fields before constructing SQL. Use native bind parameters for data and proper adapter identifier quoting for identifiers; string interpolation of unchecked identifiers is not acceptable.
 
 There is no user setting to weaken required commit durability. Optional driver features and platform support must be stated in the actual implementation's compatibility report.
+
+### 11.5 Run diagnostics
+
+Three facilities, none of which changes the protocol or the database layout:
+
+- **A run correlation id.** Generated per invocation, printed on every failure, and
+  included in `status` and `validate` output.
+- **An optional append-only event log.** `--log-file PATH`, or `MIGR8_LOG_FILE`,
+  appends one JSON object per line, flushed as written, so an interruption still
+  leaves the log usable to the last event. Recorded phases are run start,
+  preflight, connection, lock acquisition, the plan, per-migration start and
+  completion with timings, each admission, and a terminal record carrying the
+  outcome, exit code, failing identity and phase. `ctx.log()` writes into the same
+  stream. Credentials, connection strings and bind values are excluded by field
+  name.
+- **A machine-readable outcome.** `--json` emits the run report, including the
+  failing identity, the phase, the recovery command where one applies, and the
+  duration.
+
+Three constraints are part of the requirement. Nothing is written unless a log
+file is configured, so default behaviour is unchanged. No database object is
+added: an audit table would change the metadata layout and enlarge this
+specification's scope. And the log is diagnostic only -- no correctness rule may
+depend on it, exactly as Section 8.2 says of intermediate fingerprints.
 
 ## 12. Oracle adapter requirements
 
