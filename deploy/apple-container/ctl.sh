@@ -15,6 +15,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 GEN="$HERE/generated"
+# The job container is removed when it exits, so its event log has to live
+# outside it. This is the host side of that mount.
+RUNS="$GEN/runs"
 
 RUNNER_IMAGE="migr8-runner:local"
 ORACLE_NAME="migr8-ac-oracle"
@@ -159,11 +162,22 @@ run_job() {
     postgres) password="$PG_PASSWORD";          manifest="/opt/migr8/examples/postgres/manifest.toml" ;;
     *) die "unknown engine '$engine'; use oracle or postgres" ;;
   esac
+  mkdir -p "$RUNS"
+  # The job runs as uid 10001 and this directory belongs to whoever ran this
+  # script, so the mount is opened to both. A deployment mounts a directory its
+  # own runner owns instead; this is a disposable local rig.
+  chmod 0777 "$RUNS"
+  local status=0
+  # The job's exit code is the command's result, so it is kept rather than
+  # replaced by the note that follows it.
   container run --rm \
     --volume "$GEN:/etc/migr8" \
+    --volume "$RUNS:/var/log/migr8" \
     --env "MIGR8_PASSWORD=$password" \
     "$RUNNER_IMAGE" \
-    "$@" --config "/etc/migr8/$engine.toml" --manifest "$manifest"
+    "$@" --config "/etc/migr8/$engine.toml" --manifest "$manifest" || status=$?
+  note "event log: $RUNS/run.jsonl"
+  return $status
 }
 
 cmd_info() {
@@ -190,6 +204,8 @@ case "${1:-}" in
   status)    shift; run_job "${1:?engine required}" status "${@:2}" ;;
   validate)  shift; run_job "${1:?engine required}" validate "${@:2}" ;;
   logs)      shift; container logs "${1:?container name required}" ;;
+  runlog)    [[ -s "$RUNS/run.jsonl" ]] || die "no job event log at $RUNS/run.jsonl yet"
+             cat "$RUNS/run.jsonl" ;;
   ps)        container list --all | grep -E 'migr8-ac-|^ID' || true ;;
   down)      for n in "$PG_NAME" "$ORACLE_NAME"; do container stop "$n" >/dev/null 2>&1 || true; done
              echo "stopped" ;;
@@ -211,6 +227,7 @@ usage: ctl.sh <command>
   status   <engine> [..] run 'migr8 status'
   validate <engine> [..] run 'migr8 validate'
   logs <container>       show a database container's log
+  runlog                 show the migration job's event log, kept on the host
   ps                     list this project's containers
   down                   stop the database containers
   destroy                stop and remove them, and the generated configs
