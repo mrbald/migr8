@@ -213,8 +213,7 @@ def _build_required(value: object, migration_id: str) -> tuple[RequiredObject, .
         pair = (obj_type, name)
         if pair in seen:
             raise ManifestError(
-                f"migration {migration_id!r} declares duplicate required object "
-                f"{obj_type} {name}"
+                f"migration {migration_id!r} declares duplicate required object {obj_type} {name}"
             )
         seen.add(pair)
         objects.append(RequiredObject(type=obj_type, name=name))

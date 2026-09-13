@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,7 +10,16 @@ import pytest
 
 from migr8.errors import MetadataDamagedError, RecoveryRequiredError, ValidationError
 from migr8.manifest import Language, Manifest, MigrationDef, Mode
-from migr8.model import Capture, CapturedUnit, HistoryRow, ProgressRow, Snapshot, Status
+from migr8.model import (
+    LAYOUT_VERSION,
+    Capture,
+    CapturedUnit,
+    HistoryRow,
+    MetaRow,
+    ProgressRow,
+    Snapshot,
+    Status,
+)
 from migr8.statevalidate import (
     build_plan,
     check_recovery_admission,
@@ -24,47 +34,96 @@ def fp(tag: str) -> str:
     return "fp1:" + (tag * 64)[:64]
 
 
-def unit(position: int, migration_id: str, *, mode=Mode.RESTARTABLE,
-         language=Language.PYTHON, fingerprint: str | None = None) -> CapturedUnit:
+def unit(
+    position: int,
+    migration_id: str,
+    *,
+    mode=Mode.RESTARTABLE,
+    language=Language.PYTHON,
+    fingerprint: str | None = None,
+) -> CapturedUnit:
     definition = MigrationDef(
-        position=position, id=migration_id, raw_path=migration_id, language=language,
-        mode=mode, entry="migration.py", required=(), unit_dir=Path("/nonexistent"),
+        position=position,
+        id=migration_id,
+        raw_path=migration_id,
+        language=language,
+        mode=mode,
+        entry="migration.py",
+        required=(),
+        unit_dir=Path("/nonexistent"),
     )
     return CapturedUnit(
-        definition=definition, source_dir=Path("/nonexistent"),
-        fingerprint=fingerprint or fp(str(position)), relpaths=("migration.py",), staged=True,
+        definition=definition,
+        source_dir=Path("/nonexistent"),
+        fingerprint=fingerprint or fp(str(position)),
+        relpaths=("migration.py",),
+        staged=True,
     )
 
 
 def capture(*units: CapturedUnit) -> Capture:
     manifest = Manifest(
-        path=Path("/nonexistent/manifest.toml"), directory=Path("/nonexistent"),
+        path=Path("/nonexistent/manifest.toml"),
+        directory=Path("/nonexistent"),
         migrations=tuple(u.definition for u in units),
     )
     return Capture(manifest=manifest, units=units, staged=True)
 
 
-def success(position: int, migration_id: str, fingerprint: str, *, mode="restartable",
-            language="python", attempt: int | None = 1, first: str | None = None) -> HistoryRow:
+def success(
+    position: int,
+    migration_id: str,
+    fingerprint: str,
+    *,
+    mode="restartable",
+    language="python",
+    attempt: int | None = 1,
+    first: str | None = None,
+) -> HistoryRow:
     return HistoryRow(
-        seq=position, migration_id=migration_id, fingerprint=fingerprint,
-        first_fingerprint=first or fingerprint, language=language, mode=mode,
-        status=Status.SUCCESS, attempt=None if mode == "atomic" else attempt,
-        started_at=T0, last_attempt_at=T0, finished_at=T0, tool_version="test",
+        seq=position,
+        migration_id=migration_id,
+        fingerprint=fingerprint,
+        first_fingerprint=first or fingerprint,
+        language=language,
+        mode=mode,
+        status=Status.SUCCESS,
+        attempt=None if mode == "atomic" else attempt,
+        started_at=T0,
+        last_attempt_at=T0,
+        finished_at=T0,
+        tool_version="test",
     )
 
 
-def active(position: int, migration_id: str, fingerprint: str, *, attempt: int = 1,
-           mode="restartable", language="python", first: str | None = None) -> HistoryRow:
+def active(
+    position: int,
+    migration_id: str,
+    fingerprint: str,
+    *,
+    attempt: int = 1,
+    mode="restartable",
+    language="python",
+    first: str | None = None,
+) -> HistoryRow:
     return HistoryRow(
-        seq=position, migration_id=migration_id, fingerprint=fingerprint,
-        first_fingerprint=first or fingerprint, language=language, mode=mode,
-        status=Status.ACTIVE, attempt=attempt, started_at=T0, last_attempt_at=T0,
-        finished_at=None, tool_version="test",
+        seq=position,
+        migration_id=migration_id,
+        fingerprint=fingerprint,
+        first_fingerprint=first or fingerprint,
+        language=language,
+        mode=mode,
+        status=Status.ACTIVE,
+        attempt=attempt,
+        started_at=T0,
+        last_attempt_at=T0,
+        finished_at=None,
+        tool_version="test",
     )
 
 
 # --- valid states ----------------------------------------------------------------
+
 
 def test_empty_history_is_valid_and_everything_is_pending():
     cap = capture(unit(1, "a"), unit(2, "b"))
@@ -76,9 +135,7 @@ def test_empty_history_is_valid_and_everything_is_pending():
 
 def test_full_successful_history_leaves_nothing_pending():
     cap = capture(unit(1, "a"), unit(2, "b"))
-    snapshot = Snapshot(
-        history=(success(1, "a", fp("1")), success(2, "b", fp("2"))), progress=()
-    )
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(2, "b", fp("2"))), progress=())
     plan = build_plan(cap, snapshot)
     assert plan.success_count == 2
     assert plan.pending == ()
@@ -99,23 +156,21 @@ def test_prefix_plus_active_is_valid():
 
 # --- internal damage (exit 7) -----------------------------------------------------
 
+
 def test_position_gap_is_damage():
-    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(3, "c", fp("3"))),
-                        progress=())
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(3, "c", fp("3"))), progress=())
     with pytest.raises(MetadataDamagedError, match="not consecutive"):
         validate_snapshot_shape(snapshot)
 
 
 def test_duplicate_position_is_damage():
-    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(1, "b", fp("2"))),
-                        progress=())
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(1, "b", fp("2"))), progress=())
     with pytest.raises(MetadataDamagedError, match="position 1 is used by both"):
         validate_snapshot_shape(snapshot)
 
 
 def test_two_active_rows_are_damage():
-    snapshot = Snapshot(history=(active(1, "a", fp("1")), active(2, "b", fp("2"))),
-                        progress=())
+    snapshot = Snapshot(history=(active(1, "a", fp("1")), active(2, "b", fp("2"))), progress=())
     with pytest.raises(MetadataDamagedError, match="more than one ACTIVE"):
         validate_snapshot_shape(snapshot)
 
@@ -131,16 +186,19 @@ def test_active_not_at_the_next_position_is_damage():
 
 def test_success_after_an_active_row_is_damage():
     """ACTIVE must be the last row and immediately after the successful prefix."""
-    snapshot = Snapshot(history=(active(1, "a", fp("1")), success(2, "b", fp("2"))),
-                        progress=())
+    snapshot = Snapshot(history=(active(1, "a", fp("1")), success(2, "b", fp("2"))), progress=())
     with pytest.raises(MetadataDamagedError, match="ACTIVE must be the next position"):
         validate_snapshot_shape(snapshot)
 
 
 def test_non_success_before_the_active_row_is_damage():
-    snapshot = Snapshot(history=(
-        active(1, "a", fp("1")), active(2, "b", fp("2")),
-    ), progress=())
+    snapshot = Snapshot(
+        history=(
+            active(1, "a", fp("1")),
+            active(2, "b", fp("2")),
+        ),
+        progress=(),
+    )
     with pytest.raises(MetadataDamagedError, match="more than one ACTIVE"):
         validate_snapshot_shape(snapshot)
 
@@ -152,37 +210,70 @@ def test_active_marked_atomic_is_damage():
 
 
 def test_active_without_attempt_is_damage():
-    snapshot = Snapshot(history=(
-        HistoryRow(
-            seq=1, migration_id="a", fingerprint=fp("1"), first_fingerprint=fp("1"),
-            language="python", mode="restartable", status=Status.ACTIVE, attempt=None,
-            started_at=T0, last_attempt_at=T0, finished_at=None,
+    snapshot = Snapshot(
+        history=(
+            HistoryRow(
+                seq=1,
+                migration_id="a",
+                fingerprint=fp("1"),
+                first_fingerprint=fp("1"),
+                language="python",
+                mode="restartable",
+                status=Status.ACTIVE,
+                attempt=None,
+                started_at=T0,
+                last_attempt_at=T0,
+                finished_at=None,
+            ),
         ),
-    ), progress=())
+        progress=(),
+    )
     with pytest.raises(MetadataDamagedError, match="invalid attempt"):
         validate_snapshot_shape(snapshot)
 
 
 def test_success_without_completion_time_is_damage():
-    snapshot = Snapshot(history=(
-        HistoryRow(
-            seq=1, migration_id="a", fingerprint=fp("1"), first_fingerprint=fp("1"),
-            language="python", mode="restartable", status=Status.SUCCESS, attempt=1,
-            started_at=T0, last_attempt_at=T0, finished_at=None,
+    snapshot = Snapshot(
+        history=(
+            HistoryRow(
+                seq=1,
+                migration_id="a",
+                fingerprint=fp("1"),
+                first_fingerprint=fp("1"),
+                language="python",
+                mode="restartable",
+                status=Status.SUCCESS,
+                attempt=1,
+                started_at=T0,
+                last_attempt_at=T0,
+                finished_at=None,
+            ),
         ),
-    ), progress=())
+        progress=(),
+    )
     with pytest.raises(MetadataDamagedError, match="no completion time"):
         validate_snapshot_shape(snapshot)
 
 
 def test_atomic_success_with_an_attempt_count_is_damage():
-    snapshot = Snapshot(history=(
-        HistoryRow(
-            seq=1, migration_id="a", fingerprint=fp("1"), first_fingerprint=fp("1"),
-            language="sql", mode="atomic", status=Status.SUCCESS, attempt=3,
-            started_at=T0, last_attempt_at=T0, finished_at=T0,
+    snapshot = Snapshot(
+        history=(
+            HistoryRow(
+                seq=1,
+                migration_id="a",
+                fingerprint=fp("1"),
+                first_fingerprint=fp("1"),
+                language="sql",
+                mode="atomic",
+                status=Status.SUCCESS,
+                attempt=3,
+                started_at=T0,
+                last_attempt_at=T0,
+                finished_at=T0,
+            ),
         ),
-    ), progress=())
+        progress=(),
+    )
     with pytest.raises(MetadataDamagedError, match="atomic attempts are not counted"):
         validate_snapshot_shape(snapshot)
 
@@ -194,15 +285,28 @@ def test_unsupported_stored_fingerprint_format_is_damage(bad):
         validate_snapshot_shape(snapshot)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("language", "perl"), ("mode", "eventual"), ("status", "FAILED"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("language", "perl"),
+        ("mode", "eventual"),
+        ("status", "FAILED"),
+    ],
+)
 def test_corrupt_enumerated_field_is_damage(field, value):
-    base = dict(
-        seq=1, migration_id="a", fingerprint=fp("1"), first_fingerprint=fp("1"),
-        language="python", mode="restartable", status=Status.SUCCESS, attempt=1,
-        started_at=T0, last_attempt_at=T0, finished_at=T0,
-    )
+    base = {
+        "seq": 1,
+        "migration_id": "a",
+        "fingerprint": fp("1"),
+        "first_fingerprint": fp("1"),
+        "language": "python",
+        "mode": "restartable",
+        "status": Status.SUCCESS,
+        "attempt": 1,
+        "started_at": T0,
+        "last_attempt_at": T0,
+        "finished_at": T0,
+    }
     base[field] = value
     with pytest.raises(MetadataDamagedError, match="unsupported"):
         validate_snapshot_shape(Snapshot(history=(HistoryRow(**base),), progress=()))
@@ -216,16 +320,17 @@ def test_non_positive_position_is_damage():
 
 # --- progress ownership -----------------------------------------------------------
 
+
 def test_progress_attached_to_success_is_damage():
-    snapshot = Snapshot(history=(success(1, "a", fp("1")),),
-                        progress=(ProgressRow("a", "k", "v"),))
+    snapshot = Snapshot(history=(success(1, "a", fp("1")),), progress=(ProgressRow("a", "k", "v"),))
     with pytest.raises(MetadataDamagedError, match="attached to successful migration"):
         validate_snapshot_shape(snapshot)
 
 
 def test_orphaned_progress_is_damage():
-    snapshot = Snapshot(history=(active(1, "a", fp("1")),),
-                        progress=(ProgressRow("ghost", "k", "v"),))
+    snapshot = Snapshot(
+        history=(active(1, "a", fp("1")),), progress=(ProgressRow("ghost", "k", "v"),)
+    )
     with pytest.raises(MetadataDamagedError, match="unknown migration"):
         validate_snapshot_shape(snapshot)
 
@@ -240,13 +345,13 @@ def test_progress_for_a_non_active_migration_is_damage():
 
 
 def test_empty_progress_value_is_damage():
-    snapshot = Snapshot(history=(active(1, "a", fp("1")),),
-                        progress=(ProgressRow("a", "k", ""),))
+    snapshot = Snapshot(history=(active(1, "a", fp("1")),), progress=(ProgressRow("a", "k", ""),))
     with pytest.raises(MetadataDamagedError, match="empty value"):
         validate_snapshot_shape(snapshot)
 
 
 # --- manifest disagreement (exit 2) ------------------------------------------------
+
 
 def test_changed_successful_source_is_a_validation_failure():
     cap = capture(unit(1, "a", fingerprint=fp("9")))
@@ -278,9 +383,7 @@ def test_changed_stored_language_of_a_successful_row_is_a_validation_failure():
 
 def test_history_longer_than_the_manifest_is_a_validation_failure():
     cap = capture(unit(1, "a", fingerprint=fp("1")))
-    snapshot = Snapshot(
-        history=(success(1, "a", fp("1")), success(2, "b", fp("2"))), progress=()
-    )
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(2, "b", fp("2"))), progress=())
     with pytest.raises(ValidationError, match="not in the manifest"):
         build_plan(cap, snapshot)
 
@@ -293,6 +396,7 @@ def test_active_declared_atomic_in_the_manifest_is_a_validation_failure():
 
 
 # --- recovery admission ------------------------------------------------------------
+
 
 def test_unchanged_active_is_an_ordinary_retry():
     cap = capture(unit(1, "a", fingerprint=fp("1")))
@@ -336,9 +440,7 @@ def test_recover_never_admits_an_edit_to_a_successful_migration():
 def test_first_fingerprint_is_retained_across_a_recovery_edit():
     """The plan compares the current fingerprint, not the first one."""
     cap = capture(unit(1, "a", fingerprint=fp("3")))
-    snapshot = Snapshot(
-        history=(active(1, "a", fp("2"), attempt=2, first=fp("1")),), progress=()
-    )
+    snapshot = Snapshot(history=(active(1, "a", fp("2"), attempt=2, first=fp("1")),), progress=())
     plan = build_plan(cap, snapshot)
     assert plan.active_fingerprint_changed
     assert plan.active.first_fingerprint == fp("1")
@@ -348,9 +450,120 @@ def test_first_fingerprint_is_retained_across_a_recovery_edit():
 def test_first_and_latest_equality_does_not_prove_no_edit_occurred():
     """A to B and back to A leaves equal fingerprints (spec Section 8.2)."""
     cap = capture(unit(1, "a", fingerprint=fp("1")))
-    snapshot = Snapshot(
-        history=(active(1, "a", fp("1"), attempt=3, first=fp("1")),), progress=()
-    )
+    snapshot = Snapshot(history=(active(1, "a", fp("1"), attempt=3, first=fp("1")),), progress=())
     plan = build_plan(cap, snapshot)
     assert not plan.active_fingerprint_changed
     assert plan.active.attempt == 3  # only the counter hints that edits happened
+
+
+# --- damage the live suites reach through a database, pinned here as units --------
+
+
+def meta(layout_version: int) -> MetaRow:
+    return MetaRow(
+        layout_version=layout_version,
+        adapter="sqlite-probe",
+        lock_provider="file",
+        lock_binding="4711",
+        target_namespace="main",
+        initialized_at=T0,
+    )
+
+
+def test_unsupported_layout_version_is_damage():
+    snapshot = Snapshot(history=(), progress=(), meta=meta(LAYOUT_VERSION + 1))
+    with pytest.raises(MetadataDamagedError, match="layout_version"):
+        validate_snapshot_shape(snapshot)
+
+
+def test_supported_layout_version_passes():
+    validate_snapshot_shape(Snapshot(history=(), progress=(), meta=meta(LAYOUT_VERSION)))
+
+
+def test_duplicate_migration_id_at_two_positions_is_damage():
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), success(2, "a", fp("2"))), progress=())
+    with pytest.raises(MetadataDamagedError, match="duplicate migration id"):
+        validate_snapshot_shape(snapshot)
+
+
+def test_a_row_after_the_active_row_is_damage():
+    snapshot = Snapshot(history=(active(1, "a", fp("1")), success(2, "b", fp("2"))), progress=())
+    with pytest.raises(MetadataDamagedError, match="ACTIVE must be the next position"):
+        validate_snapshot_shape(snapshot)
+
+
+def test_active_row_with_a_completion_time_is_damage():
+    row = replace(active(1, "a", fp("1")), finished_at=T0)
+    with pytest.raises(MetadataDamagedError, match="has a completion time"):
+        validate_snapshot_shape(Snapshot(history=(row,), progress=()))
+
+
+def test_active_row_without_a_start_time_is_damage():
+    row = replace(active(1, "a", fp("1")), started_at=None)
+    with pytest.raises(MetadataDamagedError, match="has no start time"):
+        validate_snapshot_shape(Snapshot(history=(row,), progress=()))
+
+
+def test_atomic_success_row_carrying_an_attempt_is_damage():
+    row = replace(success(1, "a", fp("1"), mode="atomic"), attempt=2)
+    with pytest.raises(MetadataDamagedError, match="atomic attempts are not counted"):
+        validate_snapshot_shape(Snapshot(history=(row,), progress=()))
+
+
+def test_duplicate_progress_key_is_damage():
+    snapshot = Snapshot(
+        history=(active(1, "a", fp("1")),),
+        progress=(ProgressRow("a", "last_id", "10"), ProgressRow("a", "last_id", "11")),
+    )
+    with pytest.raises(MetadataDamagedError, match="duplicate progress key"):
+        validate_snapshot_shape(snapshot)
+
+
+def test_progress_row_with_an_empty_value_is_damage():
+    snapshot = Snapshot(
+        history=(active(1, "a", fp("1")),), progress=(ProgressRow("a", "last_id", ""),)
+    )
+    with pytest.raises(MetadataDamagedError, match="has an empty value"):
+        validate_snapshot_shape(snapshot)
+
+
+def test_active_history_identity_must_match_the_manifest_position():
+    cap = capture(unit(1, "a"), unit(2, "b"))
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), active(2, "c", fp("2"))), progress=())
+    with pytest.raises(ValidationError, match="but the manifest has 'b'"):
+        build_plan(cap, snapshot)
+
+
+def test_recover_refuses_when_the_manifest_no_longer_reaches_that_position():
+    """The manifest lost entries, so the active position has no unit at all."""
+    cap = capture(unit(1, "a"), unit(2, "b"))
+    snapshot = Snapshot(history=(success(1, "a", fp("1")), active(2, "b", fp("2"))), progress=())
+    plan = build_plan(cap, snapshot)
+    shortened = replace(plan, capture=capture(unit(1, "a")))
+    with pytest.raises(ValidationError, match="cannot change the active migration's position"):
+        check_recovery_admission(shortened, "b")
+
+
+def test_recover_refuses_a_mode_change():
+    """build_plan refuses an atomic manifest entry first, so the recovery-side
+    mode guard is reached only by swapping the capture after the plan is built."""
+    cap = capture(unit(1, "a", fingerprint=fp("9")))
+    snapshot = Snapshot(history=(active(1, "a", fp("1")),), progress=())
+    plan = replace(build_plan(cap, snapshot), capture=capture(unit(1, "a", mode=Mode.ATOMIC)))
+    with pytest.raises(ValidationError, match="cannot change execution mode"):
+        check_recovery_admission(plan, "a")
+
+
+def test_restartable_success_row_without_an_attempt_is_damage():
+    row = replace(success(1, "a", fp("1")), attempt=None)
+    with pytest.raises(MetadataDamagedError, match="has invalid attempt"):
+        validate_snapshot_shape(Snapshot(history=(row,), progress=()))
+
+
+def test_progress_row_belonging_to_another_migration_is_damage():
+    snapshot = Snapshot(
+        history=(success(1, "a", fp("1")), active(2, "b", fp("2"))),
+        progress=(ProgressRow("b", "k", "1"), ProgressRow("c", "k", "1")),
+    )
+    with pytest.raises(MetadataDamagedError, match="references unknown migration"):
+        validate_snapshot_shape(snapshot)

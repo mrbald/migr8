@@ -8,22 +8,35 @@ import sys
 from pathlib import Path
 
 import pytest
-
 import support
+
 from migr8.errors import UnitError
 from migr8.manifest import load
 from migr8.staging import capture_in_place, cleanup, stage
 
 
 def _project(tmp_path: Path) -> Path:
-    support.unit(tmp_path, "u", {
-        "up.sql": "SELECT 1 FROM DUAL;\n",
-        "data/rows.csv": "id,region\n1,EU\n",
-        "helper.py": "VALUE = 1\n",
-    })
-    return support.manifest(tmp_path, [{
-        "id": "m", "path": "u", "language": "sql", "mode": "atomic", "entry": "up.sql",
-    }])
+    support.unit(
+        tmp_path,
+        "u",
+        {
+            "up.sql": "SELECT 1 FROM DUAL;\n",
+            "data/rows.csv": "id,region\n1,EU\n",
+            "helper.py": "VALUE = 1\n",
+        },
+    )
+    return support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "m",
+                "path": "u",
+                "language": "sql",
+                "mode": "atomic",
+                "entry": "up.sql",
+            }
+        ],
+    )
 
 
 def test_staging_copies_every_unit_file(tmp_path):
@@ -86,10 +99,13 @@ def test_each_staged_unit_gets_an_injective_directory(tmp_path):
     """Ids differing only in a separator must not share a staged directory."""
     support.unit(tmp_path, "u1", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "u2", {"up.sql": "SELECT 2;\n"})
-    manifest_path = support.manifest(tmp_path, [
-        {"id": "a-b", "path": "u1", "language": "sql", "mode": "atomic", "entry": "up.sql"},
-        {"id": "a_b", "path": "u2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
-    ])
+    manifest_path = support.manifest(
+        tmp_path,
+        [
+            {"id": "a-b", "path": "u1", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+            {"id": "a_b", "path": "u2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+        ],
+    )
     capture = stage(load(manifest_path))
     try:
         first, second = capture.units
@@ -103,9 +119,18 @@ def test_each_staged_unit_gets_an_injective_directory(tmp_path):
 def test_staging_refuses_a_symlink_inside_a_unit(tmp_path):
     unit_dir = support.unit(tmp_path, "u", {"up.sql": "SELECT 1;\n"})
     os.symlink(unit_dir / "up.sql", unit_dir / "alias.sql")
-    manifest_path = support.manifest(tmp_path, [{
-        "id": "m", "path": "u", "language": "sql", "mode": "atomic", "entry": "up.sql",
-    }])
+    manifest_path = support.manifest(
+        tmp_path,
+        [
+            {
+                "id": "m",
+                "path": "u",
+                "language": "sql",
+                "mode": "atomic",
+                "entry": "up.sql",
+            }
+        ],
+    )
     with pytest.raises(UnitError, match="symlink"):
         stage(load(manifest_path))
 

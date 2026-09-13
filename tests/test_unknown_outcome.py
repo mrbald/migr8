@@ -9,9 +9,11 @@ produced against Oracle and PostgreSQL in ``tests/integration``.
 
 from __future__ import annotations
 
-import pytest
+import contextlib
 
+import pytest
 import support
+
 from migr8.adapters.base import Boundary, OutcomeClass
 from migr8.errors import ContractViolationError, Exit, UnknownOutcomeError
 from migr8.latch import LatchState, RunLatch
@@ -25,6 +27,17 @@ class SimulatedTransportLoss(Exception):
 
 
 # --- the latch itself ---------------------------------------------------------------
+
+
+def test_a_violation_never_displaces_an_earlier_unknown_outcome():
+    """The first latched outcome is the one reported, whichever kind it is."""
+    latch = RunLatch()
+    unknown = UnknownOutcomeError("lost", operation="commit")
+    latch.latch_unknown(unknown)
+    latch.latch_violation(ContractViolationError("transaction identity changed"))
+    assert latch.state is LatchState.UNKNOWN_OUTCOME
+    assert latch.error is unknown
+
 
 def test_latch_is_single_shot_and_not_clearable():
     latch = RunLatch()
@@ -52,15 +65,14 @@ def test_unknown_outcome_is_catchable_but_the_latch_is_not_clearable():
     latch = RunLatch()
     error = UnknownOutcomeError("lost", operation="commit")
     latch.latch_unknown(error)
-    try:
+    with contextlib.suppress(Exception):
         latch.check()
-    except Exception:  # noqa: BLE001 - deliberately the way author code would
-        pass
     with pytest.raises(UnknownOutcomeError):
         latch.check()
 
 
 # --- engine behaviour ----------------------------------------------------------------
+
 
 @pytest.fixture
 def project(tmp_path):
@@ -72,12 +84,25 @@ def project(tmp_path):
 def _batch_project(root, body: str):
     support.unit(root, "m1", {"up.sql": "CREATE TABLE dst (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"migration.py": body})
-    return support.manifest(root, [
-        {"id": "dst", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "copy", "path": "m2", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    return support.manifest(
+        root,
+        [
+            {
+                "id": "dst",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "copy",
+                "path": "m2",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
 
 
 def _fail_commit(adapter, *, boundary: str, occurrence: int = 1, durable: bool = True):
@@ -128,8 +153,9 @@ def test_classification_treats_an_unrecognised_error_as_a_lost_transport(project
     from migr8.config import load as load_config
 
     adapter = adapters.create(load_config(config))
-    assert adapter.classify_exception(SimulatedTransportLoss()) \
-        is OutcomeClass.COMMUNICATION_FAILURE
+    assert (
+        adapter.classify_exception(SimulatedTransportLoss()) is OutcomeClass.COMMUNICATION_FAILURE
+    )
 
 
 BODY = """\
@@ -175,9 +201,12 @@ def test_durable_batch_with_lost_response_exits_four_and_keeps_the_work(project)
     manifest = _batch_project(root, BODY)
     state: dict = {}
     report = support.migrate_report(
-        config, manifest,
-        adapter_hook=lambda a: state.__setitem__("injector", _fail_commit(
-            a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=2, durable=True)),
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector",
+            _fail_commit(a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=2, durable=True),
+        ),
     )
     assert report.exit_code == Exit.UNKNOWN_OUTCOME
     assert state["injector"]["rollbacks_after_latch"] == 0
@@ -188,10 +217,16 @@ def test_durable_batch_with_lost_response_exits_four_and_keeps_the_work(project)
 def test_a_fresh_run_reconciles_after_an_unknown_outcome(project):
     root, config, db = project
     manifest = _batch_project(root, BODY)
-    assert support.migrate_report(
-        config, manifest, adapter_hook=lambda a: _fail_commit(
-            a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=2, durable=True),
-    ).exit_code == Exit.UNKNOWN_OUTCOME
+    assert (
+        support.migrate_report(
+            config,
+            manifest,
+            adapter_hook=lambda a: _fail_commit(
+                a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=2, durable=True
+            ),
+        ).exit_code
+        == Exit.UNKNOWN_OUTCOME
+    )
     # A new invocation reacquires the lock and converges from the durable state.
     assert support.migrate(config, manifest) == Exit.OK
     assert support.db_query(db, "SELECT id FROM dst ORDER BY id") == [(1,), (2,), (3,)]
@@ -218,9 +253,12 @@ def test_caught_unknown_outcome_cannot_resume_the_run(project):
     manifest = _batch_project(root, CATCHING_BODY)
     state: dict = {}
     report = support.migrate_report(
-        config, manifest,
-        adapter_hook=lambda a: state.__setitem__("injector", _fail_commit(
-            a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=1, durable=True)),
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector",
+            _fail_commit(a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=1, durable=True),
+        ),
     )
     assert report.exit_code == Exit.UNKNOWN_OUTCOME
     assert state["injector"]["rollbacks_after_latch"] == 0
@@ -244,8 +282,11 @@ def test_latched_run_cannot_complete_even_if_every_error_is_swallowed(project):
     root, config, db = project
     manifest = _batch_project(root, SWALLOW_EVERYTHING)
     report = support.migrate_report(
-        config, manifest, adapter_hook=lambda a: _fail_commit(
-            a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=1, durable=True),
+        config,
+        manifest,
+        adapter_hook=lambda a: _fail_commit(
+            a, boundary=Boundary.RESTARTABLE_BATCH, occurrence=1, durable=True
+        ),
     )
     assert report.exit_code == Exit.UNKNOWN_OUTCOME
     assert [r[2] for r in support.history(db)] == ["SUCCESS", "ACTIVE"]
@@ -265,9 +306,12 @@ def test_lost_admission_acknowledgement_runs_no_migration_code(project):
     # The second restartable admission is the one that precedes Python code.
     state: dict = {}
     report = support.migrate_report(
-        config, manifest,
-        adapter_hook=lambda a: state.__setitem__("injector", _fail_commit(
-            a, boundary=Boundary.RESTARTABLE_ADMISSION, occurrence=2, durable=False)),
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector",
+            _fail_commit(a, boundary=Boundary.RESTARTABLE_ADMISSION, occurrence=2, durable=False),
+        ),
     )
     assert state["injector"]["fired"]
     assert report.exit_code == Exit.UNKNOWN_OUTCOME
@@ -279,16 +323,26 @@ def test_lost_atomic_completion_acknowledgement_is_not_inferred_as_rollback(proj
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"up.sql": "INSERT INTO t (id) VALUES (5);"})
-    manifest = support.manifest(root, [
-        {"id": "create", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "work", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
-    ])
+    manifest = support.manifest(
+        root,
+        [
+            {
+                "id": "create",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {"id": "work", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+        ],
+    )
     state: dict = {}
     report = support.migrate_report(
-        config, manifest,
-        adapter_hook=lambda a: state.__setitem__("injector", _fail_commit(
-            a, boundary=Boundary.ATOMIC_COMPLETION, durable=True)),
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector", _fail_commit(a, boundary=Boundary.ATOMIC_COMPLETION, durable=True)
+        ),
     )
     assert state["injector"]["fired"]
     assert report.exit_code == Exit.UNKNOWN_OUTCOME

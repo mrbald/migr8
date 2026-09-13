@@ -32,15 +32,60 @@ _DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
 
 #: Top-level SQL*Plus / client commands.  Recognised only to produce a precise
 #: "unsupported command" diagnostic; they are never sent to the server.
-SQLPLUS_COMMANDS = frozenset({
-    "@", "@@", "ACCEPT", "APPEND", "ARCHIVE", "ATTRIBUTE", "BREAK", "BTITLE",
-    "CHANGE", "CLEAR", "COLUMN", "COMPUTE", "CONNECT", "COPY", "DEFINE",
-    "DESC", "DESCRIBE", "DISCONNECT", "EDIT", "EXECUTE", "EXIT", "GET",
-    "HELP", "HOST", "INPUT", "LIST", "PASSWORD", "PAUSE", "PRINT", "PROMPT",
-    "QUIT", "RECOVER", "REMARK", "REPFOOTER", "REPHEADER", "RUN", "SAVE",
-    "SET", "SHOW", "SHUTDOWN", "SPOOL", "STARTUP", "STORE", "TIMING",
-    "TTITLE", "UNDEFINE", "VARIABLE", "WHENEVER", "XQUERY",
-})
+SQLPLUS_COMMANDS = frozenset(
+    {
+        "@",
+        "@@",
+        "ACCEPT",
+        "APPEND",
+        "ARCHIVE",
+        "ATTRIBUTE",
+        "BREAK",
+        "BTITLE",
+        "CHANGE",
+        "CLEAR",
+        "COLUMN",
+        "COMPUTE",
+        "CONNECT",
+        "COPY",
+        "DEFINE",
+        "DESC",
+        "DESCRIBE",
+        "DISCONNECT",
+        "EDIT",
+        "EXECUTE",
+        "EXIT",
+        "GET",
+        "HELP",
+        "HOST",
+        "INPUT",
+        "LIST",
+        "PASSWORD",
+        "PAUSE",
+        "PRINT",
+        "PROMPT",
+        "QUIT",
+        "RECOVER",
+        "REMARK",
+        "REPFOOTER",
+        "REPHEADER",
+        "RUN",
+        "SAVE",
+        "SET",
+        "SHOW",
+        "SHUTDOWN",
+        "SPOOL",
+        "STARTUP",
+        "STORE",
+        "TIMING",
+        "TTITLE",
+        "UNDEFINE",
+        "VARIABLE",
+        "WHENEVER",
+        "XQUERY",
+    }
+)
+
 
 class TokenKind(StrEnum):
     WORD = auto()
@@ -110,10 +155,10 @@ def tokenize(sql: str) -> list[Token]:
             index = end
             continue
         if ch == "$":
-            end = _try_scan_dollar_quoted(sql, index)
-            if end is not None:
-                tokens.append(Token(TokenKind.STRING, sql[index:end], index, end))
-                index = end
+            dollar_end = _try_scan_dollar_quoted(sql, index)
+            if dollar_end is not None:
+                tokens.append(Token(TokenKind.STRING, sql[index:dollar_end], index, dollar_end))
+                index = dollar_end
                 continue
         alt = _try_scan_prefixed_string(sql, index)
         if alt is not None:
@@ -208,7 +253,7 @@ def _try_scan_prefixed_string(sql: str, start: int) -> int | None:
     Returns ``None`` when the text at ``start`` is not one of those forms, so
     the caller can continue as an ordinary identifier.
     """
-    upper = sql[start:start + 3].upper()
+    upper = sql[start : start + 3].upper()
     if upper.startswith("NQ'"):
         return _scan_alt_quoted(sql, start + 3)
     if upper.startswith("Q'"):
@@ -231,9 +276,7 @@ def _scan_alt_quoted(sql: str, body: int) -> int:
     terminator = closer + "'"
     end = sql.find(terminator, body + 1)
     if end < 0:
-        raise SqlSyntaxError(
-            f"unterminated alternative-quoted literal opened with q'{opener}"
-        )
+        raise SqlSyntaxError(f"unterminated alternative-quoted literal opened with q'{opener}")
     return end + len(terminator)
 
 
@@ -242,7 +285,8 @@ def significant_tokens(sql: str) -> list[Token]:
     return [tok for tok in tokenize(sql) if tok.significant]
 
 
-# --- Statement classification -------------------------------------------------
+# --- Statement classification ---------------------------------------------------------------------
+
 
 class StatementKind(StrEnum):
     #: An ordinary SQL statement; one trailing terminator may be removed.
@@ -256,9 +300,15 @@ class StatementKind(StrEnum):
 #: Object kinds whose CREATE form carries a PL/SQL body terminated by ';'.
 #: ``LIBRARY`` is intentionally absent: it creates an object but is not a
 #: PL/SQL body and must not be classified as one.
-_PLSQL_DEFINITION_OBJECTS = frozenset({
-    "PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE",
-})
+_PLSQL_DEFINITION_OBJECTS = frozenset(
+    {
+        "PROCEDURE",
+        "FUNCTION",
+        "PACKAGE",
+        "TRIGGER",
+        "TYPE",
+    }
+)
 
 _CREATE_MODIFIERS = ("OR", "REPLACE", "EDITIONABLE", "NONEDITIONABLE", "EDITIONING")
 
@@ -292,8 +342,7 @@ def classify(sql: str) -> StatementKind:
     words = [tok.upper for tok in tokens if tok.kind is TokenKind.WORD]
     if not words:
         raise SqlSyntaxError(
-            f"SQL text does not begin with a recognisable keyword (starts with "
-            f"{tokens[0].text!r})"
+            f"SQL text does not begin with a recognisable keyword (starts with {tokens[0].text!r})"
         )
     first = words[0]
     if first in ("DECLARE", "BEGIN"):
@@ -317,7 +366,7 @@ def _standalone_slash(text: str, token: Token) -> bool:
     line_start = text.rfind("\n", 0, token.start) + 1
     line_end = text.find("\n", token.end)
     line_end = len(text) if line_end < 0 else line_end
-    return text[line_start:token.start].strip() == "" and text[token.end:line_end].strip() == ""
+    return text[line_start : token.start].strip() == "" and text[token.end : line_end].strip() == ""
 
 
 def normalize(sql: str) -> Statement:
@@ -339,8 +388,11 @@ def normalize(sql: str) -> Statement:
         raise SqlSyntaxError("SQL text contains no statement")
 
     def only_terminator() -> bool:
-        return len(significant) == 1 and significant[0].kind is TokenKind.PUNCT \
+        return (
+            len(significant) == 1
+            and significant[0].kind is TokenKind.PUNCT
             and significant[0].text in (";", "/")
+        )
 
     if only_terminator():
         raise SqlSyntaxError("SQL text contains only a terminator")
@@ -348,7 +400,7 @@ def normalize(sql: str) -> Statement:
     # Remove a single trailing end-of-file slash.
     last = significant[-1]
     if last.kind is TokenKind.PUNCT and last.text == "/" and _standalone_slash(text, last):
-        text = text[:last.start] + text[last.end:]
+        text = text[: last.start] + text[last.end :]
         significant = significant_tokens(text)
         if not significant:
             raise SqlSyntaxError("SQL text contains no statement")
@@ -360,7 +412,7 @@ def normalize(sql: str) -> Statement:
     if kind is StatementKind.SQL:
         last = significant[-1]
         if last.kind is TokenKind.PUNCT and last.text == ";":
-            text = text[:last.start] + text[last.end:]
+            text = text[: last.start] + text[last.end :]
             significant = significant_tokens(text)
         if any(tok.kind is TokenKind.PUNCT and tok.text == ";" for tok in significant):
             raise SqlSyntaxError(
@@ -370,9 +422,7 @@ def normalize(sql: str) -> Statement:
     else:
         last = significant[-1]
         if not (last.kind is TokenKind.PUNCT and last.text == ";"):
-            raise SqlSyntaxError(
-                "a PL/SQL block or stored definition must end with ';'"
-            )
+            raise SqlSyntaxError("a PL/SQL block or stored definition must end with ';'")
 
     # Any remaining standalone slash was a separator attempt, not an operator:
     # division never occupies a whole line by itself.
@@ -393,21 +443,21 @@ def normalize(sql: str) -> Statement:
     # quoted name is a different object on Oracle, so treating both forms as a
     # reference is the conservative direction.
     names = frozenset(word_tokens).union(
-        tok.text[1:-1].upper()
-        for tok in significant
-        if tok.kind is TokenKind.QUOTED_IDENT
+        tok.text[1:-1].upper() for tok in significant if tok.kind is TokenKind.QUOTED_IDENT
     )
     first = significant[0]
     if first.kind is TokenKind.PUNCT and first.text == "@":
+        raise SqlSyntaxError("'@' script inclusion is a SQL*Plus command and is not supported")
+    if (
+        words
+        and words[0] in SQLPLUS_COMMANDS
+        and kind is StatementKind.SQL
+        and not _is_also_valid_sql(words)
+    ):
         raise SqlSyntaxError(
-            "'@' script inclusion is a SQL*Plus command and is not supported"
+            f"{words[0]} is an unsupported SQL*Plus or client command; "
+            "this tool has no SQL*Plus interpreter"
         )
-    if words and words[0] in SQLPLUS_COMMANDS and kind is StatementKind.SQL:
-        if not _is_also_valid_sql(words):
-            raise SqlSyntaxError(
-                f"{words[0]} is an unsupported SQL*Plus or client command; "
-                "this tool has no SQL*Plus interpreter"
-            )
     return Statement(text=stripped, kind=kind, lead=words, names=names)
 
 

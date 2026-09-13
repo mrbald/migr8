@@ -12,12 +12,13 @@ coverage.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import datetime
 
 import pytest
-
 import support
+
 from migr8 import adapters
 from migr8.adapters.base import Adapter, OutcomeClass
 from migr8.config import load as load_config
@@ -51,15 +52,15 @@ def _oracle_config(tmp_path):
             ).fetchall()
             for obj, kind in rows:
                 suffix = " CASCADE CONSTRAINTS PURGE" if kind == "TABLE" else ""
-                try:
+                with contextlib.suppress(oracledb.DatabaseError):
                     cursor.execute(f'DROP {kind} "{user}"."{obj}"{suffix}')
-                except oracledb.DatabaseError:
-                    pass
             connection.commit()
     except oracledb.Error as exc:
         pytest.skip(f"Oracle test service is not reachable: {exc}")
     os.environ["MIGR8_PASSWORD"] = password
-    return support.write(tmp_path / "migr8.toml", f"""
+    return support.write(
+        tmp_path / "migr8.toml",
+        f"""
         [database]
         adapter = "oracle"
         dsn = "{dsn}"
@@ -74,12 +75,12 @@ def _oracle_config(tmp_path):
         package = "SYS.DBMS_LOCK"
         id = {LOCK_ID}
         timeout_seconds = 20
-    """)
+    """,
+    )
 
 
 def _postgres_config(tmp_path):
-    needed = ("MIGR8_PG_HOST", "MIGR8_PG_PORT", "MIGR8_PG_DB",
-              "MIGR8_PG_USER", "MIGR8_PG_PASSWORD")
+    needed = ("MIGR8_PG_HOST", "MIGR8_PG_PORT", "MIGR8_PG_DB", "MIGR8_PG_USER", "MIGR8_PG_PASSWORD")
     for name in needed:
         if not os.environ.get(name):
             pytest.skip(f"PostgreSQL test service not configured: {name} is unset")
@@ -97,18 +98,21 @@ def _postgres_config(tmp_path):
     except psycopg.Error as exc:
         pytest.skip(f"PostgreSQL test service is not reachable: {exc}")
     os.environ["MIGR8_PASSWORD"] = password
-    return support.write(tmp_path / "migr8.toml", f"""
+    return support.write(
+        tmp_path / "migr8.toml",
+        f"""
         [database]
         adapter = "postgres"
         dsn = "{conninfo}"
-        user = "{os.environ['MIGR8_PG_USER']}"
+        user = "{os.environ["MIGR8_PG_USER"]}"
         target_schema = "{schema}"
 
         [lock]
         provider = "advisory"
         id = {LOCK_ID}
         timeout_seconds = 20
-    """)
+    """,
+    )
 
 
 BUILDERS = {
@@ -134,7 +138,8 @@ def ready(request, tmp_path):
         adapter.acquire_lock()
         adapter.prepare_storage()
         assert adapter.inspect_metadata().state in (
-            MetadataState.ABSENT, MetadataState.INCOMPLETE_COMPATIBLE
+            MetadataState.ABSENT,
+            MetadataState.INCOMPLETE_COMPATIBLE,
         )
         adapter.initialize()
         yield adapter
@@ -144,12 +149,14 @@ def ready(request, tmp_path):
 
 # --- identity of the shipped set --------------------------------------------------
 
+
 def test_every_supported_adapter_is_covered_here():
     """A new adapter must appear in this suite, not only in the registry."""
     assert set(adapters.SUPPORTED) == set(BUILDERS)
 
 
 # --- initialization ----------------------------------------------------------------
+
 
 def test_initialize_reaches_a_complete_verified_layout(ready: Adapter):
     report = ready.inspect_metadata()
@@ -176,13 +183,12 @@ def test_metadata_names_resolve_against_the_real_layout(ready: Adapter):
     rows = ready._fetch(f"SELECT count(*) FROM {ready.metadata_name(HISTORY_TABLE)}", {})
     assert rows[0][0] == 0
     column = ready.metadata_column("mode")
-    rows = ready._fetch(
-        f"SELECT {column} FROM {ready.metadata_name(HISTORY_TABLE)}", {}
-    )
+    rows = ready._fetch(f"SELECT {column} FROM {ready.metadata_name(HISTORY_TABLE)}", {})
     assert rows == []
 
 
 # --- engine transaction state -------------------------------------------------------
+
 
 def test_engine_transaction_state_tracks_begin_commit_rollback(ready: Adapter):
     assert not ready.in_engine_transaction
@@ -216,6 +222,7 @@ def test_has_open_transaction_reflects_uncommitted_work(ready: Adapter):
 
 # --- transaction identity ------------------------------------------------------------
 
+
 def test_transaction_identity_is_stable_within_and_lost_across_a_commit(ready: Adapter):
     ready.begin()
     established = ready.establish_transaction_identity()
@@ -241,7 +248,10 @@ def test_admission_completion_and_progress_lifecycle(ready: Adapter):
     assert len(snapshot.history) == 1
     row = snapshot.history[0]
     assert (row.seq, row.migration_id, row.status, row.mode) == (
-        1, "contract", "ACTIVE", "restartable"
+        1,
+        "contract",
+        "ACTIVE",
+        "restartable",
     )
     assert row.attempt == 1
     assert row.fingerprint == row.first_fingerprint == FP_A
@@ -265,9 +275,7 @@ def test_admission_completion_and_progress_lifecycle(ready: Adapter):
 
     # A later admission changes only what recovery is allowed to change.
     first = ready.read_snapshot(consistent=True).history[0]
-    ready.update_active_attempt(
-        migration_id="contract", fingerprint=FP_B, language=Language.SQL
-    )
+    ready.update_active_attempt(migration_id="contract", fingerprint=FP_B, language=Language.SQL)
     row = ready.read_snapshot(consistent=True).history[0]
     assert row.attempt == 2
     assert row.fingerprint == FP_B
@@ -291,8 +299,11 @@ def test_admission_completion_and_progress_lifecycle(ready: Adapter):
 def test_success_row_is_inserted_inside_the_callers_transaction(ready: Adapter):
     ready.begin()
     ready.insert_success_row(
-        seq=1, migration_id="atomic-one", fingerprint=FP_A,
-        language=Language.SQL, mode=Mode.ATOMIC,
+        seq=1,
+        migration_id="atomic-one",
+        fingerprint=FP_A,
+        language=Language.SQL,
+        mode=Mode.ATOMIC,
     )
     # Not visible until the caller commits: the row rides the migration's own
     # transaction, which is the whole point of atomic mode.
@@ -301,8 +312,11 @@ def test_success_row_is_inserted_inside_the_callers_transaction(ready: Adapter):
 
     ready.begin()
     ready.insert_success_row(
-        seq=1, migration_id="atomic-one", fingerprint=FP_A,
-        language=Language.SQL, mode=Mode.ATOMIC,
+        seq=1,
+        migration_id="atomic-one",
+        fingerprint=FP_A,
+        language=Language.SQL,
+        mode=Mode.ATOMIC,
     )
     ready.commit()
     row = ready.read_snapshot(consistent=True).history[0]
@@ -324,6 +338,7 @@ def test_a_transition_matching_no_active_row_is_damage(ready: Adapter, transitio
 
 
 # --- engine-owned SQL binding ---------------------------------------------------------
+
 
 def test_bind_narrowing_and_missing_bind_detection(ready: Adapter):
     """Shared SQL is built from a superset of binds; a typo must still fail."""
@@ -353,15 +368,16 @@ class _Dialect:
         self.now_expression = now_expression
 
 
-@pytest.mark.parametrize("paramstyle,now,expected", [
-    # A cast in the timestamp expression must not be mistaken for a placeholder.
-    ("pyformat", "now()::timestamptz", "(%(migration_id)s, now()::timestamptz)"),
-    ("pyformat", "clock_timestamp()", "(%(migration_id)s, clock_timestamp())"),
-    ("named", "SYSTIMESTAMP", "(:migration_id, SYSTIMESTAMP)"),
-])
-def test_placeholders_are_translated_before_the_timestamp_expression(
-    paramstyle, now, expected
-):
+@pytest.mark.parametrize(
+    "paramstyle,now,expected",
+    [
+        # A cast in the timestamp expression must not be mistaken for a placeholder.
+        ("pyformat", "now()::timestamptz", "(%(migration_id)s, now()::timestamptz)"),
+        ("pyformat", "clock_timestamp()", "(%(migration_id)s, clock_timestamp())"),
+        ("named", "SYSTIMESTAMP", "(:migration_id, SYSTIMESTAMP)"),
+    ],
+)
+def test_placeholders_are_translated_before_the_timestamp_expression(paramstyle, now, expected):
     rendered = Adapter._render(
         _Dialect(paramstyle, now), "INSERT INTO t (a, ts) VALUES (:migration_id, {now})"
     )
@@ -370,19 +386,23 @@ def test_placeholders_are_translated_before_the_timestamp_expression(
 
 # --- statement admission --------------------------------------------------------------
 
+
 def test_forbidden_tokens_are_refused_in_every_context(ready: Adapter):
     policy = ready.statement_policy
     token = "COMMIT" if "COMMIT" in policy.forbidden else sorted(policy.forbidden)[0]
     statement = normalize(f"{token} x" if token != "COMMIT" else "COMMIT")
-    for mode, in_batch in ((Mode.ATOMIC, False), (Mode.RESTARTABLE, True),
-                           (Mode.RESTARTABLE, False)):
+    for mode, in_batch in (
+        (Mode.ATOMIC, False),
+        (Mode.RESTARTABLE, True),
+        (Mode.RESTARTABLE, False),
+    ):
         with pytest.raises(UsageError):
             ready.admit_statement(statement, mode=mode, in_batch=in_batch)
 
 
 def test_dml_outside_a_batch_is_refused_in_restartable_mode(ready: Adapter):
     statement = normalize("UPDATE probe_table SET col = 1")
-    with pytest.raises(UsageError, match="outside a ctx.transaction"):
+    with pytest.raises(UsageError, match=r"outside a ctx\.transaction"):
         ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
     # The same statement is admitted inside a batch and in atomic mode.
     ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=True)
@@ -395,12 +415,15 @@ def test_queries_are_admitted_outside_a_batch(ready: Adapter):
     )
 
 
-@pytest.mark.parametrize("sql", [
-    f"DELETE FROM {HISTORY_TABLE}",
-    f"DELETE FROM other_schema.{HISTORY_TABLE}",
-    f'DELETE FROM "{HISTORY_TABLE.upper()}"',
-    f'DELETE FROM "{HISTORY_TABLE}"',
-])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        f"DELETE FROM {HISTORY_TABLE}",
+        f"DELETE FROM other_schema.{HISTORY_TABLE}",
+        f'DELETE FROM "{HISTORY_TABLE.upper()}"',
+        f'DELETE FROM "{HISTORY_TABLE}"',
+    ],
+)
 def test_reserved_metadata_objects_are_refused(ready: Adapter, sql):
     """Every way of naming the object is a reference, quoted or qualified."""
     with pytest.raises(UsageError, match="reserved metadata object"):
@@ -417,14 +440,17 @@ _LOOKALIKE_PROGRESS = f"platfor{PROGRESS_TABLE}"
 _LOOKALIKE_META = f"custo{META_TABLE}"
 
 
-@pytest.mark.parametrize("sql", [
-    f"UPDATE {_LOOKALIKE_HISTORY} SET col = 1",
-    f"SELECT col FROM {_LOOKALIKE_PROGRESS}",
-    # A literal or a comment mentioning the engine table is prose, not a
-    # reference; the lexer already separates both from identifiers.
-    f"INSERT INTO probe_table (col) VALUES ('see {META_TABLE} for details')",
-    f"-- {HISTORY_TABLE} is the engine table; do not touch\nSELECT col FROM probe_table",
-])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        f"UPDATE {_LOOKALIKE_HISTORY} SET col = 1",
+        f"SELECT col FROM {_LOOKALIKE_PROGRESS}",
+        # A literal or a comment mentioning the engine table is prose, not a
+        # reference; the lexer already separates both from identifiers.
+        f"INSERT INTO probe_table (col) VALUES ('see {META_TABLE} for details')",
+        f"-- {HISTORY_TABLE} is the engine table; do not touch\nSELECT col FROM probe_table",
+    ],
+)
 def test_names_that_merely_contain_a_reserved_name_are_admitted(ready: Adapter, sql):
     ready.admit_statement(normalize(sql), mode=Mode.ATOMIC, in_batch=False)
 
@@ -458,6 +484,7 @@ def test_required_object_declarations_are_admitted_or_refused_consistently(ready
 
 # --- error classification ---------------------------------------------------------------
 
+
 def test_a_real_server_error_is_classified_as_definite(ready: Adapter):
     """Only a definite failure may be SERVER_REJECTION; this one is definite."""
     try:
@@ -476,6 +503,7 @@ def test_an_unrecognised_exception_is_treated_as_unknown(ready: Adapter):
 
 
 # --- reporting --------------------------------------------------------------------------
+
 
 def test_capabilities_and_descriptions_are_populated(ready: Adapter):
     caps = ready.capabilities()

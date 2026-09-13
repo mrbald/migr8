@@ -55,27 +55,62 @@ IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9_$#]{0,127}$")
 QUALIFIED_RE = re.compile(r"^[A-Z][A-Z0-9_$#]{0,127}(\.[A-Z][A-Z0-9_$#]{0,127})?$")
 
 #: Object types whose final validity this adapter can check (spec Section 3.2).
-SUPPORTED_REQUIRED_TYPES = frozenset({
-    "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY",
-    "TRIGGER", "VIEW",
-})
+SUPPORTED_REQUIRED_TYPES = frozenset(
+    {
+        "PROCEDURE",
+        "FUNCTION",
+        "PACKAGE",
+        "PACKAGE BODY",
+        "TYPE",
+        "TYPE BODY",
+        "TRIGGER",
+        "VIEW",
+    }
+)
 
 #: Oracle DDL commits independently, so it is never part of atomic work. The
 #: atomic set is the specification's list in Section 5.3.
 _POLICY = StatementPolicy(
-    atomic=frozenset({
-        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "LOCK",
-        "DECLARE", "BEGIN",
-    }),
+    atomic=frozenset(
+        {
+            "SELECT",
+            "WITH",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "MERGE",
+            "LOCK",
+            "DECLARE",
+            "BEGIN",
+        }
+    ),
     query=frozenset({"SELECT", "WITH"}),
     procedural=frozenset({"DECLARE", "BEGIN"}),
-    ddl=frozenset({
-        "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT", "ANALYZE",
-    }),
-    forbidden=frozenset({
-        "COMMIT", "ROLLBACK", "SAVEPOINT", "SET", "GRANT", "REVOKE", "AUDIT",
-        "NOAUDIT", "PURGE", "FLASHBACK",
-    }),
+    ddl=frozenset(
+        {
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "TRUNCATE",
+            "RENAME",
+            "COMMENT",
+            "ANALYZE",
+        }
+    ),
+    forbidden=frozenset(
+        {
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "SET",
+            "GRANT",
+            "REVOKE",
+            "AUDIT",
+            "NOAUDIT",
+            "PURGE",
+            "FLASHBACK",
+        }
+    ),
     allows_plsql=True,
 )
 
@@ -84,38 +119,42 @@ _X_MODE = 6
 
 #: ORA codes that mean the transport or session is gone, so an in-flight
 #: commit-capable call has an unknown outcome.  Kept narrow and justified.
-TRANSPORT_ORA_CODES = frozenset({
-    28,     # your session has been killed
-    1012,   # not logged on
-    1089,   # immediate shutdown in progress
-    1092,   # instance terminated
-    3106,   # fatal two-task communication protocol error
-    3113,   # end-of-file on communication channel
-    3114,   # not connected to ORACLE
-    3135,   # connection lost contact
-    12152,  # TNS: unable to send break message
-    12537,  # TNS: connection closed
-    12571,  # TNS: packet writer failure
-})
+TRANSPORT_ORA_CODES = frozenset(
+    {
+        28,  # your session has been killed
+        1012,  # not logged on
+        1089,  # immediate shutdown in progress
+        1092,  # instance terminated
+        3106,  # fatal two-task communication protocol error
+        3113,  # end-of-file on communication channel
+        3114,  # not connected to ORACLE
+        3135,  # connection lost contact
+        12152,  # TNS: unable to send break message
+        12537,  # TNS: connection closed
+        12571,  # TNS: packet writer failure
+    }
+)
 
 
 #: python-oracledb errors raised before anything is sent to the server.  An
 #: unlisted DPY code stays conservative (unknown outcome) on purpose.
-CLIENT_SIDE_DPY_CODES = frozenset({
-    "DPY-2002",  # cursor is not open
-    "DPY-2005",  # invalid dictionary value
-    "DPY-2006",  # invalid number of array elements
-    "DPY-2008",  # invalid parameter type / value
-    "DPY-2009",  # invalid number of positional parameters
-    "DPY-2010",  # invalid keyword parameter
-    "DPY-3002",  # percent-style placeholders are not supported
-    "DPY-3003",  # named bind placeholders are required
-    "DPY-3004",  # data type is not supported
-    "DPY-3005",  # operation is not supported in this mode
-    "DPY-4008",  # no bind placeholder with the given name was found
-    "DPY-4009",  # missing positional bind variable value
-    "DPY-4010",  # a bind variable replacement value was not provided
-})
+CLIENT_SIDE_DPY_CODES = frozenset(
+    {
+        "DPY-2002",  # cursor is not open
+        "DPY-2005",  # invalid dictionary value
+        "DPY-2006",  # invalid number of array elements
+        "DPY-2008",  # invalid parameter type / value
+        "DPY-2009",  # invalid number of positional parameters
+        "DPY-2010",  # invalid keyword parameter
+        "DPY-3002",  # percent-style placeholders are not supported
+        "DPY-3003",  # named bind placeholders are required
+        "DPY-3004",  # data type is not supported
+        "DPY-3005",  # operation is not supported in this mode
+        "DPY-4008",  # no bind placeholder with the given name was found
+        "DPY-4009",  # missing positional bind variable value
+        "DPY-4010",  # a bind variable replacement value was not provided
+    }
+)
 
 
 def _require_identifier(value: str, what: str) -> str:
@@ -133,7 +172,7 @@ class OracleAdapter(Adapter):
     name = ADAPTER_NAME
     driver_error = oracledb.Error
 
-    # --- dialect ---------------------------------------------------------------
+    # --- dialect ----------------------------------------------------------------------------------
 
     paramstyle = "named"
     now_expression = "SYSTIMESTAMP"
@@ -169,7 +208,7 @@ class OracleAdapter(Adapter):
         lock = config.lock
         if lock.provider != "dbms_lock":
             raise ConfigError(
-                f"the oracle adapter requires lock.provider = \"dbms_lock\", got "
+                f'the oracle adapter requires lock.provider = "dbms_lock", got '
                 f"{lock.provider!r}; the engine will not fall back to an ineffective lock"
             )
         if lock.id is None:
@@ -178,8 +217,7 @@ class OracleAdapter(Adapter):
         package = lock.package or "SYS.DBMS_LOCK"
         if not QUALIFIED_RE.match(package.upper()) or package.upper() != package:
             raise ConfigError(
-                f"lock.package must be an unquoted uppercase [schema.]package name, got "
-                f"{package!r}"
+                f"lock.package must be an unquoted uppercase [schema.]package name, got {package!r}"
             )
         self._lock_package = package
         self._lock_timeout = min(lock.timeout_seconds, 32767)
@@ -191,7 +229,7 @@ class OracleAdapter(Adapter):
         self._session_identity: str | None = None
         self._commit_wait_note = "not established"
 
-    # --- reporting ----------------------------------------------------------------
+    # --- reporting --------------------------------------------------------------------------------
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -225,7 +263,7 @@ class OracleAdapter(Adapter):
     def session_identity(self) -> str | None:
         return self._session_identity
 
-    # --- lifecycle -----------------------------------------------------------------
+    # --- lifecycle --------------------------------------------------------------------------------
 
     def connect(self) -> None:
         password = self.config.password()
@@ -273,17 +311,17 @@ class OracleAdapter(Adapter):
             try:
                 cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._schema}"')
             except oracledb.Error as exc:
-                raise UsageError(
-                    f"cannot set CURRENT_SCHEMA to {self._schema}: {exc}"
-                ) from exc
+                raise UsageError(f"cannot set CURRENT_SCHEMA to {self._schema}: {exc}") from exc
         self._verify_namespace_access()
 
     def _probe_commit_wait(self) -> str:
         """Attempt a read-back and report honestly when it is unavailable."""
         try:
-            row = self._cursor().execute(
-                "SELECT value FROM v$parameter WHERE name = 'commit_wait'"
-            ).fetchone()
+            row = (
+                self._cursor()
+                .execute("SELECT value FROM v$parameter WHERE name = 'commit_wait'")
+                .fetchone()
+            )
         except oracledb.Error as exc:
             code = getattr(exc.args[0], "code", 0) if exc.args else 0
             return (
@@ -310,6 +348,7 @@ class OracleAdapter(Adapter):
             ) from exc
 
     def _read_banner(self) -> str:
+        assert self._conn is not None
         cursor = self._cursor()
         try:
             row = cursor.execute("SELECT banner_full FROM v$version").fetchone()
@@ -371,7 +410,7 @@ class OracleAdapter(Adapter):
         finally:
             self._conn = None
 
-    # --- namespace lock --------------------------------------------------------------
+    # --- namespace lock ---------------------------------------------------------------------------
 
     def acquire_lock(self) -> None:
         if self._lock_held:
@@ -383,7 +422,9 @@ class OracleAdapter(Adapter):
                 f"BEGIN :result := {self._lock_package}.REQUEST("
                 "id => :lock_id, lockmode => :mode, timeout => :timeout, "
                 "release_on_commit => FALSE); END;",
-                result=result, lock_id=self._lock_id, mode=_X_MODE,
+                result=result,
+                lock_id=self._lock_id,
+                mode=_X_MODE,
                 timeout=self._lock_timeout,
             )
         except oracledb.Error as exc:
@@ -429,14 +470,15 @@ class OracleAdapter(Adapter):
         try:
             cursor.execute(
                 f"BEGIN :result := {self._lock_package}.RELEASE(id => :lock_id); END;",
-                result=result, lock_id=self._lock_id,
+                result=result,
+                lock_id=self._lock_id,
             )
         except oracledb.Error as exc:
             LOGGER.warning("releasing migration lock %s failed: %s", self._lock_id, exc)
         finally:
             self._lock_held = False
 
-    # --- internals ---------------------------------------------------------------------
+    # --- internals --------------------------------------------------------------------------------
 
     def _cursor(self) -> oracledb.Cursor:
         if self._conn is None:
@@ -451,7 +493,7 @@ class OracleAdapter(Adapter):
         """
         return self.metadata_name(name)
 
-    # --- engine-owned SQL path, transactions and admission policy ---------------
+    # --- engine-owned SQL path, transactions and admission policy ---------------------------------
 
     def _metadata_execute(self, sql: str, params) -> int:
         cursor = self._cursor()
@@ -468,17 +510,18 @@ class OracleAdapter(Adapter):
         return
 
     def _do_commit(self) -> None:
+        assert self._conn is not None
         self._conn.commit()
 
     def _do_rollback(self) -> None:
+        assert self._conn is not None
         self._conn.rollback()
 
     @property
     def statement_policy(self) -> StatementPolicy:
         return _POLICY
 
-    def _extra_statement_checks(self, statement: Statement, *, mode: Mode,
-                               in_batch: bool) -> None:
+    def _extra_statement_checks(self, statement: Statement, *, mode: Mode, in_batch: bool) -> None:
         """ALTER SESSION and ALTER SYSTEM change state the engine owns."""
         lead = statement.lead
         if len(lead) >= 2 and lead[0] == "ALTER" and lead[1] in ("SESSION", "SYSTEM"):
@@ -487,18 +530,23 @@ class OracleAdapter(Adapter):
                 "admitted through the facade"
             )
 
-    # --- metadata ----------------------------------------------------------------------
+    # --- metadata ---------------------------------------------------------------------------------
 
     def _objects_present(self) -> set[str]:
         """Oracle stores these folded to upper case; fold back to logical names."""
         names = [n.upper() for n in md.CREATION_ORDER]
         placeholders = ", ".join(f":n{i}" for i in range(len(names)))
         binds = {f"n{i}": name for i, name in enumerate(names)}
-        rows = self._cursor().execute(
-            "SELECT object_name FROM all_objects WHERE owner = :owner AND object_type IN "
-            f"('TABLE','INDEX') AND object_name IN ({placeholders})",
-            owner=self._schema, **binds,
-        ).fetchall()
+        rows = (
+            self._cursor()
+            .execute(
+                "SELECT object_name FROM all_objects WHERE owner = :owner AND object_type IN "
+                f"('TABLE','INDEX') AND object_name IN ({placeholders})",
+                owner=self._schema,
+                **binds,
+            )
+            .fetchall()
+        )
         return {row[0].lower() for row in rows}
 
     def _definition_problems(self, present: set[str]) -> list[str]:
@@ -506,16 +554,24 @@ class OracleAdapter(Adapter):
         for table, expected in _EXPECTED_COLUMNS.items():
             if table not in present:
                 continue
-            rows = self._cursor().execute(
-                "SELECT column_name, data_type, char_length, char_used, nullable, "
-                "data_precision, data_scale FROM all_tab_columns "
-                "WHERE owner = :owner AND table_name = :name ORDER BY column_id",
-                owner=self._schema, name=table.upper(),
-            ).fetchall()
+            rows = (
+                self._cursor()
+                .execute(
+                    "SELECT column_name, data_type, char_length, char_used, nullable, "
+                    "data_precision, data_scale FROM all_tab_columns "
+                    "WHERE owner = :owner AND table_name = :name ORDER BY column_id",
+                    owner=self._schema,
+                    name=table.upper(),
+                )
+                .fetchall()
+            )
             actual = tuple(
                 (
-                    row[0], row[1],
-                    int(row[2] or 0), row[3], row[4],
+                    row[0],
+                    row[1],
+                    int(row[2] or 0),
+                    row[3],
+                    row[4],
                     int(row[5]) if row[5] is not None else None,
                     int(row[6]) if row[6] is not None else None,
                 )
@@ -523,8 +579,7 @@ class OracleAdapter(Adapter):
             )
             if actual != expected:
                 problems.append(
-                    f"{table} column layout does not match the supported layout. Found: "
-                    f"{actual}"
+                    f"{table} column layout does not match the supported layout. Found: {actual}"
                 )
         problems.extend(self._constraint_problems(present))
         problems.extend(self._index_problems(present))
@@ -535,19 +590,23 @@ class OracleAdapter(Adapter):
         for table, expected in _EXPECTED_CONSTRAINTS.items():
             if table not in present:
                 continue
-            rows = self._cursor().execute(
-                "SELECT c.constraint_type, c.status, c.validated, c.search_condition, "
-                "  (SELECT LISTAGG(cc.column_name, ',') WITHIN GROUP (ORDER BY cc.position) "
-                "     FROM all_cons_columns cc "
-                "    WHERE cc.owner = c.owner AND cc.constraint_name = c.constraint_name) "
-                "FROM all_constraints c "
-                "WHERE c.owner = :owner AND c.table_name = :name",
-                owner=self._schema, name=table.upper(),
-            ).fetchall()
+            rows = (
+                self._cursor()
+                .execute(
+                    "SELECT c.constraint_type, c.status, c.validated, c.search_condition, "
+                    "  (SELECT LISTAGG(cc.column_name, ',') WITHIN GROUP (ORDER BY cc.position) "
+                    "     FROM all_cons_columns cc "
+                    "    WHERE cc.owner = c.owner AND cc.constraint_name = c.constraint_name) "
+                    "FROM all_constraints c "
+                    "WHERE c.owner = :owner AND c.table_name = :name",
+                    owner=self._schema,
+                    name=table.upper(),
+                )
+                .fetchall()
+            )
             # Compare normalised semantics, not database-generated names.
             found_keys = {
-                (row[0], (row[4] or "").upper())
-                for row in rows if row[0] in ("P", "U", "R")
+                (row[0], (row[4] or "").upper()) for row in rows if row[0] in ("P", "U", "R")
             }
             for kind, columns in expected["keys"]:
                 if (kind, columns) not in found_keys:
@@ -581,11 +640,16 @@ class OracleAdapter(Adapter):
         if ACTIVE_INDEX not in present:
             return []
         problems: list[str] = []
-        row = self._cursor().execute(
-            "SELECT uniqueness, status, funcidx_status, table_name FROM all_indexes "
-            "WHERE owner = :owner AND index_name = :name",
-            owner=self._schema, name=ACTIVE_INDEX.upper(),
-        ).fetchone()
+        row = (
+            self._cursor()
+            .execute(
+                "SELECT uniqueness, status, funcidx_status, table_name FROM all_indexes "
+                "WHERE owner = :owner AND index_name = :name",
+                owner=self._schema,
+                name=ACTIVE_INDEX.upper(),
+            )
+            .fetchone()
+        )
         if row is None:
             return [f"{ACTIVE_INDEX} is not visible in ALL_INDEXES"]
         uniqueness, status, funcidx, table_name = row
@@ -597,30 +661,37 @@ class OracleAdapter(Adapter):
             problems.append(f"{ACTIVE_INDEX} status is {status}, not VALID")
         if funcidx not in (None, "ENABLED"):
             problems.append(f"{ACTIVE_INDEX} function-based status is {funcidx}, not ENABLED")
-        expression = self._cursor().execute(
-            "SELECT column_expression FROM all_ind_expressions "
-            "WHERE index_owner = :owner AND index_name = :name ORDER BY column_position",
-            owner=self._schema, name=ACTIVE_INDEX.upper(),
-        ).fetchall()
+        expression = (
+            self._cursor()
+            .execute(
+                "SELECT column_expression FROM all_ind_expressions "
+                "WHERE index_owner = :owner AND index_name = :name ORDER BY column_position",
+                owner=self._schema,
+                name=ACTIVE_INDEX.upper(),
+            )
+            .fetchall()
+        )
         rendered = " ".join(
-            (value[0].read() if hasattr(value[0], "read") else str(value[0])) for value in expression
+            (value[0].read() if hasattr(value[0], "read") else str(value[0]))
+            for value in expression
         )
         normalised = md.normalise_definition(rendered)
         if "STATUS" not in normalised or "ACTIVE" not in normalised:
             problems.append(
-                f"{ACTIVE_INDEX} expression does not restrict to status='ACTIVE': "
-                f"{rendered!r}"
+                f"{ACTIVE_INDEX} expression does not restrict to status='ACTIVE': {rendered!r}"
             )
         return problems
 
     def _create_metadata_object(self, name: str) -> None:
         """Oracle DDL commits independently, so the CREATE is its own durable step."""
-        self._cursor().execute(_DDL[name].format(
-            history=self._q(HISTORY_TABLE),
-            progress=self._q(PROGRESS_TABLE),
-            meta=self._q(META_TABLE),
-            index=self._q(ACTIVE_INDEX),
-        ))
+        self._cursor().execute(
+            _DDL[name].format(
+                history=self._q(HISTORY_TABLE),
+                progress=self._q(PROGRESS_TABLE),
+                meta=self._q(META_TABLE),
+                index=self._q(ACTIVE_INDEX),
+            )
+        )
 
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
         """Read history, progress and the marker in one statement.
@@ -632,13 +703,17 @@ class OracleAdapter(Adapter):
         has just created metadata or executed migration DDL, and would make
         ``status`` fail during exactly the long migration it is meant to observe.
         """
-        rows = self._cursor().execute(
-            _SNAPSHOT_SQL.format(
-                history=self._q(HISTORY_TABLE),
-                progress=self._q(PROGRESS_TABLE),
-                meta=self._q(META_TABLE),
+        rows = (
+            self._cursor()
+            .execute(
+                _SNAPSHOT_SQL.format(
+                    history=self._q(HISTORY_TABLE),
+                    progress=self._q(PROGRESS_TABLE),
+                    meta=self._q(META_TABLE),
+                )
             )
-        ).fetchall()
+            .fetchall()
+        )
 
         history: list = []
         progress: list = []
@@ -648,29 +723,48 @@ class OracleAdapter(Adapter):
             kind = row[0]
             payload = [_lob(value) for value in row[2:]]
             if kind == "H":
-                history.append(md.history_row(
-                    (
-                        int(row[1]), payload[0], payload[1], payload[2], payload[3],
-                        payload[4], payload[5],
-                        None if payload[6] is None else int(payload[6]),
-                        payload[7], payload[8], payload[9], payload[10], payload[11],
-                        None if payload[12] is None else int(payload[12]),
-                        payload[13], payload[14],
-                    ),
-                    md.parse_iso_timestamp,
-                ))
+                history.append(
+                    md.history_row(
+                        (
+                            int(row[1]),
+                            payload[0],
+                            payload[1],
+                            payload[2],
+                            payload[3],
+                            payload[4],
+                            payload[5],
+                            None if payload[6] is None else int(payload[6]),
+                            payload[7],
+                            payload[8],
+                            payload[9],
+                            payload[10],
+                            payload[11],
+                            None if payload[12] is None else int(payload[12]),
+                            payload[13],
+                            payload[14],
+                        ),
+                        md.parse_iso_timestamp,
+                    )
+                )
             elif kind == "P":
-                progress.append(md.progress_row(
-                    (payload[0], payload[1], payload[2], payload[3]),
-                    md.parse_iso_timestamp,
-                ))
+                progress.append(
+                    md.progress_row(
+                        (payload[0], payload[1], payload[2], payload[3]),
+                        md.parse_iso_timestamp,
+                    )
+                )
             else:
                 meta_rows += 1
                 if payload[0] == META_SINGLETON_KEY:
                     meta = md.meta_row(
                         (
-                            payload[0], int(payload[1]), payload[2], payload[3],
-                            payload[4], payload[5], payload[6],
+                            payload[0],
+                            int(payload[1]),
+                            payload[2],
+                            payload[3],
+                            payload[4],
+                            payload[5],
+                            payload[6],
                         ),
                         md.parse_iso_timestamp,
                     )
@@ -680,7 +774,7 @@ class OracleAdapter(Adapter):
             )
         return Snapshot(history=tuple(history), progress=tuple(progress), meta=meta)
 
-    # --- transaction control --------------------------------------------------------------
+    # --- transaction control ----------------------------------------------------------------------
 
     def has_open_transaction(self) -> bool:
         """Oracle assigns a local transaction id only once a write happens.
@@ -692,7 +786,7 @@ class OracleAdapter(Adapter):
         """
         return self.read_transaction_identity() is not None
 
-    # --- transaction identity ----------------------------------------------------------------
+    # --- transaction identity ---------------------------------------------------------------------
 
     def establish_transaction_identity(self) -> str | None:
         cursor = self._cursor()
@@ -716,7 +810,7 @@ class OracleAdapter(Adapter):
         )
         return holder.getvalue() or None
 
-    # --- admission -----------------------------------------------------------------------------
+    # --- admission --------------------------------------------------------------------------------
 
     def admit_required_objects(self, required: tuple[RequiredObject, ...]) -> None:
         """Accept only declaration types this adapter can actually resolve.
@@ -745,8 +839,9 @@ class OracleAdapter(Adapter):
     def executemany(self, statement: Statement, parameter_sets: list[object]) -> int:
         cursor = self._cursor()
         # Raise on the first error rather than silently collecting row errors.
-        cursor.executemany(statement.text, parameter_sets, batcherrors=False,
-                           arraydmlrowcounts=False)
+        cursor.executemany(
+            statement.text, parameter_sets, batcherrors=False, arraydmlrowcounts=False
+        )
         return max(cursor.rowcount, 0)
 
     def execute_ddl(self, statement: Statement) -> None:
@@ -774,14 +869,16 @@ class OracleAdapter(Adapter):
             binds[f"t{index}"] = obj.type
             binds[f"n{index}"] = obj.name
         try:
-            rows = self._cursor().execute(
-                _REQUIRED_SQL.format(branches=branches), **binds
-            ).fetchall()
+            rows = (
+                self._cursor().execute(_REQUIRED_SQL.format(branches=branches), **binds).fetchall()
+            )
         except oracledb.Error as exc:
-            return ValidityResult(failures=(
-                f"required-object inspection failed: {exc}. An inaccessible probe is an "
-                "error, not evidence that the object is absent.",
-            ))
+            return ValidityResult(
+                failures=(
+                    f"required-object inspection failed: {exc}. An inaccessible probe is an "
+                    "error, not evidence that the object is absent.",
+                )
+            )
         for otype, oname, status, exact_count, other_types, hard, soft in rows:
             qualified = f"{otype} {self._schema}.{oname}"
             if exact_count == 0:
@@ -793,8 +890,7 @@ class OracleAdapter(Adapter):
                     )
                 else:
                     failures.append(
-                        f"{qualified} does not exist or is not visible with the current "
-                        "privileges"
+                        f"{qualified} does not exist or is not visible with the current privileges"
                     )
                 continue
             if exact_count > 1:
@@ -825,28 +921,31 @@ class OracleAdapter(Adapter):
     def _error_text(self, name: str, obj_type: str, *, attribute: str) -> str:
         """Fetch diagnostic text for an already-decided verdict."""
         try:
-            rows = self._cursor().execute(
-                "SELECT line, position, text FROM all_errors WHERE owner = :owner AND "
-                "name = :name AND type = :type AND attribute = :attribute "
-                "ORDER BY sequence FETCH FIRST 3 ROWS ONLY",
-                owner=self._schema, name=name, type=obj_type, attribute=attribute,
-            ).fetchall()
+            rows = (
+                self._cursor()
+                .execute(
+                    "SELECT line, position, text FROM all_errors WHERE owner = :owner AND "
+                    "name = :name AND type = :type AND attribute = :attribute "
+                    "ORDER BY sequence FETCH FIRST 3 ROWS ONLY",
+                    owner=self._schema,
+                    name=name,
+                    type=obj_type,
+                    attribute=attribute,
+                )
+                .fetchall()
+            )
         except oracledb.Error:
             return "(compiler messages are not readable with the current privileges)"
         if not rows:
             return "(no compiler message recorded)"
-        return "; ".join(
-            f"line {row[0]}:{row[1]} {str(_lob(row[2])).strip()}" for row in rows
-        )
+        return "; ".join(f"line {row[0]}:{row[1]} {str(_lob(row[2])).strip()}" for row in rows)
 
-    # --- diagnostics -----------------------------------------------------------------------------------
+    # --- diagnostics ------------------------------------------------------------------------------
 
     def probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
         if not db_session:
             return ("unknown", "no session identity was recorded for the latest attempt")
-        fields = dict(
-            part.split("=", 1) for part in db_session.split(",") if "=" in part
-        )
+        fields = dict(part.split("=", 1) for part in db_session.split(",") if "=" in part)
         if fields.get("serial") in (None, "unavailable"):
             return (
                 "unknown",
@@ -854,10 +953,15 @@ class OracleAdapter(Adapter):
                 "established; a reusable SID alone is not an identity",
             )
         try:
-            row = self._cursor().execute(
-                "SELECT COUNT(*) FROM v$session WHERE sid = :sid AND serial# = :serial",
-                sid=int(fields["sid"]), serial=int(fields["serial"]),
-            ).fetchone()
+            row = (
+                self._cursor()
+                .execute(
+                    "SELECT COUNT(*) FROM v$session WHERE sid = :sid AND serial# = :serial",
+                    sid=int(fields["sid"]),
+                    serial=int(fields["serial"]),
+                )
+                .fetchone()
+            )
         except oracledb.Error as exc:
             return ("unknown", f"v$session is not readable with the current privileges: {exc}")
         verdict = "present" if row and row[0] else "absent"
@@ -867,7 +971,7 @@ class OracleAdapter(Adapter):
             "lock; the instance is not cross-checked by this probe",
         )
 
-    # --- error classification ----------------------------------------------------------------------------
+    # --- error classification ---------------------------------------------------------------------
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
         """Classify a driver exception conservatively.
@@ -899,7 +1003,7 @@ class OracleAdapter(Adapter):
         return OutcomeClass.COMMUNICATION_FAILURE
 
 
-# --- helpers ---------------------------------------------------------------------------------------------
+# --- helpers --------------------------------------------------------------------------------------
 
 _KIND_NAMES = {"P": "primary key", "U": "unique key", "R": "foreign key"}
 
@@ -912,7 +1016,8 @@ def _lob(value):
 _TS = "TO_CHAR({column}, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF6TZH:TZM')"
 
 #: One statement, so the whole metadata read is consistent without a transaction.
-_SNAPSHOT_SQL = """
+_SNAPSHOT_SQL = (
+    """
 SELECT 'H' AS kind, seq AS ord,
        migration_id AS c1, fingerprint AS c2, first_fingerprint AS c3,
        language AS c4, "MODE" AS c5, status AS c6, TO_CHAR(attempt) AS c7,
@@ -932,11 +1037,12 @@ SELECT 'M', 0,
        NULL, NULL
   FROM {meta}
 ORDER BY 1, 2
-""".replace("{ts_started}", _TS.format(column="started_at")) \
-   .replace("{ts_last}", _TS.format(column="last_attempt_at")) \
-   .replace("{ts_finished}", _TS.format(column="finished_at")) \
-   .replace("{ts_updated}", _TS.format(column="updated_at")) \
-   .replace("{ts_initialized}", _TS.format(column="initialized_at"))
+""".replace("{ts_started}", _TS.format(column="started_at"))
+    .replace("{ts_last}", _TS.format(column="last_attempt_at"))
+    .replace("{ts_finished}", _TS.format(column="finished_at"))
+    .replace("{ts_updated}", _TS.format(column="updated_at"))
+    .replace("{ts_initialized}", _TS.format(column="initialized_at"))
+)
 
 #: One statement for the whole declared set, so the verdict is a consistent read.
 _REQUIRED_SQL = """
@@ -1067,7 +1173,7 @@ _EXPECTED_COLUMNS = {
     ),
 }
 
-_EXPECTED_CONSTRAINTS = {
+_EXPECTED_CONSTRAINTS: dict[str, md.ExpectedConstraints] = {
     HISTORY_TABLE: {
         "keys": (("P", "MIGRATION_ID"), ("U", "SEQ")),
         "checks": (

@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from typing import Any
 
 import psycopg
 
@@ -51,20 +52,52 @@ IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_$]{0,62}$")
 #: rather than smuggled in. Statements that cannot run inside a transaction
 #: block are refused there and belong to ctx.ddl() in a restartable migration.
 _POLICY = StatementPolicy(
-    atomic=frozenset({
-        "SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE", "LOCK",
-        "CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "DO",
-    }),
+    atomic=frozenset(
+        {
+            "SELECT",
+            "WITH",
+            "VALUES",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "MERGE",
+            "LOCK",
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "TRUNCATE",
+            "COMMENT",
+            "DO",
+        }
+    ),
     query=frozenset({"SELECT", "WITH", "VALUES"}),
     procedural=frozenset({"DO", "CALL"}),
     ddl=frozenset({"CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "REINDEX"}),
-    forbidden=frozenset({
-        "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "START",
-        "SET", "RESET", "DISCARD", "LISTEN", "NOTIFY", "GRANT", "REVOKE",
-        "VACUUM", "PREPARE", "DEALLOCATE", "COPY",
-    }),
+    forbidden=frozenset(
+        {
+            "BEGIN",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "RELEASE",
+            "START",
+            "SET",
+            "RESET",
+            "DISCARD",
+            "LISTEN",
+            "NOTIFY",
+            "GRANT",
+            "REVOKE",
+            "VACUUM",
+            "PREPARE",
+            "DEALLOCATE",
+            "COPY",
+        }
+    ),
     allows_plsql=False,
 )
+
 
 def _require_identifier(value: str, what: str) -> str:
     lower = value.lower()
@@ -80,7 +113,7 @@ class PostgresAdapter(Adapter):
     name = ADAPTER_NAME
     driver_error = psycopg.Error
 
-    # --- dialect ---------------------------------------------------------------
+    # --- dialect ----------------------------------------------------------------------------------
 
     paramstyle = "pyformat"
     now_expression = "clock_timestamp()"
@@ -120,7 +153,7 @@ class PostgresAdapter(Adapter):
         self._session_identity: str | None = None
         self._synchronous_commit = "not established"
 
-    # --- reporting ------------------------------------------------------------
+    # --- reporting --------------------------------------------------------------------------------
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -138,8 +171,7 @@ class PostgresAdapter(Adapter):
                 "DDL commits are NOT emulated.",
                 "Statements that cannot run inside a transaction block, such as CREATE "
                 "INDEX CONCURRENTLY, are executed outside one by ctx.ddl().",
-                "Transaction identity uses pg_current_xact_id / "
-                "pg_current_xact_id_if_assigned.",
+                "Transaction identity uses pg_current_xact_id / pg_current_xact_id_if_assigned.",
                 "Nonempty Oracle-style require_valid lists are rejected.",
                 f"psycopg {psycopg.__version__}; server {self._banner}.",
             ),
@@ -157,7 +189,7 @@ class PostgresAdapter(Adapter):
     def session_identity(self) -> str | None:
         return self._session_identity
 
-    # --- lifecycle -------------------------------------------------------------
+    # --- lifecycle --------------------------------------------------------------------------------
 
     def connect(self) -> None:
         password = self.config.password()
@@ -245,16 +277,14 @@ class PostgresAdapter(Adapter):
         finally:
             self._conn = None
 
-    # --- namespace lock ---------------------------------------------------------
+    # --- namespace lock ---------------------------------------------------------------------------
 
     def acquire_lock(self) -> None:
         if self._lock_held:
             raise UsageError("the namespace lock is already held by this run")
         deadline = time.monotonic() + self._lock_timeout
         while True:
-            row = self._db.execute(
-                "SELECT pg_try_advisory_lock(%s)", (self._lock_id,)
-            ).fetchone()
+            row = self._db.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_id,)).fetchone()
             if row and row[0]:
                 self._lock_held = True
                 return
@@ -277,15 +307,15 @@ class PostgresAdapter(Adapter):
         finally:
             self._lock_held = False
 
-    # --- internals ---------------------------------------------------------------
+    # --- internals --------------------------------------------------------------------------------
 
     @property
-    def _db(self) -> psycopg.Connection:
+    def _db(self) -> psycopg.Connection[tuple[Any, ...]]:
         if self._conn is None:
             raise UsageError("the PostgreSQL session is not connected")
         return self._conn
 
-    # --- engine-owned SQL path, transactions and admission policy ------------------
+    # --- engine-owned SQL path, transactions and admission policy ---------------------------------
 
     def _metadata_execute(self, sql: str, params) -> int:
         cursor = self._db.execute(sql, dict(params))
@@ -308,8 +338,7 @@ class PostgresAdapter(Adapter):
     def statement_policy(self) -> StatementPolicy:
         return _POLICY
 
-    def _extra_statement_checks(self, statement: Statement, *, mode: Mode,
-                               in_batch: bool) -> None:
+    def _extra_statement_checks(self, statement: Statement, *, mode: Mode, in_batch: bool) -> None:
         """CONCURRENTLY cannot run inside a transaction block."""
         if (mode is Mode.ATOMIC or in_batch) and _is_concurrent(statement):
             raise UsageError(
@@ -317,7 +346,7 @@ class PostgresAdapter(Adapter):
                 "use ctx.ddl() in a restartable migration"
             )
 
-    # --- metadata ------------------------------------------------------------------
+    # --- metadata ---------------------------------------------------------------------------------
 
     def _objects_present(self) -> set[str]:
         rows = self._db.execute(
@@ -343,8 +372,7 @@ class PostgresAdapter(Adapter):
             actual = tuple((row[0], row[1], row[2]) for row in rows)
             if actual != expected:
                 problems.append(
-                    f"{table} column layout does not match the supported layout. "
-                    f"Found: {actual}"
+                    f"{table} column layout does not match the supported layout. Found: {actual}"
                 )
         problems.extend(self._constraint_problems(present))
         problems.extend(self._index_problems(present))
@@ -376,7 +404,8 @@ class PostgresAdapter(Adapter):
                     )
             checks = [
                 (md.normalise_definition(row[2], drop_parens=True), row[1])
-                for row in rows if row[0] == "c"
+                for row in rows
+                if row[0] == "c"
             ]
             for fragment in expected["checks"]:
                 matches = [item for item in checks if fragment in item[0]]
@@ -388,9 +417,7 @@ class PostgresAdapter(Adapter):
                     continue
                 for _definition, validated in matches:
                     if not validated:
-                        problems.append(
-                            f"{table} check constraint for {fragment!r} is NOT VALID"
-                        )
+                        problems.append(f"{table} check constraint for {fragment!r} is NOT VALID")
         return problems
 
     def _index_problems(self, present: set[str]) -> list[str]:
@@ -417,9 +444,7 @@ class PostgresAdapter(Adapter):
             problems.append(f"{ACTIVE_INDEX} is not valid and ready")
         normalised = md.normalise_definition(definition, drop_parens=True)
         if "WHERE" not in normalised or "ACTIVE" not in normalised:
-            problems.append(
-                f"{ACTIVE_INDEX} is not restricted to status='ACTIVE': {definition!r}"
-            )
+            problems.append(f"{ACTIVE_INDEX} is not restricted to status='ACTIVE': {definition!r}")
         return problems
 
     def _create_metadata_object(self, name: str) -> None:
@@ -428,14 +453,16 @@ class PostgresAdapter(Adapter):
         Oracle's implicit DDL commits are not emulated.
         """
         self.begin()
-        self._db.execute(_DDL[name].format(
-            history=self.metadata_name(HISTORY_TABLE),
-            progress=self.metadata_name(PROGRESS_TABLE),
-            meta=self.metadata_name(META_TABLE),
-            # CREATE INDEX takes a bare name; PostgreSQL puts the index in the
-            # schema of the table it indexes.
-            index=self.quoted(self._physical_object_name(ACTIVE_INDEX)),
-        ))
+        self._db.execute(
+            _DDL[name].format(
+                history=self.metadata_name(HISTORY_TABLE),
+                progress=self.metadata_name(PROGRESS_TABLE),
+                meta=self.metadata_name(META_TABLE),
+                # CREATE INDEX takes a bare name; PostgreSQL puts the index in the
+                # schema of the table it indexes.
+                index=self.quoted(self._physical_object_name(ACTIVE_INDEX)),
+            )
+        )
         self.durable_commit(Boundary.METADATA_OBJECT_CREATED)
 
     def read_snapshot(self, *, consistent: bool) -> Snapshot:
@@ -472,14 +499,14 @@ class PostgresAdapter(Adapter):
                 conn.execute("COMMIT")
         return Snapshot(history=history, progress=progress, meta=meta)
 
-    # --- transaction control ------------------------------------------------------
+    # --- transaction control ----------------------------------------------------------------------
 
     def has_open_transaction(self) -> bool:
         if self._conn is None:
             return False
         return self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE
 
-    # --- transaction identity ------------------------------------------------------
+    # --- transaction identity ---------------------------------------------------------------------
 
     def establish_transaction_identity(self) -> str | None:
         row = self._db.execute("SELECT pg_current_xact_id()::text").fetchone()
@@ -493,12 +520,10 @@ class PostgresAdapter(Adapter):
     def read_transaction_identity(self) -> str | None:
         if not self.has_open_transaction():
             return None
-        row = self._db.execute(
-            "SELECT pg_current_xact_id_if_assigned()::text"
-        ).fetchone()
+        row = self._db.execute("SELECT pg_current_xact_id_if_assigned()::text").fetchone()
         return None if row is None or row[0] is None else str(row[0])
 
-    # --- execution ------------------------------------------------------------------------
+    # --- execution --------------------------------------------------------------------------------
 
     def _run(self, text: str, params: object | None):
         return self._db.execute(text, _bind(params))
@@ -517,7 +542,7 @@ class PostgresAdapter(Adapter):
             return
         super().execute_ddl(statement)
 
-    # --- diagnostics ------------------------------------------------------------------------
+    # --- diagnostics ------------------------------------------------------------------------------
 
     def probe_session_liveness(self, db_session: str | None) -> tuple[str, str]:
         if not db_session:
@@ -541,7 +566,7 @@ class PostgresAdapter(Adapter):
             "executing or holding the lock",
         )
 
-    # --- error classification ----------------------------------------------------------------
+    # --- error classification ---------------------------------------------------------------------
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
         """A SQLSTATE means the server answered, so the outcome is definite.
@@ -563,7 +588,7 @@ class PostgresAdapter(Adapter):
         return OutcomeClass.COMMUNICATION_FAILURE
 
 
-# --- helpers ---------------------------------------------------------------------------------
+# --- helpers --------------------------------------------------------------------------------------
 
 _KIND_NAMES = {"p": "primary key", "u": "unique key", "f": "foreign key"}
 
@@ -679,7 +704,7 @@ _EXPECTED_COLUMNS = {
     ),
 }
 
-_EXPECTED_CONSTRAINTS = {
+_EXPECTED_CONSTRAINTS: dict[str, md.ExpectedConstraints] = {
     HISTORY_TABLE: {
         "keys": (("p", "migration_id"), ("u", "seq")),
         # Fragments of the normalised pg_get_constraintdef output, so semantics

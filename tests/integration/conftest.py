@@ -8,16 +8,14 @@ stays visibly incomplete rather than being satisfied by a mock.
 
 from __future__ import annotations
 
+import contextlib
 import os
-from pathlib import Path
 
 import pytest
-
 import support
 
 ORACLE_ENV = ("MIGR8_ORACLE_DSN", "MIGR8_ORACLE_USER", "MIGR8_ORACLE_PASSWORD")
-PG_ENV = ("MIGR8_PG_HOST", "MIGR8_PG_PORT", "MIGR8_PG_DB", "MIGR8_PG_USER",
-          "MIGR8_PG_PASSWORD")
+PG_ENV = ("MIGR8_PG_HOST", "MIGR8_PG_PORT", "MIGR8_PG_DB", "MIGR8_PG_USER", "MIGR8_PG_PASSWORD")
 
 LOCK_ID = 4711
 
@@ -27,6 +25,7 @@ def _missing(names: tuple[str, ...]) -> list[str]:
 
 
 # --- Oracle ---------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def oracle_settings():
@@ -73,10 +72,8 @@ def _oracle_clean(settings, schema: str) -> None:
             suffix = " CASCADE CONSTRAINTS PURGE" if kind == "TABLE" else ""
             if kind == "TYPE":
                 suffix = " FORCE"
-            try:
+            with contextlib.suppress(oracledb.DatabaseError):
                 cursor.execute(f'DROP {kind} "{schema}"."{name}"{suffix}')
-            except oracledb.DatabaseError:
-                pass
         connection.commit()
 
 
@@ -85,11 +82,13 @@ def oracle_project(tmp_path, oracle_settings):
     """A clean Oracle namespace plus a config file pointing at it."""
     schema = oracle_settings["user"]
     _oracle_clean(oracle_settings, schema)
-    config = support.write(tmp_path / "migr8.toml", f"""
+    config = support.write(
+        tmp_path / "migr8.toml",
+        f"""
         [database]
         adapter = "oracle"
-        dsn = "{oracle_settings['dsn']}"
-        user = "{oracle_settings['user']}"
+        dsn = "{oracle_settings["dsn"]}"
+        user = "{oracle_settings["user"]}"
         target_schema = "{schema}"
 
         [oracle]
@@ -100,7 +99,8 @@ def oracle_project(tmp_path, oracle_settings):
         package = "SYS.DBMS_LOCK"
         id = {LOCK_ID}
         timeout_seconds = 20
-    """)
+    """,
+    )
     os.environ["MIGR8_PASSWORD"] = oracle_settings["password"]
     yield tmp_path, config, schema
     _oracle_clean(oracle_settings, schema)
@@ -114,7 +114,8 @@ def oracle_query(oracle_settings):
     def run(sql: str, **binds):
         """Execute a statement; returns rows for a query and commits otherwise."""
         with oracledb.connect(
-            user=oracle_settings["user"], password=oracle_settings["password"],
+            user=oracle_settings["user"],
+            password=oracle_settings["password"],
             dsn=oracle_settings["dsn"],
         ) as connection:
             cursor = connection.cursor()
@@ -131,12 +132,14 @@ def oracle_query(oracle_settings):
 
 # --- PostgreSQL ------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def pg_settings():
     missing = _missing(PG_ENV)
     if missing:
         pytest.skip(
-            "PostgreSQL test service not configured: missing " + ", ".join(missing)
+            "PostgreSQL test service not configured: missing "
+            + ", ".join(missing)
             + ". Start it with testenv/dbctl.sh up and use testenv/dbctl.sh test."
         )
     psycopg = pytest.importorskip("psycopg")
@@ -166,19 +169,25 @@ def pg_project(tmp_path, pg_settings):
     with psycopg.connect(pg_settings["conninfo"], autocommit=True) as connection:
         connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         connection.execute(f'CREATE SCHEMA "{schema}"')
-    config = support.write(tmp_path / "migr8.toml", f"""
+    config = support.write(
+        tmp_path / "migr8.toml",
+        f"""
         [database]
         adapter = "postgres"
-        dsn = "{pg_settings['conninfo'].replace(
-            'password=' + os.environ['MIGR8_PG_PASSWORD'], '').strip()}"
-        user = "{pg_settings['user']}"
+        dsn = "{
+            pg_settings["conninfo"]
+            .replace("password=" + os.environ["MIGR8_PG_PASSWORD"], "")
+            .strip()
+        }"
+        user = "{pg_settings["user"]}"
         target_schema = "{schema}"
 
         [lock]
         provider = "advisory"
         id = {LOCK_ID}
         timeout_seconds = 20
-    """)
+    """,
+    )
     os.environ["MIGR8_PASSWORD"] = os.environ["MIGR8_PG_PASSWORD"]
     yield tmp_path, config, schema
     with psycopg.connect(pg_settings["conninfo"], autocommit=True) as connection:
@@ -219,7 +228,9 @@ def oracle_sys(oracle_settings):
 
     def run(sql: str, **binds):
         with oracledb.connect(
-            user="SYS", password=password, dsn=oracle_settings["dsn"],
+            user="SYS",
+            password=password,
+            dsn=oracle_settings["dsn"],
             mode=oracledb.AUTH_MODE_SYSDBA,
         ) as connection:
             cursor = connection.cursor()

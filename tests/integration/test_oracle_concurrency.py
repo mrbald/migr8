@@ -6,26 +6,26 @@ real ``DBMS_LOCK`` user lock held with ``release_on_commit => FALSE``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
-
 import support
-from migr8.errors import Exit
 from proxy import DirectionalProxy
+
+from migr8.errors import Exit
 
 pytestmark = [pytest.mark.oracle]
 
 ENTRY = Path(__file__).resolve().parents[2] / "migr8"
 TIMEOUT = 120
 
-SLOW = '''\
+SLOW = """\
 import pathlib
 import time
 
@@ -54,27 +54,36 @@ def migrate(ctx):
         with ctx.transaction() as tx:
             tx.execute("INSERT INTO slow_t (id) VALUES (2)")
             ctx.progress.set("last_id", "2")
-'''
+"""
 
 
 def _config_with_timeout(root: Path, config: Path, seconds: int, name: str) -> Path:
     text = config.read_text()
     assert "timeout_seconds = 20" in text
-    return support.write(root / name, text.replace("timeout_seconds = 20",
-                                                   f"timeout_seconds = {seconds}"))
+    return support.write(
+        root / name, text.replace("timeout_seconds = 20", f"timeout_seconds = {seconds}")
+    )
 
 
 def run_cli(args: list[str], cwd: Path, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT, env=env,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=env,
     )
 
 
 def start_cli(args: list[str], cwd: Path, env: dict) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
     )
 
 
@@ -101,17 +110,25 @@ def slow_project(oracle_project, oracle_settings):
     ready = root / "ready"
     go = root / "go"
     support.unit(root, "m1", {"migration.py": SLOW.format(ready=str(ready), go=str(go))})
-    support.manifest(root, [{
-        "id": "slow", "path": "m1", "language": "python", "mode": "restartable",
-        "entry": "migration.py",
-    }])
+    support.manifest(
+        root,
+        [
+            {
+                "id": "slow",
+                "path": "m1",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            }
+        ],
+    )
     env = {**os.environ, "MIGR8_PASSWORD": oracle_settings["password"]}
     return root, config, schema, ready, go, env
 
 
 def test_lock_is_held_across_ddl_and_batch_commits(slow_project, oracle_query):
     root, config, schema, ready, go, env = slow_project
-    zero = _config_with_timeout(root, config, 0, "zero.toml")
+    _config_with_timeout(root, config, 0, "zero.toml")
     holder = start_cli(["migrate"], root, env)
     try:
         _wait_for(ready)
@@ -128,8 +145,7 @@ def test_lock_is_held_across_ddl_and_batch_commits(slow_project, oracle_query):
     assert oracle_query("SELECT id FROM slow_t ORDER BY id") == [(1,), (2,)]
 
 
-def test_status_is_read_only_and_prompt_during_a_long_migration(slow_project,
-                                                                oracle_query):
+def test_status_is_read_only_and_prompt_during_a_long_migration(slow_project, oracle_query):
     root, config, schema, ready, go, env = slow_project
     holder = start_cli(["migrate"], root, env)
     try:
@@ -170,10 +186,9 @@ def test_waiter_acquires_the_lock_after_the_holder_finishes(slow_project, oracle
     assert "no pending migrations" in waiter_out
 
 
-def test_dead_client_leaves_a_live_server_session_holding_the_lock(slow_project,
-                                                                  oracle_query,
-                                                                  oracle_sys,
-                                                                  oracle_settings):
+def test_dead_client_leaves_a_live_server_session_holding_the_lock(
+    slow_project, oracle_query, oracle_sys, oracle_settings
+):
     """A fresh runner proceeds only after acquiring the lock, not after noticing
     that the previous operating-system process has disappeared.
 
@@ -187,24 +202,20 @@ def test_dead_client_leaves_a_live_server_session_holding_the_lock(slow_project,
     port, service = rest.split("/", 1)
 
     with DirectionalProxy(host, int(port)) as proxy:
-        proxied = support.write(
+        support.write(
             root / "proxied.toml",
             config.read_text().replace(
                 f'dsn = "{oracle_settings["dsn"]}"',
                 f'dsn = "{proxy.host}:{proxy.port}/{service}"',
             ),
         )
-        zero = _config_with_timeout(root, config, 0, "zero.toml")
+        _config_with_timeout(root, config, 0, "zero.toml")
         holder = start_cli(["migrate", "--config", "proxied.toml"], root, env)
         try:
             _wait_for(ready)
-            recorded = oracle_query(
-                "SELECT db_session FROM m8_history WHERE status = 'ACTIVE'"
-            )
+            recorded = oracle_query("SELECT db_session FROM m8_history WHERE status = 'ACTIVE'")
             assert recorded, "the ACTIVE row should record the runner's session"
-            fields = dict(
-                part.split("=", 1) for part in recorded[0][0].split(",") if "=" in part
-            )
+            fields = dict(part.split("=", 1) for part in recorded[0][0].split(",") if "=" in part)
             audsid = int(fields["audsid"])
 
             # Keep the upstream socket open, then kill the client process.
@@ -228,8 +239,10 @@ def test_dead_client_leaves_a_live_server_session_holding_the_lock(slow_project,
             sid, serial = sessions[0]
             oracle_sys(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
             assert _wait_until(
-                lambda: not oracle_sys(
-                    "SELECT sid FROM v$session WHERE audsid = :audsid", audsid=audsid
+                lambda: (
+                    not oracle_sys(
+                        "SELECT sid FROM v$session WHERE audsid = :audsid", audsid=audsid
+                    )
                 )
             ), "the killed server session did not end"
         finally:
@@ -240,9 +253,9 @@ def test_dead_client_leaves_a_live_server_session_holding_the_lock(slow_project,
     assert resumed.returncode == Exit.OK, resumed.stderr
     # The durable first batch survived; the retry converged.
     assert oracle_query("SELECT id FROM slow_t ORDER BY id") == [(1,), (2,)]
-    assert oracle_query(
-        "SELECT status, attempt FROM m8_history WHERE migration_id = 'slow'"
-    ) == [("SUCCESS", 2)]
+    assert oracle_query("SELECT status, attempt FROM m8_history WHERE migration_id = 'slow'") == [
+        ("SUCCESS", 2)
+    ]
 
 
 def test_session_liveness_is_unknown_without_privileges(oracle_project, oracle_settings):
@@ -252,24 +265,26 @@ def test_session_liveness_is_unknown_without_privileges(oracle_project, oracle_s
     owner = f"{oracle_settings['user']}_OWNER"
     import oracledb
 
-    with oracledb.connect(user=runner, password=oracle_settings["password"],
-                          dsn=oracle_settings["dsn"]) as probe:
+    with oracledb.connect(
+        user=runner, password=oracle_settings["password"], dsn=oracle_settings["dsn"]
+    ) as probe:
         cursor = probe.cursor()
         for name, kind in cursor.execute(
             "SELECT object_name, object_type FROM all_objects WHERE owner = :owner AND "
-            "object_type IN ('TABLE','VIEW') ORDER BY object_type DESC", owner=owner,
+            "object_type IN ('TABLE','VIEW') ORDER BY object_type DESC",
+            owner=owner,
         ).fetchall():
             suffix = " CASCADE CONSTRAINTS PURGE" if kind == "TABLE" else ""
-            try:
+            with contextlib.suppress(oracledb.DatabaseError):
                 cursor.execute(f'DROP {kind} "{owner}"."{name}"{suffix}')
-            except oracledb.DatabaseError:
-                pass
         probe.commit()
 
-    split = support.write(root / "split.toml", f"""
+    split = support.write(
+        root / "split.toml",
+        f"""
         [database]
         adapter = "oracle"
-        dsn = "{oracle_settings['dsn']}"
+        dsn = "{oracle_settings["dsn"]}"
         user = "{runner}"
         target_schema = "{owner}"
 
@@ -281,15 +296,26 @@ def test_session_liveness_is_unknown_without_privileges(oracle_project, oracle_s
         package = "SYS.DBMS_LOCK"
         id = 4714
         timeout_seconds = 20
-    """)
+    """,
+    )
     os.environ["MIGR8_PASSWORD"] = oracle_settings["password"]
-    support.unit(root, "m_fail", {"migration.py": (
-        "def migrate(ctx):\n    raise RuntimeError('stay active')\n"
-    )})
-    manifest = support.manifest(root, [{
-        "id": "stuck", "path": "m_fail", "language": "python", "mode": "restartable",
-        "entry": "migration.py",
-    }])
+    support.unit(
+        root,
+        "m_fail",
+        {"migration.py": ("def migrate(ctx):\n    raise RuntimeError('stay active')\n")},
+    )
+    manifest = support.manifest(
+        root,
+        [
+            {
+                "id": "stuck",
+                "path": "m_fail",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            }
+        ],
+    )
     assert support.migrate(split, manifest) == Exit.MIGRATION_FAILED
     report = support.report_for("status", split, manifest)
     entry = report.migrations[0]

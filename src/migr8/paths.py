@@ -62,9 +62,7 @@ def check_no_case_collisions(relpaths: list[str]) -> None:
         folded = rel.casefold()
         other = seen.get(folded)
         if other is not None:
-            raise UnitError(
-                f"unit contains case-folding collision between {other!r} and {rel!r}"
-            )
+            raise UnitError(f"unit contains case-folding collision between {other!r} and {rel!r}")
         seen[folded] = rel
 
 
@@ -96,7 +94,8 @@ def resolve_unit_dir(manifest_dir: Path, raw_path: str, *, migration_id: str) ->
         )
     if resolved == root:
         raise ManifestError(
-            f"migration {migration_id!r} path {raw_path!r} must not be the manifest directory itself"
+            f"migration {migration_id!r} path {raw_path!r} must not be the manifest "
+            "directory itself"
         )
     if root not in resolved.parents:
         raise ManifestError(
@@ -117,7 +116,7 @@ def _lstat_or_fail(path: Path, migration_id: str) -> os.stat_result:
 def check_units_disjoint(units: list[tuple[str, Path]]) -> None:
     """Reject overlapping units: equal paths, or one containing another."""
     for i, (id_a, path_a) in enumerate(units):
-        for id_b, path_b in units[i + 1:]:
+        for id_b, path_b in units[i + 1 :]:
             if path_a == path_b:
                 raise ManifestError(
                     f"migrations {id_a!r} and {id_b!r} resolve to the same unit directory {path_a}"

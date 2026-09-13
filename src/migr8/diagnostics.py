@@ -49,7 +49,11 @@ class RunLog:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Line-buffered append: concurrent runners each write whole lines.
-        self._handle = open(self.path, "a", encoding="utf-8", buffering=1)
+        # Held open for the life of the run and closed by close(); a context
+        # manager here would shut the log before the events it exists to record.
+        self._handle = open(  # noqa: SIM115
+            self.path, "a", encoding="utf-8", buffering=1
+        )
 
     @property
     def elapsed(self) -> float:

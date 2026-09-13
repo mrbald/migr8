@@ -24,8 +24,8 @@ from .diagnostics import RunLog
 from .errors import (
     ContractViolationError,
     Exit,
-    Migr8Error,
     MetadataDamagedError,
+    Migr8Error,
     MigrationFailedError,
     RecoveryRequiredError,
     UnknownOutcomeError,
@@ -34,12 +34,12 @@ from .latch import RunLatch
 from .loader import load_entry
 from .manifest import Language, Mode
 from .model import Capture, CapturedUnit, MetadataState, Plan, Snapshot
+from .sqltext import StatementKind, normalize
 from .statevalidate import (
     build_plan,
     check_recovery_admission,
     require_no_recovery_needed,
 )
-from .sqltext import StatementKind, normalize
 from .version import TOOL_VERSION
 
 LOGGER = logging.getLogger("migr8.engine")
@@ -112,8 +112,15 @@ def runner_info(run_id: str) -> RunnerInfo:
 class Engine:
     """One ``migrate`` run against one namespace."""
 
-    def __init__(self, *, config: Config, adapter: Adapter, capture: Capture,
-                 recover_id: str | None = None, log: RunLog | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        adapter: Adapter,
+        capture: Capture,
+        recover_id: str | None = None,
+        log: RunLog | None = None,
+    ) -> None:
         self.config = config
         self.adapter = adapter
         self.capture = capture
@@ -125,14 +132,17 @@ class Engine:
         adapter.latch = self.latch
         adapter.runner = runner_info(self.run_id)
 
-    # --- top level -------------------------------------------------------------
+    # --- top level --------------------------------------------------------------------------------
 
     def run(self) -> RunReport:
         started = time.monotonic()
         connected = False
         self.log.event(
-            "run_start", command="migrate", adapter=self.adapter.name,
-            manifest=str(self.capture.manifest.path), units=len(self.capture.units),
+            "run_start",
+            command="migrate",
+            adapter=self.adapter.name,
+            manifest=str(self.capture.manifest.path),
+            units=len(self.capture.units),
             recover=self.recover_id,
         )
         try:
@@ -142,7 +152,8 @@ class Engine:
             connected = True
             self.report.namespace = self.adapter.normalized_namespace()
             self.log.event(
-                "connected", namespace=self.report.namespace,
+                "connected",
+                namespace=self.report.namespace,
                 server=self.adapter.server_description(),
                 session=self.adapter.session_identity(),
             )
@@ -160,9 +171,7 @@ class Engine:
             return self._finish(started)
         except RecoveryRequiredError as exc:
             self._fail(exc, exc.exit_code)
-            self.report.recovery_command = (
-                f"migr8 migrate --recover {exc.migration_id}"
-            )
+            self.report.recovery_command = f"migr8 migrate --recover {exc.migration_id}"
             if connected:
                 self._close_quietly()
             return self._finish(started)
@@ -188,13 +197,18 @@ class Engine:
         self.report.phase = error.phase
         self.report.connection_discarded = discarded
         self.log.event(
-            "run_end", outcome=_OUTCOMES[code], exit_code=int(code),
-            phase=error.phase, migration=error.migration_id, detail=error.message,
+            "run_end",
+            outcome=_OUTCOMES[code],
+            exit_code=int(code),
+            phase=error.phase,
+            migration=error.migration_id,
+            detail=error.message,
             connection_discarded=discarded,
         )
 
-    def _handle_interruption(self, exc: BaseException, *, connected: bool,
-                             started: float) -> RunReport:
+    def _handle_interruption(
+        self, exc: BaseException, *, connected: bool, started: float
+    ) -> RunReport:
         """Treat an interruption the way the durable state requires.
 
         If a commit-capable operation was in flight its outcome is already
@@ -204,8 +218,11 @@ class Engine:
         """
         latched = self.latch.error
         if latched is not None:
-            self._fail(latched, Exit(latched.exit_code),
-                       discarded=latched.exit_code == Exit.UNKNOWN_OUTCOME)
+            self._fail(
+                latched,
+                Exit(latched.exit_code),
+                discarded=latched.exit_code == Exit.UNKNOWN_OUTCOME,
+            )
             if connected and self.report.connection_discarded:
                 self.adapter.discard()
             elif connected:
@@ -217,8 +234,8 @@ class Engine:
         error = MigrationFailedError(
             f"the run was interrupted ({kind}); uncommitted work was rolled back and any "
             "restartable migration remains ACTIVE. Rerun to continue."
-            if interrupted else
-            f"the run failed unexpectedly ({kind}: {exc}); uncommitted work was rolled "
+            if interrupted
+            else f"the run failed unexpectedly ({kind}: {exc}); uncommitted work was rolled "
             "back and any restartable migration remains ACTIVE",
             phase="interrupted" if interrupted else "internal_error",
         )
@@ -241,7 +258,7 @@ class Engine:
         except Exception as exc:  # pragma: no cover - best-effort teardown
             LOGGER.warning("closing the session did not complete cleanly: %s", exc)
 
-    # --- initialization ---------------------------------------------------------
+    # --- initialization ---------------------------------------------------------------------------
 
     def _initialize_if_needed(self) -> None:
         report = self.adapter.inspect_metadata()
@@ -261,7 +278,7 @@ class Engine:
                 )
         verify_bindings(self.adapter, report.meta)
 
-    # --- planning ---------------------------------------------------------------
+    # --- planning ---------------------------------------------------------------------------------
 
     def _build_plan(self) -> Plan:
         snapshot: Snapshot = self.adapter.read_snapshot(consistent=True)
@@ -278,22 +295,28 @@ class Engine:
                 )
         return plan
 
-    # --- execution --------------------------------------------------------------
+    # --- execution --------------------------------------------------------------------------------
 
     def _execute(self, plan: Plan) -> None:
         self.log.event(
-            "plan", successful=plan.success_count,
+            "plan",
+            successful=plan.success_count,
             pending=[unit.id for unit in plan.pending],
             active=plan.active.migration_id if plan.active else None,
         )
         for unit in plan.pending:
-            active = plan.active if (
-                plan.active is not None and plan.active.migration_id == unit.id
-            ) else None
+            active = (
+                plan.active
+                if (plan.active is not None and plan.active.migration_id == unit.id)
+                else None
+            )
             started = time.monotonic()
             self.log.event(
-                "migration_start", migration=unit.id, position=unit.position,
-                mode=unit.mode.value, language=unit.language.value,
+                "migration_start",
+                migration=unit.id,
+                position=unit.position,
+                mode=unit.mode.value,
+                language=unit.language.value,
                 fingerprint=unit.fingerprint,
             )
             if unit.mode is Mode.ATOMIC:
@@ -302,11 +325,12 @@ class Engine:
                 self._run_restartable(unit, active)
             self.report.executed.append(unit.id)
             self.log.event(
-                "migration_done", migration=unit.id,
+                "migration_done",
+                migration=unit.id,
                 seconds=round(time.monotonic() - started, 4),
             )
 
-    # --- atomic -----------------------------------------------------------------
+    # --- atomic -----------------------------------------------------------------------------------
 
     def _run_atomic(self, unit: CapturedUnit) -> None:
         """Spec Section 5.1.  Work and the SUCCESS row commit together."""
@@ -326,7 +350,7 @@ class Engine:
             )
         except UnknownOutcomeError:
             raise
-        except (ContractViolationError, MigrationFailedError):
+        except ContractViolationError, MigrationFailedError:
             # Roll back what remains; no success row is written.  After a contract
             # violation, durable effects of non-compliant code may still need
             # remediation.
@@ -369,7 +393,7 @@ class Engine:
         except Exception as exc:  # pragma: no cover
             LOGGER.warning("rollback did not complete cleanly: %s", exc)
 
-    # --- restartable ------------------------------------------------------------
+    # --- restartable ------------------------------------------------------------------------------
 
     def _run_restartable(self, unit: CapturedUnit, active) -> None:
         """Spec Section 5.2.  Admission commits before any migration code runs."""
@@ -398,7 +422,7 @@ class Engine:
             context = self._invoke(unit, attempt=attempt)
         except UnknownOutcomeError:
             raise
-        except (ContractViolationError, MigrationFailedError):
+        except ContractViolationError, MigrationFailedError:
             self._post_return_cleanup(unit)
             raise
         except Exception as exc:
@@ -452,7 +476,7 @@ class Engine:
         if self.adapter.has_open_transaction():
             self._rollback_quietly()
 
-    # --- invocation -------------------------------------------------------------
+    # --- invocation -------------------------------------------------------------------------------
 
     def _invoke(self, unit: CapturedUnit, *, attempt: int | None):
         """Run the migration; returns its context object for Python migrations."""

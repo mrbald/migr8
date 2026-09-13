@@ -17,8 +17,8 @@ import time
 from pathlib import Path
 
 import pytest
-
 import support
+
 from migr8.adapters.base import Boundary
 from migr8.diagnostics import RunLog, default_log_path
 from migr8.errors import Exit
@@ -39,33 +39,45 @@ def project(tmp_path):
 def _simple(root: Path) -> Path:
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"up.sql": "INSERT INTO t (id) VALUES (1);"})
-    return support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "seed-t", "path": "m2", "language": "sql", "mode": "atomic",
-         "entry": "up.sql"},
-    ])
+    return support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {"id": "seed-t", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+        ],
+    )
 
 
 def cli(args: list[str], cwd: Path, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(ENTRY), *args],
-        cwd=cwd, capture_output=True, text=True, timeout=60, **kwargs,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        **kwargs,
     )
 
 
 # --- the event log -----------------------------------------------------------------
 
+
 def test_no_log_file_means_no_file(project):
     root, config, db = project
-    manifest = _simple(root)
+    _simple(root)
     assert cli(["migrate"], root).returncode == Exit.OK
     assert not list(root.glob("*.jsonl"))
 
 
 def test_event_log_records_the_phases_in_order(project):
     root, config, db = project
-    manifest = _simple(root)
+    _simple(root)
     log_path = root / "run.jsonl"
     assert cli(["migrate", "--log-file", str(log_path)], root).returncode == Exit.OK
 
@@ -73,8 +85,14 @@ def test_event_log_records_the_phases_in_order(project):
     names = [event["event"] for event in events]
     assert names[0] == "run_start"
     assert names[-1] == "run_end"
-    for expected in ("preflight_passed", "connected", "lock_acquired", "plan",
-                     "migration_start", "migration_done"):
+    for expected in (
+        "preflight_passed",
+        "connected",
+        "lock_acquired",
+        "plan",
+        "migration_start",
+        "migration_done",
+    ):
         assert expected in names, expected
 
     # Every event carries the same correlation id and a monotonic elapsed time.
@@ -96,12 +114,19 @@ def test_event_log_names_the_failing_migration_and_phase(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"up.sql": "INSERT INTO absent_table (id) VALUES (1);"})
-    support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "broken", "path": "m2", "language": "sql", "mode": "atomic",
-         "entry": "up.sql"},
-    ])
+    support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {"id": "broken", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+        ],
+    )
     log_path = root / "run.jsonl"
     result = cli(["migrate", "--log-file", str(log_path)], root)
     assert result.returncode == Exit.MIGRATION_FAILED
@@ -120,19 +145,38 @@ def test_event_log_names_the_failing_migration_and_phase(project):
 def test_author_log_lines_land_in_the_same_log(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
-    support.unit(root, "m2", {"migration.py": (
-        "def migrate(ctx):\n"
-        "    with ctx.transaction() as tx:\n"
-        "        tx.execute('INSERT INTO t (id) VALUES (1)')\n"
-        "        ctx.progress.set('last', '1')\n"
-        "    ctx.log('checkpointed', last_id=1, rows=1)\n"
-    )})
-    support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "fill", "path": "m2", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    support.unit(
+        root,
+        "m2",
+        {
+            "migration.py": (
+                "def migrate(ctx):\n"
+                "    with ctx.transaction() as tx:\n"
+                "        tx.execute('INSERT INTO t (id) VALUES (1)')\n"
+                "        ctx.progress.set('last', '1')\n"
+                "    ctx.log('checkpointed', last_id=1, rows=1)\n"
+            )
+        },
+    )
+    support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "fill",
+                "path": "m2",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
     log_path = root / "run.jsonl"
     assert cli(["migrate", "--log-file", str(log_path)], root).returncode == Exit.OK
     events = [json.loads(line) for line in log_path.read_text().splitlines()]
@@ -188,6 +232,7 @@ def test_default_log_path_prefers_the_explicit_argument(tmp_path, monkeypatch):
 
 # --- the machine-readable outcome --------------------------------------------------
 
+
 def test_migrate_json_outcome_on_success(project):
     root, config, db = project
     _simple(root)
@@ -208,12 +253,19 @@ def test_migrate_json_outcome_names_the_failure(project):
     root, config, db = project
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"up.sql": "INSERT INTO absent_table (id) VALUES (1);"})
-    support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "broken", "path": "m2", "language": "sql", "mode": "atomic",
-         "entry": "up.sql"},
-    ])
+    support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {"id": "broken", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+        ],
+    )
     result = cli(["migrate", "--json"], root)
     assert result.returncode == Exit.MIGRATION_FAILED
     report = json.loads(result.stdout)
@@ -227,13 +279,21 @@ def test_migrate_json_outcome_names_the_failure(project):
 
 def test_migrate_json_outcome_carries_the_recovery_command(project):
     root, config, db = project
-    support.unit(root, "m1", {"migration.py": (
-        "def migrate(ctx):\n    raise RuntimeError('stop')\n"
-    )})
-    manifest = support.manifest(root, [{
-        "id": "stuck", "path": "m1", "language": "python", "mode": "restartable",
-        "entry": "migration.py",
-    }])
+    support.unit(
+        root, "m1", {"migration.py": ("def migrate(ctx):\n    raise RuntimeError('stop')\n")}
+    )
+    support.manifest(
+        root,
+        [
+            {
+                "id": "stuck",
+                "path": "m1",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            }
+        ],
+    )
     assert cli(["migrate"], root).returncode == Exit.MIGRATION_FAILED
     support.unit(root, "m1", {"migration.py": "def migrate(ctx):\n    pass\n"})
     result = cli(["migrate", "--json"], root)
@@ -256,7 +316,7 @@ def test_read_only_reports_carry_the_run_id(project):
 
 # --- interruption ------------------------------------------------------------------
 
-SLOW = '''\
+SLOW = """\
 import pathlib
 import time
 
@@ -271,18 +331,31 @@ def migrate(ctx):
             ctx.progress.set("last", "1")
     READY.write_text("working")
     time.sleep(60)
-'''
+"""
 
 
 def _slow_project(root: Path, ready: Path) -> None:
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);\n"})
     support.unit(root, "m2", {"migration.py": SLOW.format(ready=str(ready))})
-    support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "slow", "path": "m2", "language": "python", "mode": "restartable",
-         "entry": "migration.py"},
-    ])
+    support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "slow",
+                "path": "m2",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
 
 
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
@@ -294,7 +367,10 @@ def test_interruption_between_commits_rolls_back_and_retains_active(project, sig
     log_path = root / "run.jsonl"
     process = subprocess.Popen(
         [sys.executable, str(ENTRY), "migrate", "--log-file", str(log_path)],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         deadline = time.monotonic() + 30

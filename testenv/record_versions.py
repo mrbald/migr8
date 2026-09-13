@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import os
 import platform
-import subprocess
 import sqlite3
+import subprocess
 import sys
 
 
@@ -38,8 +38,7 @@ def main() -> int:
     print(f"docker          : {run(['docker', '--version'])}")
     print()
     for image in ("gvenzl/oracle-free:23.9-slim", "postgres:17.5"):
-        digest = run(["docker", "image", "inspect", image, "--format",
-                      "{{index .RepoDigests 0}}"])
+        digest = run(["docker", "image", "inspect", image, "--format", "{{index .RepoDigests 0}}"])
         arch = run(["docker", "image", "inspect", image, "--format", "{{.Architecture}}"])
         print(f"image           : {image}")
         print(f"  digest        : {digest}")
@@ -55,9 +54,7 @@ def main() -> int:
             password=os.environ.get("ORACLE_TEST_PASSWORD", "migr8_ora_test"),
             dsn=dsn,
         ) as connection:
-            banner = connection.cursor().execute(
-                "SELECT banner_full FROM v$version"
-            ).fetchone()
+            banner = connection.cursor().execute("SELECT banner_full FROM v$version").fetchone()
             print(f"oracle server   : {banner[0] if banner else connection.version}")
             print(f"oracle thin mode: {connection.thin}")
     except Exception as exc:
@@ -75,6 +72,7 @@ def main() -> int:
         )
         with psycopg.connect(info, autocommit=True) as connection:
             row = connection.execute("SELECT version()").fetchone()
+            assert row is not None
             print(f"postgres server : {row[0]}")
     except Exception as exc:
         print(f"postgres server : NOT RUN ({type(exc).__name__}: {exc})")

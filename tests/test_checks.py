@@ -8,8 +8,8 @@ to reach the caller rather than being assumed to.
 from __future__ import annotations
 
 import pytest
-
 import support
+
 from migr8.checks import preflight
 from migr8.errors import UnsupportedCapabilityError
 from migr8.manifest import Language, Mode
@@ -46,12 +46,25 @@ class _StubAdapter:
 def _capture(root):
     support.unit(root, "m1", {"up.sql": "CREATE TABLE t (id INTEGER);\n"})
     support.unit(root, "m2", {"up.sql": "INSERT INTO t (id) VALUES (1);\n"})
-    manifest = support.manifest(root, [
-        {"id": "create-t", "path": "m1", "language": "sql", "mode": "restartable",
-         "entry": "up.sql"},
-        {"id": "insert-t", "path": "m2", "language": "sql", "mode": "atomic",
-         "entry": "up.sql"},
-    ])
+    manifest = support.manifest(
+        root,
+        [
+            {
+                "id": "create-t",
+                "path": "m1",
+                "language": "sql",
+                "mode": "restartable",
+                "entry": "up.sql",
+            },
+            {
+                "id": "insert-t",
+                "path": "m2",
+                "language": "sql",
+                "mode": "atomic",
+                "entry": "up.sql",
+            },
+        ],
+    )
     return capture_in_place(load_manifest(manifest))
 
 

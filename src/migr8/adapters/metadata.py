@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import TypedDict
 
 from ..model import (
     ACTIVE_INDEX,
@@ -21,6 +22,20 @@ from ..model import (
     MetaRow,
     ProgressRow,
 )
+
+
+class ExpectedConstraints(TypedDict):
+    """The constraint shape one metadata table must have.
+
+    ``keys`` pairs a constraint kind with its comma-joined column list; ``checks``
+    holds fragments the normalised check-constraint text must contain. Both are
+    spelled in each adapter's own dictionary vocabulary, so semantics are compared
+    rather than database-generated constraint names.
+    """
+
+    keys: tuple[tuple[str, str], ...]
+    checks: tuple[str, ...]
+
 
 #: Logical history columns, in the order every adapter selects them.
 HISTORY_COLUMNS = (
@@ -195,14 +210,14 @@ def classify(
 
 
 __all__ = [
-    "HISTORY_COLUMNS",
-    "PROGRESS_COLUMNS",
-    "META_COLUMNS",
     "CREATION_ORDER",
+    "HISTORY_COLUMNS",
+    "META_COLUMNS",
+    "PROGRESS_COLUMNS",
+    "classify",
     "history_row",
-    "progress_row",
     "meta_row",
     "normalise_definition",
     "parse_iso_timestamp",
-    "classify",
+    "progress_row",
 ]
