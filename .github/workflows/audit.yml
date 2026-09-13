@@ -1,0 +1,29 @@
+# Dependency vulnerability audit: pip-audit over the locked dependency set.
+# `uv export` pins the exact transitive closure and `--no-deps` audits precisely
+# that set with no re-resolution. `--all-extras` is what makes this meaningful
+# here: the package has no required runtime dependencies, and everything worth
+# auditing (the Oracle and PostgreSQL drivers) lives in an optional extra.
+# The weekly schedule catches advisories published between pushes.
+# README's "vulnerabilities" brick badges this workflow.
+
+name: vulnerabilities
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * 1" # Mondays 06:23 UTC
+  workflow_dispatch:
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # --no-hashes deliberately: the audit needs name==version, and the
+      # hash set pins wheels per platform, so a lock built on one
+      # architecture fails the install step on the runner's.
+      - run: uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes -o requirements.txt
+      - run: uvx pip-audit --no-deps -r requirements.txt
