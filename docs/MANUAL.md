@@ -5,7 +5,9 @@ It has three commands and no undo.
 
 [`ACCEPTANCE.md`](ACCEPTANCE.md) records what has been tested and against which
 versions. The specification is [`SPEC.md`](SPEC.md); this manual is how to use
-the thing.
+the thing. [`ORACLE-CONNECTIONS.md`](ORACLE-CONNECTIONS.md) is the background for
+the Oracle connection settings: driver modes, TNS aliases, proxy authentication
+and wallets.
 
 **Contents** — [Install](#install) · [Configure](#configure) ·
 [Write a migration](#write-a-migration) · [Run it](#run-it) ·

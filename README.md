@@ -22,6 +22,7 @@ which gates are open.
 | [`docs/SPEC.md`](docs/SPEC.md) | The maintained specification: the protocol and its guarantees. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module layering, what each adapter owns, and the standing design positions. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | What was tested, against which versions, and which gates are open. |
+| [`docs/ORACLE-CONNECTIONS.md`](docs/ORACLE-CONNECTIONS.md) | Thin and thick drivers, TNS aliases, proxy authentication, wallets and TLS. |
 | [`deploy/apple-container/`](deploy/apple-container/) | Running the migration job as a container under Apple's `container` runtime. |
 
 ## What it does
