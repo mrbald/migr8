@@ -23,18 +23,22 @@ adapters, ~3,000 code lines
   metadata      the logical layout, state classification, definition comparison
   oracle        primary target: DBMS_LOCK, transaction identity, ALL_* validity
   postgres      second adapter: advisory lock, transactional DDL, real xid guard
-  sqlite_probe  local probe: file lock, stated enforcement boundary, no claims
+  sqlite        local file database: file lock, stated enforcement boundary
 ```
 
 The dependency direction is one-way, but not the way a one-line summary suggests.
 `adapters` imports from the core (`config`, `errors`, `latch`, `manifest`,
 `model`, `sqltext`), and `engine`, `context` and `checks` import
 `adapters.base` for the `Adapter` contract, `Boundary` and `OutcomeClass`. No
-core module imports a concrete driver: `oracle`, `postgres` and `sqlite_probe`
+core module imports a concrete driver: `oracle`, `postgres` and `sqlite`
 are reached only through `adapters.create`, and the engine contains no
 engine-specific SQL. `checks` exists so the read-only commands can preflight
 without importing `engine`, which would pull in the Python unit loader;
 `readonly`'s contract is that it imports nothing able to import migration code.
+That is also what lets `validate --offline` run the whole plan lint, Python
+compilation included, in a process that has connected to nothing: `compile()`
+parses the source without importing it, so the module that checks migration code
+still never loads it.
 
 `statevalidate` performs no I/O at all. It is handed a consistent snapshot and a
 fingerprinted capture and either returns a `Plan` or raises, which is what makes
