@@ -179,7 +179,10 @@ running with them are recorded below. Without the services, 617 run and the live
 suites skip with an explicit message naming the missing environment variables; a
 skip is never counted as coverage. The
 `databases` job in CI runs the whole suite against both servers on every push
-and pull request, and fails if anything skipped.
+and pull request. It prints every skip and fails on one whose reason says a
+service was unreachable or unconfigured, which is the failure that would
+otherwise pass as a green run. The release build applies the same rule before
+it builds anything.
 
 The `checks` job requires 100% branch coverage for `errors`, `fingerprint`,
 `latch`, `model` and `statevalidate`. `[tool.coverage.report]` in
