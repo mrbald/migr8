@@ -15,12 +15,19 @@
 # extra against SQLite, and once with the oracle extra against the live server
 # that is still up at that point. The artifacts published afterwards are the
 # ones those steps installed.
+#
+# Run it by hand from the Actions tab to exercise everything up to the upload
+# and stop: `build` runs in full and `publish` is skipped, because only a tag
+# push may publish. Use that before trusting a change to this file -- a bump to
+# the artifact actions moves the distributions between `build` and `publish`,
+# and a tag is an expensive place to discover that it broke.
 
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -36,12 +43,17 @@ jobs:
       # The tag is the release's name and src/migr8/version.py is the version
       # written into every durable history row. A mismatch means a published
       # artifact would record a version nobody can find, so refuse before doing
-      # any work.
+      # any work. A manual run has no tag to check and publishes nothing, so it
+      # reports the version it is about to build instead.
       - name: the tag matches the package version
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
           pkg="$(uv run python -c 'from migr8.version import TOOL_VERSION; print(TOOL_VERSION)')"
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            echo "dry run of ${pkg}: every gate below runs, nothing is published"
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME#v}"
           if [ "$tag" != "$pkg" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match src/migr8/version.py (${pkg})"
             exit 1
@@ -155,7 +167,12 @@ jobs:
             runtime-base.txt
             runtime-oracle.txt
 
+  # Only a tag push publishes. `on` admits manual runs so the build above can be
+  # exercised on demand, and this condition is what keeps such a run from
+  # reaching PyPI: the upload cannot be started by hand, whatever is selected in
+  # the Actions tab. github-release needs this job, so it is skipped with it.
   publish:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
