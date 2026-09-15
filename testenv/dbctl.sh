@@ -25,6 +25,15 @@ fi
 export ORACLE_SYS_PASSWORD ORACLE_HOST_PORT ORACLE_TEST_USER ORACLE_TEST_PASSWORD
 export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB POSTGRES_HOST_PORT
 
+# One resolved endpoint pair for everything below. The provisioning scripts
+# honour an inherited ORACLE_DSN or PG_CONNINFO, while the suite always connects
+# to the ports Compose publishes, so a shell carrying settings from another rig
+# could provision one database and test another and report the result as this
+# project's. These are set, not defaulted, for that reason.
+ORACLE_DSN="localhost:${ORACLE_HOST_PORT}/FREEPDB1"
+PG_CONNINFO="host=127.0.0.1 port=${POSTGRES_HOST_PORT} dbname=${POSTGRES_DB} user=${POSTGRES_USER} password=${POSTGRES_PASSWORD}"
+export ORACLE_DSN PG_CONNINFO
+
 PY="$ROOT/.venv/bin/python"
 [[ -x "$PY" ]] || PY="python3"
 
@@ -94,20 +103,38 @@ cmd_versions() {
 }
 
 cmd_test() {
-  # shellcheck disable=SC2068
-  ( cd "$ROOT" && MIGR8_ORACLE_DSN="localhost:${ORACLE_HOST_PORT}/FREEPDB1" \
+  local log status skips
+  log="$(mktemp -t migr8-suite.XXXXXX)"
+  set +e
+  ( cd "$ROOT" && MIGR8_ORACLE_DSN="${ORACLE_DSN}" \
       MIGR8_ORACLE_USER="${ORACLE_TEST_USER}" \
       MIGR8_ORACLE_PASSWORD="${ORACLE_TEST_PASSWORD}" \
       MIGR8_ORACLE_SYS_PASSWORD="${ORACLE_SYS_PASSWORD}" \
       MIGR8_PG_HOST=127.0.0.1 MIGR8_PG_PORT="${POSTGRES_HOST_PORT}" \
       MIGR8_PG_DB="${POSTGRES_DB}" MIGR8_PG_USER="${POSTGRES_USER}" \
       MIGR8_PG_PASSWORD="${POSTGRES_PASSWORD}" \
-      "$ROOT/.venv/bin/pytest" ${@:-} )
+      "$ROOT/.venv/bin/pytest" ${1+"$@"} ) 2>&1 | tee "$log"
+  status="${PIPESTATUS[0]}"
+  set -e
+  # A live fixture skips when its service is unreachable or unconfigured, which
+  # is the failure this command exists to catch. Applying the rule here rather
+  # than in the workflow means a developer running the command locally gets the
+  # gate CI gets. The skips that survive name a fixture no plain runner has: a
+  # bounded filesystem for the ENOSPC case, and an Oracle wallet plus Client
+  # libraries for the two certificate tests. pytest colours the summary even
+  # when stdout is a pipe, so the codes are stripped before matching.
+  skips="$(sed $'s/\x1b\\[[0-9;]*m//g' "$log" | grep '^SKIPPED' || true)"
+  rm -f "$log"
+  echo "${skips:-nothing skipped}"
+  if printf '%s\n' "$skips" | grep -qE 'not reachable|not configured|is unset|could not import'; then
+    die "a live suite skipped; the service it needs is unreachable"
+  fi
+  return "$status"
 }
 
 cmd_env() {
   cat <<ENVEOF
-export MIGR8_ORACLE_DSN="localhost:${ORACLE_HOST_PORT}/FREEPDB1"
+export MIGR8_ORACLE_DSN="${ORACLE_DSN}"
 export MIGR8_ORACLE_USER="${ORACLE_TEST_USER}"
 export MIGR8_ORACLE_PASSWORD="${ORACLE_TEST_PASSWORD}"
 export MIGR8_ORACLE_SYS_PASSWORD="${ORACLE_SYS_PASSWORD}"

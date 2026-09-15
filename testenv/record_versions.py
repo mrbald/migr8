@@ -27,6 +27,20 @@ def run(args: list[str]) -> str:
     return done.stdout.strip() or "<unavailable: no output>"
 
 
+# Every line this script prints is an acceptance-evidence item. A value that
+# could not be read is marked in place and remembered here, so the exit code can
+# say the output does not back a claim -- printing "<unavailable>" and exiting 0
+# let a caller record a green step over missing evidence.
+INCOMPLETE: list[str] = []
+
+
+def record(label: str, value: str) -> None:
+    """Print one evidence line, and remember it when the value is not evidence."""
+    if value.startswith("<unavailable") or value.startswith("NOT "):
+        INCOMPLETE.append(label.strip())
+    print(f"{label}: {value}")
+
+
 def main() -> int:
     print("# Recorded test environment")
     print()
@@ -36,16 +50,16 @@ def main() -> int:
     try:
         import oracledb
 
-        print(f"python-oracledb : {oracledb.__version__}")
+        record("python-oracledb", oracledb.__version__)
     except ImportError:
-        print("python-oracledb : NOT INSTALLED")
+        record("python-oracledb", "NOT INSTALLED")
     try:
         import psycopg
 
-        print(f"psycopg         : {psycopg.__version__}")
+        record("psycopg        ", psycopg.__version__)
     except ImportError:
-        print("psycopg         : NOT INSTALLED")
-    print(f"docker          : {run(['docker', '--version'])}")
+        record("psycopg        ", "NOT INSTALLED")
+    record("docker         ", run(["docker", "--version"]))
     print()
     # Read the reference off the running container rather than naming a tag
     # here. compose.yaml pins each image as tag@sha256:..., and a host that
@@ -56,12 +70,14 @@ def main() -> int:
     for container in ("migr8-oracle", "migr8-postgres"):
         ref = run(["docker", "inspect", container, "--format", "{{.Config.Image}}"])
         print(f"container       : {container}")
-        print(f"  image         : {ref}")
+        record("  image        ", ref)
         if ref.startswith("<unavailable"):
-            print("  architecture  : <unavailable: no image reference>")
+            record("  architecture ", "<unavailable: no image reference>")
             continue
-        arch = run(["docker", "image", "inspect", ref, "--format", "{{.Architecture}}"])
-        print(f"  architecture  : {arch}")
+        record(
+            "  architecture ",
+            run(["docker", "image", "inspect", ref, "--format", "{{.Architecture}}"]),
+        )
     print()
 
     dsn = f"localhost:{os.environ.get('ORACLE_HOST_PORT', '15210')}/FREEPDB1"
@@ -74,10 +90,10 @@ def main() -> int:
             dsn=dsn,
         ) as connection:
             banner = connection.cursor().execute("SELECT banner_full FROM v$version").fetchone()
-            print(f"oracle server   : {banner[0] if banner else connection.version}")
+            record("oracle server  ", str(banner[0] if banner else connection.version))
             print(f"oracle thin mode: {connection.thin}")
     except Exception as exc:
-        print(f"oracle server   : NOT RUN ({type(exc).__name__}: {exc})")
+        record("oracle server  ", f"NOT RUN ({type(exc).__name__}: {exc})")
 
     try:
         import psycopg
@@ -92,9 +108,15 @@ def main() -> int:
         with psycopg.connect(info, autocommit=True) as connection:
             row = connection.execute("SELECT version()").fetchone()
             assert row is not None
-            print(f"postgres server : {row[0]}")
+            record("postgres server", str(row[0]))
     except Exception as exc:
-        print(f"postgres server : NOT RUN ({type(exc).__name__}: {exc})")
+        record("postgres server", f"NOT RUN ({type(exc).__name__}: {exc})")
+
+    if INCOMPLETE:
+        print()
+        print(f"INCOMPLETE: could not read {', '.join(INCOMPLETE)}")
+        print("This output does not back an acceptance claim.")
+        return 1
     return 0
 
 
