@@ -24,9 +24,36 @@ testenv/dbctl.sh down        # remove containers, keep volumes
 testenv/dbctl.sh destroy     # remove containers AND this project's volumes
 ```
 
-`up` checks the Docker daemon, architecture and available memory before pulling
-or starting anything, and warns if the daemon has less than 3 GB, which the
-Oracle image needs.
+`up` checks that an engine answers on the current `docker context` before
+pulling or starting anything, prints its version, architecture and memory, and
+warns below 3 GB, which the Oracle image needs.
+
+## Container engine
+
+The scripts use the `docker` CLI and its Compose plugin and run against any
+engine that serves the Docker API on the current `docker context`. CI uses the
+runner's dockerd. On macOS the engine is podman; Docker Desktop is not
+installed:
+
+```bash
+brew install podman docker docker-compose
+podman machine init --cpus 4 --memory 8192 --now
+docker context create podman \
+  --docker "host=unix://$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+docker context use podman
+```
+
+The brew Compose plugin sits outside the CLI's default plugin directories, so
+`~/.docker/config.json` needs the line brew's install notes give:
+`"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]`. After a
+reboot, `podman machine start` brings the engine back; a user LaunchAgent that
+runs it at login removes that step.
+
+Measured on 2026-09-15 with that setup (podman 6.1.1, rootless, applehv, 4 CPUs,
+8 GiB, arm64): `up` on a cold machine including image pulls 28 s; `test`
+776 passed and 3 skipped in 79 s; `provision_tls.sh` on a fresh container 41 s.
+colima 0.10.3 with dockerd 29.5.2 ran the same commands unmodified the same day
+with the same counts, `up` 36 s and `test` 83 s.
 
 ## What gets created
 
@@ -74,10 +101,13 @@ State the blocker and carry on: the live suites skip with a message naming the
 missing environment variables, and the corresponding acceptance gate stays
 visibly incomplete rather than being satisfied by a mock. Common causes:
 
-- **Docker daemon not reachable.** `dbctl.sh` says so and stops.
+- **No engine answers.** `dbctl.sh` names the `docker context` it tried and
+  stops. Start that engine (`podman machine start` on macOS) or select another
+  with `docker context use`.
 - **Port already allocated.** Set `ORACLE_HOST_PORT` or `POSTGRES_HOST_PORT` in
   `testenv/.env`. Do not stop the container that holds the port unless it is
   yours.
-- **Oracle never becomes healthy.** Check `dbctl.sh logs oracle`. The first start
-  initialises the database and takes several minutes; the health wait allows 15.
-  Low memory is the usual cause.
+- **Oracle never becomes healthy.** Check `dbctl.sh logs oracle`. With the
+  pinned image the first start reached healthy in under a minute on 2026-09-15
+  on both engines tried; the wait allows 15 minutes. Low memory is the usual
+  cause of a stall.

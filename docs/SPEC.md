@@ -671,7 +671,7 @@ One more Oracle detail shapes the adapter. Oracle assigns a local transaction id
 
 Recommended local development path: run Oracle Database Free in a disposable container using the maintained `gvenzl/oracle-free` images. The project provides ARM64 images from the 23.5 generation onward, suitable for an Apple Silicon development host. Select a currently available compatible tag and pin its digest in the test infrastructure; record the actual server banner, since image tags and product names evolve.
 
-Docker Desktop or another working local container runtime is sufficient if it supports the image. Check the daemon, architecture, disk space, and configured memory before downloading or starting the Oracle image. Bind published database ports to loopback. Use an isolated Compose project, dedicated test credentials, dedicated volumes or disposable storage, and a health check before running tests.
+A local engine that serves the Docker API, such as podman or dockerd, is sufficient if it runs the image. Check the engine, architecture, disk space, and configured memory before downloading or starting the Oracle image. Bind published database ports to loopback. Use an isolated Compose project, dedicated test credentials, dedicated volumes or disposable storage, and a health check before running tests.
 
 Create a disposable migration user/schema with the required metadata/migration privileges and a `DBMS_LOCK` grant or test wrapper. If exercising separate connect-user/target-schema behavior, use a second controlled fixture for those grants. Run setup as an administrator only against the explicitly identified disposable test instance. Do not reuse a production service or credentials as a fallback.
 

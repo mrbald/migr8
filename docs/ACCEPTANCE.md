@@ -108,6 +108,18 @@ Compose. Result: **776 passed, 3 skipped** -- the two Oracle TLS tests and the
 bounded-filesystem test, no service skip. The same run on 3.14.7 gave the same
 counts.
 
+Later on 2026-09-15 the suite was run by `testenv/dbctl.sh test`, the command
+CI runs, on the same host with Docker Desktop not running: the `docker` CLI
+29.8.0 and Compose 5.5.1 from Homebrew on a `docker context` pointing at
+**podman 6.1.1** (rootless, applehv, 4 CPUs, 8 GiB), Python 3.14.0. `dbctl.sh
+up` from a cold machine took 28 s including image pulls, `dbctl.sh versions`
+exited 0 with both pinned digests, and the suite gave **776 passed, 3 skipped
+in 79 s**, the same three skips. `testenv/provision_tls.sh` completed on a
+fresh container in 41 s, and the bounded-filesystem case passed in a
+`python:3.14-slim` container with `--tmpfs /small:size=8m` in 7 s. colima
+0.10.3 with dockerd 29.5.2 ran the same commands unmodified the same day:
+`up` 36 s, **776 passed, 3 skipped in 83 s**.
+
 | Service | Image | Digest | Recorded server banner |
 |---|---|---|---|
 | Oracle | `gvenzl/oracle-free:23.9-slim` | `sha256:945400df5e3fc9589db628223385f906e1024932dc3b72e118fc4fcd0f0e9bbb` | Oracle Database 23ai Free Release 23.0.0.0.0, Version **23.9.0.25.07** |
@@ -479,7 +491,7 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 | Gate | Status | What would close it |
 |---|---|---|
 | Client-side statement timeout | **NOT IMPLEMENTED, by decision** | Nothing bounds a single migration statement; a blocked statement holds the namespace lock indefinitely. The specification declines a client-side timeout for the initial runner, and adding one would create a new unknown-outcome surface, since a timeout firing during a commit is indistinguishable from a lost acknowledgement. Bound long statements with database policy instead: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout` on PostgreSQL. |
-| Host-to-container TCP under Apple `container` | **BLOCKED on this machine** | Published ports reset and direct container IPs gave "no route to host" while ICMP succeeded, so the Apple `container` deployment runs the migration job as a sibling container. Both engines pass that way. See [`../deploy/apple-container/README.md`](../deploy/apple-container/README.md). The acceptance suite uses the Docker Compose services, which publish working host ports. |
+| Host-to-container TCP under Apple `container` | **PASS at 1.4.1; blocked at 1.2.2** | On 2026-09-15 with `container` CLI 1.4.1, a PostgreSQL 17.5 container accepted host connections on a published port (`127.0.0.1:15499`) and on its own address, 4 s after start, and the 3.12 run above drove the whole suite from a host interpreter against container addresses. At 1.2.2, published ports reset and direct addresses gave "no route to host" while ICMP succeeded, which is why the deployment example runs the job as a sibling container. See [`../deploy/apple-container/README.md`](../deploy/apple-container/README.md). The acceptance suite uses the Compose services, which publish host ports. |
 | Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle publishes no freely redistributable 19c container image, so this gate needs a licensed installation. Results on Free 23ai are results on Free 23ai; 19c support is not published on the strength of them. |
 | python-oracledb Thick mode | **PASS, one client** | All 97 Oracle tests pass in Thick mode with Instant Client 23.9.0.25.07 on Linux ARM64, recorded above. One client version, one architecture, one server release; and no Thick-mode-only feature is used, so this says the adapter works through that stack, not that it exercises it. |
 | TNS aliases and a driver configuration directory | **PASS, aliases only** | `oracle.config_dir` with a `tnsnames.ora` alias resolves in both modes against a real listener. `sqlnet.ora` settings, a wallet directory and Easy Connect Plus parameters are not exercised. |
