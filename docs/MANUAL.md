@@ -571,10 +571,10 @@ Run migrations as a one-shot job with the tool and the migrations in the **same
 immutable artifact**. If the migration tree can change after the artifact is
 built, the fingerprint is not protecting anything.
 
-A worked example, using Apple's `container` runtime on macOS, is in
-[`../deploy/apple-container/`](../deploy/apple-container/): the migrations are baked
-into the image, only the generated config is mounted, the password arrives through
-the environment, and the job runs as an unprivileged user.
+A worked example is in [`../deploy/container-job/`](../deploy/container-job/):
+the migrations are baked into the image, only the generated config is mounted,
+the password arrives through the environment, and the job runs as an
+unprivileged user on any engine that serves the Docker API.
 
 Operational notes:
 
