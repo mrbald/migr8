@@ -62,9 +62,13 @@ for entry in "${PKI_JARS[@]}"; do
   got="$(shasum -a 256 "$staging/$file" | cut -d' ' -f1)"
   [[ "$got" == "$want" ]] || die "$file has digest $got, expected $want"
 done
-# docker cp writes as root, so the staging directory is cleared as root too.
+# Who owns the copy depends on the engine: Docker writes it as root and keeps
+# the directory's mode, podman applies the archive's owner and mode, and mktemp
+# made the staging directory 0700. Clearing the directory as root and opening it
+# again after the copy leaves the jars readable by oracle either way.
 docker exec -u 0 "$CONTAINER" bash -lc 'rm -rf /tmp/pki && mkdir -p /tmp/pki'
 docker cp "$staging/." "$CONTAINER:/tmp/pki/" >/dev/null
+docker exec -u 0 "$CONTAINER" chmod -R a+rX /tmp/pki
 
 # --- wallets -------------------------------------------------------------------------
 
@@ -127,7 +131,12 @@ lsnrctl start >/dev/null
 echo 'ALTER SYSTEM REGISTER;' | sqlplus -s / as sysdba >/dev/null
 "
 sleep 3
-docker exec "$CONTAINER" bash -lc 'lsnrctl status' | grep -q "PROTOCOL=tcps" \
+# Read the whole listing before matching it. grep -q exits at its first match,
+# and a writer still sending the rest then fails on the closed pipe, which
+# pipefail turns into a failed pipeline after a successful match. A listener
+# restarted a moment ago answers in several pieces, so that is when it happens.
+endpoints="$(docker exec "$CONTAINER" bash -lc 'lsnrctl status')"
+grep -q "PROTOCOL=tcps" <<<"$endpoints" \
   || die "the listener has no TCPS endpoint; see: docker exec $CONTAINER lsnrctl status"
 
 # --- the certificate identity and what it may become ---------------------------------
