@@ -126,7 +126,7 @@ cmd_test() {
   skips="$(sed $'s/\x1b\\[[0-9;]*m//g' "$log" | grep '^SKIPPED' || true)"
   rm -f "$log"
   echo "${skips:-nothing skipped}"
-  if printf '%s\n' "$skips" | grep -qE 'not reachable|not configured|is unset|could not import'; then
+  if grep -qE 'not reachable|not configured|is unset|could not import' <<<"$skips"; then
     die "a live suite skipped; the service it needs is unreachable"
   fi
   return "$status"
