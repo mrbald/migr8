@@ -3,7 +3,7 @@ name = "migr8"
 dynamic = ["version"]
 description = "An inspectable database migration engine: ordered manifest, immutable history, atomic and restartable migrations. Oracle primary target."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE", "LICENSING.md", "COMMERCIAL.md"]
 authors = [{ name = "migr8 authors", email = "mail@bobah.net" }]
@@ -22,6 +22,8 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: System Administrators",
   "Operating System :: POSIX",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Topic :: Database",
   "Topic :: Software Development :: Version Control",
@@ -98,8 +100,10 @@ ignore = [
   "RUF059",
 ]
 
+# Type-check at the supported floor, so a 3.13 or 3.14 only API is an error
+# here rather than a failure on an operator's 3.12 interpreter.
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 files = ["src/migr8", "testenv"]
 warn_unused_ignores = true
 warn_redundant_casts = true

@@ -35,9 +35,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # The floor from pyproject.toml. The dependency sets recorded below are
+      # resolved here, so resolving at the floor keeps them installable across
+      # the whole supported range; the smoke environments use it for the same
+      # reason. The wheel itself is pure Python and tagged py3-none-any.
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.14"
+          python-version: "3.12"
       - run: uv sync --all-extras
 
       # The tag is the release's name and src/migr8/version.py is the version
@@ -107,7 +111,7 @@ jobs:
           wheel="$(ls dist/*.whl)"
           work="$(mktemp -d)"
           cp -r examples/sqlite "$work/example"
-          uv venv --python 3.14 "$work/venv"
+          uv venv --python 3.12 "$work/venv"
           uv pip install --python "$work/venv/bin/python" "$wheel"
           # Installed, not imported from the checkout: a source-tree import would
           # test the repository rather than the artifact.
@@ -140,7 +144,7 @@ jobs:
           work="$(mktemp -d)"
           cp -r examples/oracle "$work/example"
           sed -i 's/MIGR8_TEST/MIGR8_SMOKE/g' "$work/example/migr8.toml"
-          uv venv --python 3.14 "$work/venv"
+          uv venv --python 3.12 "$work/venv"
           uv pip install --python "$work/venv/bin/python" "${wheel}[oracle]"
           uv pip list --python "$work/venv/bin/python" --format=freeze | tee "$work/installed.txt"
           grep -qi '^oracledb' "$work/installed.txt"

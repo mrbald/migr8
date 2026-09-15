@@ -370,7 +370,7 @@ class Engine:
             )
         except UnknownOutcomeError:
             raise
-        except ContractViolationError, MigrationFailedError:
+        except (ContractViolationError, MigrationFailedError):
             # Roll back what remains; no success row is written.  After a contract
             # violation, durable effects of non-compliant code may still need
             # remediation.
@@ -453,7 +453,7 @@ class Engine:
             context = self._invoke(unit, attempt=attempt)
         except UnknownOutcomeError:
             raise
-        except ContractViolationError, MigrationFailedError:
+        except (ContractViolationError, MigrationFailedError):
             self._post_return_cleanup(unit)
             raise
         except Exception as exc:

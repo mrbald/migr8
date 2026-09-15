@@ -20,7 +20,7 @@ and wallets.
 
 ## Install
 
-Requires Python 3.14 or later on a POSIX host. One wheel carries every adapter;
+Requires Python 3.12 or later on a POSIX host. One wheel carries every adapter;
 the extras decide which driver is installed with it.
 
 **On a server.** Install into a virtual environment of its own, from your index
@@ -28,7 +28,7 @@ or proxy, and pin the version:
 
 ```bash
 export PIP_INDEX_URL=https://proxy.internal/simple     # your index or proxy
-python3.14 -m venv /opt/migr8
+python3 -m venv /opt/migr8            # 3.12 or later
 /opt/migr8/bin/pip install 'migr8[oracle]==<approved-version>'   # Oracle
 /opt/migr8/bin/pip install 'migr8==<approved-version>'           # SQLite only
 /opt/migr8/bin/migr8 --version                                   # self-check

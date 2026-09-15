@@ -94,6 +94,20 @@ A second environment, for the results labelled *Linux* below: `python:3.14-slim`
 **3.46.1**, run as an unprivileged user. Both SQLite library versions are
 therefore covered, 3.50.4 on the host and 3.46.1 there.
 
+The supported floor is Python 3.12 (`requires-python` in `pyproject.toml`).
+Every other measurement in this report was taken on 3.14 and is evidence for
+3.14 only. CI runs lint, types and the service-free suite on both 3.12 and 3.14
+on every push.
+
+The whole suite was run at the floor on 2026-09-15: Python **3.12.12** on Darwin
+25.6.0 arm64, against Oracle Free **23.9.0.25.7** and **PostgreSQL 17.5** from
+the image digests `testenv/compose.yaml` pins. The services ran under Apple
+`container` 1.4.1 and were reached on the container network, not through a
+published port; `testenv/dbctl.sh` was not used, because it drives Docker
+Compose. Result: **776 passed, 3 skipped** -- the two Oracle TLS tests and the
+bounded-filesystem test, no service skip. The same run on 3.14.7 gave the same
+counts.
+
 | Service | Image | Digest | Recorded server banner |
 |---|---|---|---|
 | Oracle | `gvenzl/oracle-free:23.9-slim` | `sha256:945400df5e3fc9589db628223385f906e1024932dc3b72e118fc4fcd0f0e9bbb` | Oracle Database 23ai Free Release 23.0.0.0.0, Version **23.9.0.25.07** |
