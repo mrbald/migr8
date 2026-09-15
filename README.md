@@ -23,7 +23,7 @@ which gates are open.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module layering, what each adapter owns, and the standing design positions. |
 | [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | What was tested, against which versions, and which gates are open. |
 | [`docs/ORACLE-CONNECTIONS.md`](docs/ORACLE-CONNECTIONS.md) | Thin and thick drivers, TNS aliases, proxy authentication, wallets and TLS. |
-| [`deploy/apple-container/`](deploy/apple-container/) | Running the migration job as a container under Apple's `container` runtime. |
+| [`deploy/container-job/`](deploy/container-job/) | Running the migration job as a container image against the test databases. |
 
 ## What it does
 

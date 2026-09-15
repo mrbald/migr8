@@ -491,7 +491,7 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 | Gate | Status | What would close it |
 |---|---|---|
 | Client-side statement timeout | **NOT IMPLEMENTED, by decision** | Nothing bounds a single migration statement; a blocked statement holds the namespace lock indefinitely. The specification declines a client-side timeout for the initial runner, and adding one would create a new unknown-outcome surface, since a timeout firing during a commit is indistinguishable from a lost acknowledgement. Bound long statements with database policy instead: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout` on PostgreSQL. |
-| Host-to-container TCP under Apple `container` | **PASS at 1.4.1; blocked at 1.2.2** | On 2026-09-15 with `container` CLI 1.4.1, a PostgreSQL 17.5 container accepted host connections on a published port (`127.0.0.1:15499`) and on its own address, 4 s after start, and the 3.12 run above drove the whole suite from a host interpreter against container addresses. At 1.2.2, published ports reset and direct addresses gave "no route to host" while ICMP succeeded, which is why the deployment example runs the job as a sibling container. See [`../deploy/apple-container/README.md`](../deploy/apple-container/README.md). The acceptance suite uses the Compose services, which publish host ports. |
+| Host-to-container TCP under Apple `container` | **PASS at 1.4.1; blocked at 1.2.2** | On 2026-09-15 with `container` CLI 1.4.1, a PostgreSQL 17.5 container accepted host connections on a published port (`127.0.0.1:15499`) and on its own address, 4 s after start, and the 3.12 run above drove the whole suite from a host interpreter against container addresses. At 1.2.2, published ports reset and direct addresses gave "no route to host" while ICMP succeeded, which is why the deployment example runs the job as a sibling container. See [`../deploy/container-job/APPLE-CONTAINER.md`](../deploy/container-job/APPLE-CONTAINER.md). The acceptance suite uses the Compose services, which publish host ports. |
 | Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle publishes no freely redistributable 19c container image, so this gate needs a licensed installation. Results on Free 23ai are results on Free 23ai; 19c support is not published on the strength of them. |
 | python-oracledb Thick mode | **PASS, one client** | All 97 Oracle tests pass in Thick mode with Instant Client 23.9.0.25.07 on Linux ARM64, recorded above. One client version, one architecture, one server release; and no Thick-mode-only feature is used, so this says the adapter works through that stack, not that it exercises it. |
 | TNS aliases and a driver configuration directory | **PASS, aliases only** | `oracle.config_dir` with a `tnsnames.ora` alias resolves in both modes against a real listener. `sqlnet.ora` settings, a wallet directory and Easy Connect Plus parameters are not exercised. |
@@ -563,30 +563,24 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
    the target Linux, and record the architecture, the resolved dependency set and
    the installation self-check.
 
-## Deployment under Apple `container`
+## Deployment as a container job
 
-Separate from the acceptance gates above, the containerised deployment in
-[`../deploy/apple-container/`](../deploy/apple-container/) was run end to end on
-this machine. **The run predates the current scripts and has not been repeated
-against them**, so read the table as evidence about the runtime rather than about
-the files as they stand:
+Separate from the acceptance gates above, the deployment example in
+[`../deploy/container-job/`](../deploy/container-job/) builds the migration job
+as an image and runs it as a container on the Compose network against the
+disposable databases, in schemas of its own. Run on 2026-09-15 on this host,
+podman 6.1.1 through the docker CLI 29.8.0:
 
-| Component | Version | Result |
-|---|---|---|
-| `container` CLI | 1.2.2 on macOS 26.6.2, arm64 | runtime works |
-| Oracle Database Free | 23.9.0.25.07, `gvenzl/oracle-free:23.9-slim` | **migrate and status pass**, 5 migrations |
-| PostgreSQL | 17.5, `postgres:17.5` | **migrate and validate pass**, 4 migrations |
-| Migration job image | `python:3.14-slim`, Python 3.14.7 | builds and runs unprivileged |
+| Step | Result |
+|---|---|
+| `ctl.sh build`: `python:3.14-slim`, migr8 with both drivers, unprivileged user | builds, 208 MB |
+| `migrate`, `status`, `validate` on Oracle Free 23.9.0.25.07, schema `MIGR8_JOB` | **5 migrations applied, exit 0 on all three** |
+| `migrate`, `validate`, `status` on PostgreSQL 17.5, schema `migr8_job` | **4 migrations applied, exit 0 on all three** |
+| event log | 54 events in `generated/runs/run.jsonl` on the host after the containers were removed |
 
-One change since that run: the job's event log was written inside a container
-started with `--rm`, so it disappeared with the container. `ctl.sh` now mounts a
-host directory over `/var/log/migr8` and `ctl.sh runlog` prints it. Rebuilt and
-checked on 2026-09-13 with `container` CLI 1.4.1: the image builds, and a job run
-with that mount leaves `run.jsonl` on the host with the run's events in it. The
-database runs in the table above have **not** been repeated.
+The `databases` job in `.github/workflows/ci.yml` runs the same steps after the
+suite.
 
-Two runtime limitations were found and are documented rather than worked around:
-Oracle cannot initialise into an Apple `container` named volume, so the disposable
-database uses the container's own writable layer; and host-to-container TCP did not
-work on this machine, so the job runs as a sibling container, which is the
-production shape anyway.
+Earlier runs of this example under Apple `container` (CLI 1.2.2 and 1.4.1),
+with the databases started by the script of that time, are recorded in
+[`../deploy/container-job/APPLE-CONTAINER.md`](../deploy/container-job/APPLE-CONTAINER.md).

@@ -77,6 +77,20 @@ jobs:
       # docs/ACCEPTANCE.md records running the skipped fixtures elsewhere.
       - name: full suite against both servers
         run: testenv/dbctl.sh test -q
+      # The deployment example, run the way an operator would: the image is
+      # built from this checkout and the job runs as a container on the Compose
+      # network, against schemas of its own. deploy/container-job/README.md
+      # describes the shape.
+      - name: the migration job runs as a container against both servers
+        run: |
+          set -euo pipefail
+          deploy/container-job/ctl.sh provision
+          deploy/container-job/ctl.sh build
+          deploy/container-job/ctl.sh migrate oracle
+          deploy/container-job/ctl.sh validate oracle
+          deploy/container-job/ctl.sh migrate postgres
+          deploy/container-job/ctl.sh validate postgres
+          deploy/container-job/ctl.sh runlog | tail -n 1
       - name: service logs
         if: failure()
         run: testenv/dbctl.sh logs

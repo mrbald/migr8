@@ -8,7 +8,7 @@
 #   * it runs as an unprivileged user and carries no credentials. The database
 #     password is supplied at run time through MIGR8_PASSWORD.
 #
-# Build with: deploy/apple-container/ctl.sh build
+# Build with: deploy/container-job/ctl.sh build
 
 FROM python:3.14-slim
 
@@ -24,9 +24,8 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-compile '.[oracle,postgres]'
 
-# Migrations and the provisioning helpers used by the disposable test setup.
+# The migrations.
 COPY examples ./examples
-COPY testenv/provision_oracle.py testenv/provision_postgres.py ./testenv/
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin runner \
     && mkdir -p /var/log/migr8 && chown runner /var/log/migr8

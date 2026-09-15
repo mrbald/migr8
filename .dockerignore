@@ -1,0 +1,18 @@
+# Build context for deploy/container-job/Containerfile. The image copies
+# pyproject.toml, README.md, src/ and examples/; everything else only slows the
+# upload of the context, and a __pycache__ inside a migration unit would make
+# the tool refuse that unit.
+.git
+.venv
+.scratch
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+dist
+build
+**/__pycache__
+**/*.py[cod]
+testenv/tls
+testenv/secrets
+deploy/container-job/generated
