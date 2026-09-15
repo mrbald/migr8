@@ -39,14 +39,20 @@ PY="$ROOT/.venv/bin/python"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# The engine is whatever serves the Docker API on the current `docker context`:
+# dockerd on a CI runner, podman on a developer's machine. The line printed here
+# names it, because a result recorded without it cannot say what ran the
+# containers.
 check_runtime() {
   command -v docker >/dev/null || die "docker CLI not found"
-  docker info >/dev/null 2>&1 || die "the Docker daemon is not reachable; start it first"
-  local mem
+  local context mem
+  context="$(docker context show)"
+  docker info >/dev/null 2>&1 \
+    || die "no engine answers on docker context '${context}'; start the engine that context names, or select another with 'docker context use'"
   mem="$(docker info --format '{{.MemTotal}}')"
-  echo "runtime: $(docker info --format '{{.ServerVersion}}') arch=$(docker info --format '{{.Architecture}}') cpus=$(docker info --format '{{.NCPU}}') mem=${mem}"
+  echo "engine: $(docker info --format '{{.ServerVersion}} on {{.OperatingSystem}}') context=${context} arch=$(docker info --format '{{.Architecture}}') cpus=$(docker info --format '{{.NCPU}}') mem=${mem}"
   if (( mem < 3000000000 )); then
-    echo "warning: less than 3 GB is available to Docker; the Oracle image may fail to start" >&2
+    echo "warning: less than 3 GB is available to the engine; the Oracle image may fail to start" >&2
   fi
 }
 

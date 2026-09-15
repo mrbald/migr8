@@ -59,14 +59,22 @@ def main() -> int:
         record("psycopg        ", psycopg.__version__)
     except ImportError:
         record("psycopg        ", "NOT INSTALLED")
-    record("docker         ", run(["docker", "--version"]))
+    record("docker cli     ", run(["docker", "--version"]))
+    # The CLI version says nothing about what ran the containers. The engine
+    # behind the current context does, and it differs between a CI runner
+    # (dockerd) and a developer's machine (podman).
+    engine_format = "{{.ServerVersion}} on {{.OperatingSystem}} {{.Architecture}}"
+    record("engine         ", run(["docker", "info", "--format", engine_format]))
+    record("docker context ", run(["docker", "context", "show"]))
     print()
     # Read the reference off the running container rather than naming a tag
     # here. compose.yaml pins each image as tag@sha256:..., and a host that
     # pulled that pinned reference has no bare tag to inspect -- which is every
     # clean runner, so the tag lookup reported nothing exactly where the
     # evidence mattered most. This also keeps one source of truth: whatever
-    # compose started is what gets recorded.
+    # compose started is what gets recorded. podman's API reports the reference
+    # as a canonical name@sha256 without the tag; the digest is the evidence
+    # either way.
     for container in ("migr8-oracle", "migr8-postgres"):
         ref = run(["docker", "inspect", container, "--format", "{{.Config.Image}}"])
         print(f"container       : {container}")
