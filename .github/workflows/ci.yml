@@ -4,8 +4,10 @@
 # `databases` brings up Oracle and PostgreSQL and runs the whole suite against
 # them. README's "tests" badge tracks this workflow, so it covers both jobs.
 #
-# One Python version: the package requires >= 3.14 and uses 3.14 syntax
-# (PEP 758 unparenthesised `except`).
+# `checks` runs on the oldest and newest supported interpreters. The floor in
+# pyproject.toml is a promise to operators, and an untested floor is not one.
+# `databases` runs on the newest only: it provisions Oracle, which dominates
+# its runtime, and the adapters it exercises are version-independent DB-API.
 
 name: tests
 
@@ -18,11 +20,16 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    name: checks (${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras
       # The whole repository, which is the command AGENTS.md documents: the
       # Python blocks in docs/ and the example migrations are checked too.
