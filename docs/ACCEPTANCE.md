@@ -118,7 +118,9 @@ in 79 s**, the same three skips. `testenv/provision_tls.sh` completed on a
 fresh container in 41 s, and the bounded-filesystem case passed in a
 `python:3.14-slim` container with `--tmpfs /small:size=8m` in 7 s. colima
 0.10.3 with dockerd 29.5.2 ran the same commands unmodified the same day:
-`up` 36 s, **776 passed, 3 skipped in 83 s**.
+`up` 36 s, **776 passed, 3 skipped in 83 s**. On 2026-09-16, with Docker
+Desktop uninstalled from the host, `dbctl.sh up` and `dbctl.sh test` on podman
+gave the same result: **776 passed, 3 skipped in 80 s**.
 
 | Service | Image | Digest | Recorded server banner |
 |---|---|---|---|
