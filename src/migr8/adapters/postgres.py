@@ -20,9 +20,16 @@ import time
 from typing import Any
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 
-from ..config import Config
-from ..errors import ConfigError, LockNotAcquiredError, UsageError
+from ..config import PASSWORD_ENV, Config
+from ..errors import (
+    ConfigError,
+    LockNotAcquiredError,
+    Migr8Error,
+    UnknownOutcomeError,
+    UsageError,
+)
 from ..manifest import Mode
 from ..model import (
     ACTIVE_INDEX,
@@ -35,6 +42,7 @@ from ..sqltext import Statement
 from . import metadata as md
 from .base import (
     Adapter,
+    BatchTransactionState,
     Boundary,
     Capabilities,
     OutcomeClass,
@@ -96,12 +104,35 @@ _POLICY = StatementPolicy(
         }
     ),
     allows_plsql=False,
+    cte_bodies_modify=True,
 )
+
+
+def _check_dsn_credentials(dsn: str, configured_user: str | None) -> None:
+    """Refuse a DSN password and a DSN user that contradicts ``database.user``.
+
+    The password comes from ``MIGR8_PASSWORD`` only. The DSN is parsed by libpq's
+    rules, so the key=value and URI forms are both covered. Messages name the
+    settings and never repeat the DSN, which can hold a secret.
+    """
+    try:
+        parts = conninfo_to_dict(dsn)
+    except psycopg.Error:
+        raise ConfigError("database.dsn is not a valid PostgreSQL connection string") from None
+    if "password" in parts:
+        raise ConfigError(
+            f"database.dsn carries a password; remove it and set {PASSWORD_ENV} instead"
+        )
+    dsn_user = parts.get("user")
+    if configured_user and dsn_user and configured_user != dsn_user:
+        raise ConfigError(
+            "database.user and the user in database.dsn differ; set the user in one of them"
+        )
 
 
 def _require_identifier(value: str, what: str) -> str:
     lower = value.lower()
-    if not IDENTIFIER_RE.match(lower) or lower != value:
+    if not IDENTIFIER_RE.fullmatch(lower) or lower != value:
         raise ConfigError(
             f"{what} must be an unquoted lowercase PostgreSQL identifier matching "
             f"[a-z_][a-z0-9_$]*; got {value!r}"
@@ -124,6 +155,7 @@ class PostgresAdapter(Adapter):
         super().__init__(config)
         if not config.dsn:
             raise ConfigError("the postgres adapter requires database.dsn")
+        _check_dsn_credentials(config.dsn, config.user)
         self._schema = _require_identifier(
             config.target_schema or "public", "database.target_schema"
         )
@@ -192,14 +224,19 @@ class PostgresAdapter(Adapter):
     # --- lifecycle --------------------------------------------------------------------------------
 
     def connect(self) -> None:
+        # User and password travel as keyword arguments, so a password may
+        # contain spaces, quotes, backslashes and `=`, and cannot add connection
+        # keys.
+        credentials: dict[str, Any] = {}
+        if self.config.user:
+            credentials["user"] = self.config.user
         password = self.config.password()
-        conninfo = self.config.dsn or ""
         if password:
-            conninfo = f"{conninfo} password={password}"
+            credentials["password"] = password
         try:
             # Autocommit at the driver level; every engine transaction is an
             # explicit BEGIN/COMMIT issued by this adapter.
-            self._conn = psycopg.connect(conninfo, autocommit=True)
+            self._conn = psycopg.connect(self.config.dsn or "", autocommit=True, **credentials)
         except psycopg.Error as exc:
             # The driver's connection message repeats the connection string, so it
             # is reported by code and the operator is pointed at the settings.
@@ -207,9 +244,14 @@ class PostgresAdapter(Adapter):
                 f"cannot connect to PostgreSQL: {self.describe_exception(exc)}. Check "
                 "database.dsn, database.user and the MIGR8_PASSWORD environment variable."
             ) from exc
-        self._configure_session()
-        self._banner = self._read_banner()
-        self._session_identity = self._read_session_identity()
+        try:
+            self._configure_session()
+            self._banner = self._read_banner()
+            self._session_identity = self._read_session_identity()
+        except BaseException:
+            # The engine does not close a session whose connect() raised.
+            self.discard()
+            raise
 
     def _configure_session(self) -> None:
         conn = self._db
@@ -218,9 +260,10 @@ class PostgresAdapter(Adapter):
             conn.execute("SET synchronous_commit = on")
             row = conn.execute("SHOW synchronous_commit").fetchone()
         except psycopg.Error as exc:
-            raise UsageError(
-                f"cannot establish synchronous commit durability: {exc}. There is no "
-                "setting to weaken required commit durability, so setup fails."
+            raise self.setup_error(
+                exc,
+                "establishing synchronous commit durability",
+                hint="There is no setting to weaken required commit durability, so setup fails.",
             ) from exc
         value = row[0] if row else None
         if value != "on":
@@ -230,12 +273,19 @@ class PostgresAdapter(Adapter):
             )
         self._synchronous_commit = "VERIFIED 'on' by session read-back"
         try:
-            conn.execute(f"SET search_path = {self.quoted(self._schema)}, pg_catalog")
+            # The path names only the target schema. PostgreSQL searches pg_catalog
+            # before the listed schemas unless it is listed itself, so a function in
+            # the target schema cannot shadow the engine's unqualified calls, such as
+            # pg_try_advisory_lock or clock_timestamp.
+            conn.execute(f"SET search_path = {self.quoted(self._schema)}")
         except psycopg.Error as exc:
-            raise UsageError(f"cannot set search_path to {self._schema}: {exc}") from exc
-        row = conn.execute(
-            "SELECT 1 FROM pg_namespace WHERE nspname = %s", (self._schema,)
-        ).fetchone()
+            raise self.setup_error(exc, f"setting search_path to {self._schema}") from exc
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM pg_namespace WHERE nspname = %s", (self._schema,)
+            ).fetchone()
+        except psycopg.Error as exc:
+            raise self.setup_error(exc, f"looking up the target schema {self._schema}") from exc
         if row is None:
             raise UsageError(
                 f"target schema {self._schema!r} does not exist; create it before running "
@@ -243,16 +293,22 @@ class PostgresAdapter(Adapter):
             )
 
     def _read_banner(self) -> str:
-        row = self._db.execute("SELECT version()").fetchone()
+        try:
+            row = self._db.execute("SELECT version()").fetchone()
+        except psycopg.Error as exc:
+            raise self.setup_error(exc, "reading the server version") from exc
         return f"{row[0]} [psycopg {psycopg.__version__}]" if row else "unknown"
 
     def _read_session_identity(self) -> str:
-        row = self._db.execute(
-            "SELECT pg_backend_pid(), "
-            "to_char(backend_start, 'YYYY-MM-DD\"T\"HH24:MI:SS.US'), "
-            "current_setting('cluster_name', true) "
-            "FROM pg_stat_activity WHERE pid = pg_backend_pid()"
-        ).fetchone()
+        try:
+            row = self._db.execute(
+                "SELECT pg_backend_pid(), "
+                "to_char(backend_start, 'YYYY-MM-DD\"T\"HH24:MI:SS.US'), "
+                "current_setting('cluster_name', true) "
+                "FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+            ).fetchone()
+        except psycopg.Error as exc:
+            raise self.setup_error(exc, "reading the session identity") from exc
         if row is None:
             return f"pid={self._db.info.backend_pid},backend_start=unavailable"
         return f"pid={row[0]},backend_start={row[1]},cluster={row[2] or 'default'}"
@@ -271,6 +327,10 @@ class PostgresAdapter(Adapter):
                 self._conn.close()
             finally:
                 self._conn = None
+
+    @property
+    def connection_held(self) -> bool:
+        return self._conn is not None
 
     def discard(self) -> None:
         """Drop the session without issuing any further SQL."""
@@ -291,7 +351,12 @@ class PostgresAdapter(Adapter):
             raise UsageError("the namespace lock is already held by this run")
         deadline = time.monotonic() + self._lock_timeout
         while True:
-            row = self._db.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_id,)).fetchone()
+            try:
+                row = self._db.execute(
+                    "SELECT pg_try_advisory_lock(%s)", (self._lock_id,)
+                ).fetchone()
+            except psycopg.Error as exc:
+                raise self.setup_error(exc, "acquiring the advisory lock") from exc
             if row and row[0]:
                 self._lock_held = True
                 return
@@ -303,6 +368,11 @@ class PostgresAdapter(Adapter):
                     "failure."
                 )
             time.sleep(self._poll)
+
+    def is_contention(self, exc: BaseException) -> bool:
+        # 55P03 lock_not_available: a setup statement was refused a lock another
+        # session holds.  pg_try_advisory_lock itself never raises it.
+        return isinstance(exc, psycopg.Error) and getattr(exc, "sqlstate", None) == "55P03"
 
     def release_lock(self) -> None:
         if not self._lock_held or self._conn is None:
@@ -335,10 +405,32 @@ class PostgresAdapter(Adapter):
         self._db.execute("BEGIN")
 
     def _do_commit(self) -> None:
-        self._db.execute("COMMIT")
+        """Commit, refusing a transaction the server has already aborted.
+
+        After a statement error PostgreSQL keeps the transaction open in the
+        aborted state, and a COMMIT sent then succeeds with the status tag
+        ``ROLLBACK``: the driver raises nothing and the work is gone.  Author
+        code may catch the statement error, so the aborted state is checked
+        here before COMMIT is sent, and the returned tag is checked after.
+        Both raise ``InFailedSqlTransaction``, whose SQLSTATE 25P02 the
+        classifier reads as a definite rejection.
+        """
+        db = self._db
+        if db.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            raise psycopg.errors.InFailedSqlTransaction(
+                "an earlier statement error aborted the transaction; COMMIT would roll it back"
+            )
+        cursor = db.execute("COMMIT")
+        if cursor.statusmessage == "ROLLBACK":
+            raise psycopg.errors.InFailedSqlTransaction(
+                "COMMIT ended the transaction with ROLLBACK"
+            )
 
     def _do_rollback(self) -> None:
-        if self.has_open_transaction():
+        # Reads the driver's local status without the guarded probe, because
+        # this rollback also runs after the run latch holds a contract
+        # violation, when every guarded call re-raises the latched error.
+        if self._has_open_transaction():
             self._db.execute("ROLLBACK")
 
     @property
@@ -557,10 +649,27 @@ class PostgresAdapter(Adapter):
                 )
             )
             meta, _rows = self._read_meta()
-        finally:
-            if opened:
+        except BaseException as exc:
+            # A failed read ends the read-only transaction only while the session
+            # is still usable. After a communication failure or a latched run the
+            # caller discards the connection, and a COMMIT would send SQL on it
+            # and replace the original error.
+            if opened and not self._session_unusable_after(exc):
                 conn.execute("COMMIT")
+            raise
+        if opened:
+            conn.execute("COMMIT")
         return Snapshot(history=history, progress=progress, meta=meta)
+
+    def _session_unusable_after(self, exc: BaseException) -> bool:
+        """True when no further SQL may be sent after *exc*."""
+        if self.latch is not None and self.latch.latched:
+            return True
+        if isinstance(exc, UnknownOutcomeError):
+            return True
+        if isinstance(exc, Migr8Error):
+            return False
+        return self.classify_exception(exc) is OutcomeClass.COMMUNICATION_FAILURE
 
     # --- transaction control ----------------------------------------------------------------------
 
@@ -569,13 +678,25 @@ class PostgresAdapter(Adapter):
             return False
         return self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE
 
+    def batch_transaction_state(self) -> BatchTransactionState:
+        """The driver's transaction status, read locally.
+
+        An aborted transaction (``INERROR``) still counts as open: it ends only
+        at the engine's COMMIT or ROLLBACK, and :meth:`_do_commit` refuses it.
+        ``IDLE`` means the transaction ended by a commit, as a procedure that
+        commits leaves it.
+        """
+        if self._has_open_transaction():
+            return BatchTransactionState.OPEN
+        return BatchTransactionState.ENDED
+
     # --- transaction identity ---------------------------------------------------------------------
 
     def _establish_transaction_identity(self) -> str | None:
         row = self._db.execute("SELECT pg_current_xact_id()::text").fetchone()
         if row is None or row[0] is None:
             raise UsageError(
-                "PostgreSQL did not assign a transaction id when establishing atomic "
+                "PostgreSQL did not assign a transaction id when establishing the "
                 "transaction identity"
             )
         return str(row[0])
@@ -632,13 +753,31 @@ class PostgresAdapter(Adapter):
     # --- error classification ---------------------------------------------------------------------
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
+        """Classify *exc* as a failure of a call that could have committed.
+
+        Callers outside the operation guard, such as setup and the snapshot
+        read's teardown, have no call to qualify, so they get the conservative
+        answer.
+        """
+        return self._classify(exc, commit_capable=True)
+
+    def classify_call_failure(self, exc: Exception, *, commit_capable: bool) -> OutcomeClass:
+        return self._classify(exc, commit_capable=commit_capable)
+
+    def _classify(self, exc: BaseException, *, commit_capable: bool) -> OutcomeClass:
         """A SQLSTATE usually means the server answered, so the outcome is definite.
 
-        Two families of code say otherwise and are excluded: class ``08``, the
-        connection exceptions, and ``40003`` ``statement_completion_unknown``,
-        which is the server stating in as many words that it does not know
-        whether the statement completed.  Receiving a code is not by itself an
-        outcome.
+        Some codes say otherwise.  Class ``08``, the connection exceptions, and
+        ``40003`` ``statement_completion_unknown``, the server stating that it
+        does not know whether the statement completed, leave every call's
+        outcome unknown.  Classes ``57`` (operator intervention), ``58`` (system
+        error) and ``XX`` (internal error) are what a server reports when it is
+        shutting down or when storage or its own state failed, for example
+        ``58030`` after a failed WAL write during COMMIT.  They leave the
+        outcome of a commit-capable call unknown; any other call made nothing
+        durable, so for it they are a definite rejection.  ``57014``
+        ``query_canceled`` is definite for every call: the server cancelled the
+        statement and aborted the transaction.
 
         Anything without a SQLSTATE -- a closed connection, a driver-side refusal
         this adapter has not justified, an unrecognised exception -- is a
@@ -649,7 +788,11 @@ class PostgresAdapter(Adapter):
             sqlstate = getattr(exc, "sqlstate", None)
             if sqlstate:
                 code = str(sqlstate)
+                if code in DEFINITE_SQLSTATES:
+                    return OutcomeClass.SERVER_REJECTION
                 if code.startswith(INDEFINITE_SQLSTATE_CLASSES) or code in INDEFINITE_SQLSTATES:
+                    return OutcomeClass.COMMUNICATION_FAILURE
+                if commit_capable and code.startswith(COMMIT_INDEFINITE_SQLSTATE_CLASSES):
                     return OutcomeClass.COMMUNICATION_FAILURE
                 return OutcomeClass.SERVER_REJECTION
             if isinstance(exc, (psycopg.ProgrammingError, psycopg.NotSupportedError)):
@@ -670,8 +813,20 @@ class PostgresAdapter(Adapter):
 
 _KIND_NAMES = {"p": "primary key", "u": "unique key", "f": "foreign key"}
 
-#: SQLSTATE class 08 is the connection-exception class: the server did not answer.
+#: SQLSTATE classes that do not settle any call's outcome: 08 is the
+#: connection-exception class, where the server did not answer.
 INDEFINITE_SQLSTATE_CLASSES = ("08",)
+
+#: SQLSTATE classes that do not settle the outcome of a commit-capable call: 57
+#: is operator intervention (shutdown, cancel), 58 is system error (I/O failure
+#: outside the server) and XX is internal error.  A call that could not commit
+#: made nothing durable, so for it these are definite rejections.
+COMMIT_INDEFINITE_SQLSTATE_CLASSES = ("57", "58", "XX")
+
+#: Codes that settle the outcome of every call.  57014 ``query_canceled``: the
+#: server cancelled the statement and aborted the transaction, so nothing of it
+#: is durable.
+DEFINITE_SQLSTATES = frozenset({"57014"})
 
 #: Individual codes that answer without settling the outcome.  40003 is
 #: ``statement_completion_unknown``: the server is reporting that it does not

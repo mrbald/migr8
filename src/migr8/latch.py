@@ -1,22 +1,32 @@
 """The run latch (spec Section 7.2).
 
-Once the engine records an unknown operation outcome or a detected
-transaction-contract violation, the run is unusable.  Author code that catches
-the exception must not be able to continue: every subsequent facade call and the
-completion path re-raise the latched error.
+Once the engine records an unknown operation outcome, a detected
+transaction-contract violation, or a batch whose transaction failed with a
+definite outcome, the run is unusable.  Author code that catches the exception
+must not be able to continue: every subsequent facade call and the completion
+path re-raise the latched error.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
 
-from .errors import ContractViolationError, Migr8Error, UnknownOutcomeError
+from .errors import (
+    ContractViolationError,
+    Migr8Error,
+    MigrationFailedError,
+    UnknownOutcomeError,
+)
 
 
 class LatchState(StrEnum):
     OPEN = "open"
     UNKNOWN_OUTCOME = "unknown_outcome"
     CONTRACT_VIOLATION = "contract_violation"
+    #: The database rolled a batch back, or the batch could not be committed.
+    #: Nothing of the batch is durable, so cleanup still rolls back; the run
+    #: exits 3 with the migration ACTIVE.
+    BATCH_FAILED = "batch_failed"
 
 
 class RunLatch:
@@ -53,6 +63,12 @@ class RunLatch:
     def latch_violation(self, error: ContractViolationError) -> ContractViolationError:
         if self._state is LatchState.OPEN:
             self._state = LatchState.CONTRACT_VIOLATION
+            self._error = error
+        return error
+
+    def latch_failure(self, error: MigrationFailedError) -> MigrationFailedError:
+        if self._state is LatchState.OPEN:
+            self._state = LatchState.BATCH_FAILED
             self._error = error
         return error
 

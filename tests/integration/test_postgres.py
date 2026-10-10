@@ -435,6 +435,188 @@ def test_failure_retains_active_and_the_checkpoint(pg_project, pg_query):
     assert pg_query("SELECT count(*) FROM orders WHERE region = 'EU'") == [(10,)]
 
 
+SWALLOWED_ERROR = """\
+import psycopg
+
+
+def migrate(ctx):
+    with ctx.transaction() as tx:
+        tx.execute("UPDATE orders SET region = 'EU' WHERE id = 1")
+        ctx.progress.set("last_id", "1")
+        try:
+            tx.execute("INSERT INTO orders (id) VALUES (2)")
+        except psycopg.errors.UniqueViolation:
+            ctx.log("duplicate ignored")
+"""
+
+
+def test_a_batch_that_caught_a_statement_error_is_not_committed(pg_project, pg_query):
+    """The server aborted the transaction, so COMMIT would only roll it back."""
+    root, config, schema = pg_project
+    manifest = _backfill_project(root, SWALLOWED_ERROR)
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.MIGRATION_FAILED
+    assert pg_query(
+        f"SELECT status, attempt FROM {schema}.m8_history WHERE migration_id = 'backfill'"
+    ) == [("ACTIVE", 1)]
+    assert pg_query("SELECT count(*) FROM orders WHERE region IS NOT NULL") == [(0,)]
+    assert pg_query(f"SELECT count(*) FROM {schema}.m8_progress") == [(0,)]
+
+
+CAUGHT_AT_BATCH_EXIT = """\
+import psycopg
+
+
+def migrate(ctx):
+    try:
+        with ctx.transaction() as tx:
+            tx.execute("UPDATE orders SET region = 'EU' WHERE id = 1")
+            ctx.progress.set("last_id", "1")
+            try:
+                tx.execute("INSERT INTO orders (id) VALUES (2)")
+            except psycopg.errors.UniqueViolation:
+                ctx.log("duplicate ignored")
+    except Exception as exc:
+        ctx.log("batch failure ignored", error=type(exc).__name__)
+"""
+
+
+def test_catching_the_batch_exit_failure_does_not_let_the_migration_complete(pg_project, pg_query):
+    root, config, schema = pg_project
+    manifest = _backfill_project(root, CAUGHT_AT_BATCH_EXIT)
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.MIGRATION_FAILED
+    assert "batch transaction could not be checked before commit" in report.message
+    assert pg_query(
+        f"SELECT status, attempt FROM {schema}.m8_history WHERE migration_id = 'backfill'"
+    ) == [("ACTIVE", 1)]
+    # The seed's ten rows, none updated by the batch.
+    assert pg_query("SELECT count(*), count(region) FROM orders") == [(10, 0)]
+    assert pg_query(f"SELECT count(*) FROM {schema}.m8_progress") == [(0,)]
+
+
+def test_a_deferred_constraint_failing_at_batch_commit_exits_three(pg_project, pg_query):
+    root, config, schema = pg_project
+    support.unit(root, "m1", {"up.sql": "CREATE TABLE parent (id integer PRIMARY KEY)"})
+    support.unit(
+        root,
+        "m2",
+        {
+            "up.sql": (
+                "CREATE TABLE child (id integer PRIMARY KEY, parent_id integer "
+                "REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+        },
+    )
+    support.unit(
+        root,
+        "m3",
+        {
+            "migration.py": (
+                "def migrate(ctx):\n"
+                "    with ctx.transaction() as tx:\n"
+                '        tx.execute("INSERT INTO child (id, parent_id) VALUES (1, 99)")\n'
+                '        ctx.progress.set("linked", "1")\n'
+            )
+        },
+    )
+    manifest = support.manifest(
+        root,
+        [
+            {"id": "parent", "path": "m1", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+            {"id": "child", "path": "m2", "language": "sql", "mode": "atomic", "entry": "up.sql"},
+            {
+                "id": "link",
+                "path": "m3",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.MIGRATION_FAILED
+    assert "batch commit was rejected" in report.message
+    assert "SQLSTATE 23503" in report.message
+    assert pg_query(f"SELECT status FROM {schema}.m8_history WHERE migration_id = 'link'") == [
+        ("ACTIVE",)
+    ]
+    assert pg_query("SELECT count(*) FROM child") == [(0,)]
+    assert pg_query(f"SELECT count(*) FROM {schema}.m8_progress") == [(0,)]
+
+
+def test_commit_refuses_an_aborted_transaction(pg_project):
+    """Adapter level: a COMMIT on an aborted transaction raises a definite rejection."""
+    import psycopg
+
+    from migr8 import adapters
+    from migr8.adapters.base import BatchTransactionState, Boundary, OutcomeClass
+    from migr8.config import load as load_config
+    from migr8.errors import ContractViolationError
+    from migr8.latch import RunLatch
+
+    root, config, schema = pg_project
+    adapter = adapters.create(load_config(config))
+    adapter.latch = RunLatch()
+    adapter.connect()
+    try:
+        adapter.begin()
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            adapter._db.execute("SELECT 1/0")
+        assert adapter.batch_transaction_state() is BatchTransactionState.OPEN
+        with pytest.raises(psycopg.errors.InFailedSqlTransaction) as info:
+            adapter.durable_commit(Boundary.RESTARTABLE_BATCH)
+        assert adapter.classify_exception(info.value) is OutcomeClass.SERVER_REJECTION
+        assert not adapter.latch.latched
+        # The rollback that follows a latched violation does not pass the latch.
+        adapter.latch.latch_violation(ContractViolationError("test violation"))
+        adapter.rollback()
+        assert adapter.batch_transaction_state() is BatchTransactionState.ENDED
+    finally:
+        adapter.close()
+
+
+HIDDEN_BOUNDARY = """\
+def migrate(ctx):
+    with ctx.transaction() as tx:
+        tx.execute("UPDATE orders SET region = 'EU' WHERE id = 1")
+        ctx.progress.set("last_id", "1")
+    with ctx.transaction() as tx:
+        tx.execute("UPDATE orders SET region = 'EU' WHERE id = 2")
+"""
+
+
+def test_a_hidden_transaction_boundary_inside_a_batch_is_a_violation(pg_project, pg_query):
+    """The boundary is injected by wrapping the adapter's ``execute``; the commit is real."""
+    root, config, schema = pg_project
+    manifest = _backfill_project(root, HIDDEN_BOUNDARY)
+
+    def hook(adapter):
+        real_execute = adapter.execute
+
+        def execute(statement, params):
+            result = real_execute(statement, params)
+            if "id = 1" in statement.text:
+                adapter._db.execute("COMMIT")
+                adapter._db.execute("BEGIN")
+            return result
+
+        adapter.execute = execute
+
+    report = support.migrate_report(config, manifest, adapter_hook=hook)
+    assert report.exit_code == Exit.CONTRACT_VIOLATION
+    assert "broke its transaction" in report.message
+    assert "batch transaction" in report.message
+    assert "manual remediation" in report.message
+    assert pg_query(f"SELECT status FROM {schema}.m8_history WHERE migration_id = 'backfill'") == [
+        ("ACTIVE",)
+    ]
+    # The update before the hidden commit is durable; the checkpoint after it
+    # was rolled back, and the second batch never ran.
+    assert pg_query("SELECT id FROM orders WHERE region = 'EU'") == [(1,)]
+    assert pg_query(f"SELECT count(*) FROM {schema}.m8_progress") == [(0,)]
+
+
 def test_create_index_concurrently_belongs_to_a_restartable_migration(pg_project, pg_query):
     """It cannot run in a transaction block, so the adapter runs it outside one."""
     root, config, schema = pg_project
@@ -542,6 +724,87 @@ def test_oracle_plsql_is_not_accepted(pg_project):
         ],
     )
     assert support.migrate(config, manifest) == Exit.USAGE
+
+
+def _restartable_entry_manifest(root, entries):
+    """A manifest of SQL units, each ``(id, path, mode)`` with entry ``up.sql``."""
+    return support.manifest(
+        root,
+        [
+            {"id": uid, "path": path, "language": "sql", "mode": mode, "entry": "up.sql"}
+            for uid, path, mode in entries
+        ],
+    )
+
+
+def test_a_do_block_applies_as_a_restartable_sql_entry(pg_project, pg_query):
+    """A restartable DO file is admitted as a procedural block and runs once."""
+    root, config, schema = pg_project
+    support.unit(
+        root, "m1", {"up.sql": "CREATE TABLE orders (id integer PRIMARY KEY, region text)"}
+    )
+    support.unit(
+        root,
+        "m2",
+        {
+            "up.sql": (
+                "DO $$\nBEGIN\n"
+                "  INSERT INTO orders (id, region) VALUES (1, 'EU') ON CONFLICT DO NOTHING;\n"
+                "END\n$$;\n"
+            )
+        },
+    )
+    manifest = _restartable_entry_manifest(
+        root, [("create-orders", "m1", "atomic"), ("seed-orders", "m2", "restartable")]
+    )
+    assert support.migrate(config, manifest) == Exit.OK
+    assert pg_query("SELECT id, region FROM orders") == [(1, "EU")]
+    assert pg_query(f"SELECT migration_id, status FROM {schema}.m8_history ORDER BY seq") == [
+        ("create-orders", "SUCCESS"),
+        ("seed-orders", "SUCCESS"),
+    ]
+
+
+def test_a_call_applies_as_a_restartable_sql_entry(pg_project, pg_query):
+    root, config, schema = pg_project
+    # One statement per file: the table, the procedure and the call are separate units.
+    support.unit(root, "m2", {"up.sql": "CALL seed_orders();\n"})
+    support.unit(
+        root, "m0", {"up.sql": "CREATE TABLE orders (id integer PRIMARY KEY, region text)"}
+    )
+    support.unit(
+        root,
+        "m1",
+        {
+            "up.sql": (
+                "CREATE PROCEDURE seed_orders() LANGUAGE sql AS $$\n"
+                "  INSERT INTO orders (id, region) VALUES (1, 'EU') ON CONFLICT DO NOTHING\n"
+                "$$;\n"
+            )
+        },
+    )
+    manifest = _restartable_entry_manifest(
+        root,
+        [
+            ("create-orders", "m0", "restartable"),
+            ("create-seed", "m1", "restartable"),
+            ("call-seed", "m2", "restartable"),
+        ],
+    )
+    assert support.migrate(config, manifest) == Exit.OK
+    assert pg_query("SELECT id, region FROM orders") == [(1, "EU")]
+
+
+def test_a_do_block_naming_a_reserved_object_is_refused(pg_project, pg_query):
+    root, config, schema = pg_project
+    support.unit(root, "m1", {"up.sql": "CREATE TABLE orders (id integer PRIMARY KEY)"})
+    support.unit(root, "m2", {"up.sql": "DO $$ BEGIN DELETE FROM m8_history; END $$;\n"})
+    manifest = _restartable_entry_manifest(
+        root, [("create-orders", "m1", "atomic"), ("wipe", "m2", "restartable")]
+    )
+    assert support.migrate(config, manifest) == Exit.USAGE
+    # Preflight refuses the plan before connecting, so nothing was created.
+    assert pg_query("SELECT count(*) FROM pg_tables WHERE schemaname = %s", (schema,)) == [(0,)]
 
 
 # --- concurrency and inspection --------------------------------------------------------

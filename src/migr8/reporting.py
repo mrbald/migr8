@@ -36,6 +36,18 @@ class MigrationStatus:
     tool_version: str | None = None
     session_liveness: str | None = None
     session_liveness_detail: str | None = None
+    #: Set when this unit fails the checks that need no connection (status only).
+    problem: str | None = None
+
+
+@dataclass(slots=True)
+class Problem:
+    """One reason a report is not clean."""
+
+    kind: str
+    message: str
+    exit_code: int
+    migration_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -50,8 +62,15 @@ class Report:
     pending_count: int = 0
     active_id: str | None = None
     migrations: list[MigrationStatus] = field(default_factory=list)
+    #: The problem that decides ``exit_code``.
     problem: str | None = None
     problem_kind: str | None = None
+    #: Every problem found, the deciding one first.  Empty means ``problem`` is
+    #: the only one; read it through :meth:`problem_list`.
+    problems: list[Problem] = field(default_factory=list)
+    #: The amended active migration that needs ``migrate --recover``; the CLI
+    #: renders ``recovery_command`` from it.
+    recovery_id: str | None = None
     recovery_command: str | None = None
     #: What the command actually checked.  A report that passed is only as
     #: strong as this list, and the offline lint's list is deliberately short.
@@ -60,8 +79,18 @@ class Report:
     #: Correlation id shared with the event log, so a report and its log line up.
     run_id: str = ""
 
+    def problem_list(self) -> list[Problem]:
+        """Every problem, the one that decides the exit code first."""
+        if self.problems:
+            return list(self.problems)
+        if self.problem:
+            return [Problem(self.problem_kind or "problem", self.problem, self.exit_code)]
+        return []
+
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=False)
+        payload = asdict(self)
+        payload["problems"] = [asdict(item) for item in self.problem_list()]
+        return json.dumps(payload, indent=2, sort_keys=False)
 
     def to_text(self) -> str:
         lines = [
@@ -92,6 +121,8 @@ class Report:
                     f"{item.position:>4}  {item.state:<8} {item.mode:<12} "
                     f"{item.language:<7} {mark:<5} {item.id}"
                 )
+                if item.problem:
+                    lines.append(f"        fails preflight: {item.problem}")
                 if item.state == "ACTIVE":
                     lines.append(
                         f"        attempt={item.attempt} started={item.started_at} "
@@ -113,9 +144,12 @@ class Report:
             lines.append("")
             lines.append("checked:")
             lines.extend(f"  - {item}" for item in self.checks)
-        if self.problem:
+        problems = self.problem_list()
+        if problems:
             lines.append("")
-            lines.append(f"{self.problem_kind or 'problem'}: {self.problem}")
+            lines.append(f"{problems[0].kind}: {problems[0].message}")
+            for extra in problems[1:]:
+                lines.append(f"also {extra.kind}: {extra.message}")
         if self.recovery_command:
             lines.append(f"recovery: {self.recovery_command}")
         lines.append("")

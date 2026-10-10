@@ -306,3 +306,58 @@ def test_oracle_identifiers_containing_dollar_still_scan_as_words():
 def test_dollar_quoted_trailing_terminator_is_still_removed():
     sql = "DO $$ BEGIN NULL; END $$;"
     assert normalize(sql).text == "DO $$ BEGIN NULL; END $$"
+
+
+# --- the verb after a WITH list --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "verb"),
+    [
+        ("WITH c AS (SELECT 1) SELECT * FROM c", "SELECT"),
+        ("WITH c AS (SELECT 1) DELETE FROM t", "DELETE"),
+        (
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c",
+            "SELECT",
+        ),
+        (
+            "WITH a AS (SELECT 1), b AS MATERIALIZED (DELETE FROM x RETURNING 1) UPDATE t SET v=1",
+            "UPDATE",
+        ),
+        ("WITH c AS NOT MATERIALIZED (SELECT 1) INSERT INTO t SELECT * FROM c", "INSERT"),
+        ('WITH "delete" AS (SELECT 1) SELECT * FROM "delete"', "SELECT"),
+        ("SELECT 1", ""),
+    ],
+)
+def test_the_verb_after_a_cte_list_is_the_one_outside_the_parentheses(sql, verb):
+    assert normalize(sql).cte_verb == verb
+
+
+@pytest.mark.parametrize(
+    ("sql", "verbs"),
+    [
+        ("WITH d AS (DELETE FROM t RETURNING *) SELECT count(*) FROM d", {"DELETE"}),
+        ("with d as materialized (update t set v = 1 returning v) select * from d", {"UPDATE"}),
+        (
+            "WITH d AS NOT MATERIALIZED (INSERT INTO t VALUES (1) RETURNING id) SELECT 1",
+            {"INSERT"},
+        ),
+        (
+            "WITH d(n) AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE "
+            "RETURNING t.id), e AS (DELETE FROM u RETURNING 1) SELECT 1",
+            {"MERGE", "DELETE"},
+        ),
+        (
+            "WITH a AS (SELECT 1), b AS MATERIALIZED (DELETE FROM x RETURNING 1) SELECT 1",
+            {"DELETE"},
+        ),
+        ("WITH c(n) AS (SELECT 1) SELECT n FROM c", set()),
+        # Only the first word of a body counts, and only at depth one.
+        ("WITH c AS (SELECT (SELECT 1) AS x) SELECT CAST(1 AS int) FROM c", set()),
+        ('WITH "as" AS (SELECT 1) SELECT * FROM "as"', set()),
+        ("WITH c AS (SELECT 1) DELETE FROM t", set()),
+        ("SELECT 1 AS x", set()),
+    ],
+)
+def test_dml_verbs_that_open_a_cte_body_are_found(sql, verbs):
+    assert normalize(sql).cte_body_verbs == frozenset(verbs)

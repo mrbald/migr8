@@ -22,6 +22,7 @@ import oracledb
 from ..config import PASSWORD_ENV, Config
 from ..errors import (
     ConfigError,
+    ConnectionSetupError,
     LockNotAcquiredError,
     MetadataDamagedError,
     UnsupportedCapabilityError,
@@ -41,6 +42,7 @@ from ..sqltext import Statement
 from . import metadata as md
 from .base import (
     Adapter,
+    BatchTransactionState,
     Boundary,
     Capabilities,
     OutcomeClass,
@@ -120,6 +122,21 @@ _POLICY = StatementPolicy(
 #: DBMS_LOCK exclusive mode.
 _X_MODE = 6
 
+#: Errors that mean the connecting user lacks a privilege on the lock package:
+#: ORA-01031 insufficient privileges, and ORA-06550 (with PLS-00201 behind it)
+#: when the package is not visible to the user.
+_LOCK_PRIVILEGE_ORA_CODES = frozenset({"ORA-01031", "ORA-06550"})
+
+#: ORA-00942 (the object is not visible) and ORA-01031 insufficient privileges.
+#: They are the privilege errors of the v$session read that checks the failover
+#: type, and the only codes for which the compiler-message lookup reports a
+#: privilege problem.
+_PRIVILEGE_ORA_CODES = frozenset({"ORA-00942", "ORA-01031"})
+
+#: Errors that mean another session holds a resource a setup statement needs:
+#: ORA-00054 resource busy and ORA-30006 resource busy with a WAIT timeout.
+_CONTENTION_ORA_CODES = frozenset({"ORA-00054", "ORA-30006"})
+
 #: ORA codes that mean the transport or session is gone, so an in-flight
 #: commit-capable call has an unknown outcome.  Kept narrow and justified.
 TRANSPORT_ORA_CODES = frozenset(
@@ -135,8 +152,34 @@ TRANSPORT_ORA_CODES = frozenset(
         12152,  # TNS: unable to send break message
         12537,  # TNS: connection closed
         12571,  # TNS: packet writer failure
+        # python-oracledb marks these as DPY-4011 with is_session_dead set.
+        # tests/test_oracle_classification.py compares this set with the
+        # driver's own table, so a driver release that adds a code fails there.
+        22,
+        31,
+        45,
+        378,
+        600,
+        602,
+        603,
+        609,
+        1041,
+        1043,
+        2396,
+        3122,
+        12153,
+        12547,
+        12570,
+        12583,
+        27146,
+        28511,
+        56600,
     }
 )
+
+#: The driver code for a dead session (``DPY-4011``).  The driver raises it for
+#: the ORA codes above and for a socket that closed with no ORA code at all.
+SESSION_DEAD_DPY_CODE = "DPY-4011"
 
 
 #: python-oracledb errors raised before anything is sent to the server.  An
@@ -260,7 +303,7 @@ _THICK_MODE: tuple[str | None, str | None] | str | None = None
 
 def _require_identifier(value: str, what: str) -> str:
     upper = value.upper()
-    if not IDENTIFIER_RE.match(upper) or upper != value:
+    if not IDENTIFIER_RE.fullmatch(upper) or upper != value:
         raise ConfigError(
             f"{what} must be an unquoted uppercase Oracle identifier matching "
             f"[A-Z][A-Z0-9_$#]*; got {value!r}. Quoted mixed-case identifiers require "
@@ -331,7 +374,7 @@ class OracleAdapter(Adapter):
             raise ConfigError("the oracle adapter requires an explicit lock.id")
         self._lock_id = lock.id
         package = lock.package or "SYS.DBMS_LOCK"
-        if not QUALIFIED_RE.match(package.upper()) or package.upper() != package:
+        if not QUALIFIED_RE.fullmatch(package.upper()) or package.upper() != package:
             raise ConfigError(
                 f"lock.package must be an unquoted uppercase [schema.]package name, got {package!r}"
             )
@@ -452,10 +495,57 @@ class OracleAdapter(Adapter):
                 "oracle.allow_thick_mode is set but the connection is in Thin mode; the "
                 "Oracle Client libraries did not take effect"
             )
-        self._conn.autocommit = False
-        self._configure_session()
-        self._banner = self._read_banner()
-        self._session_identity = self._read_session_identity()
+        try:
+            if not self._conn.thin:
+                self._verify_no_failover()
+            self._conn.autocommit = False
+            self._configure_session()
+            self._banner = self._read_banner()
+            self._session_identity = self._read_session_identity()
+        except BaseException:
+            # The engine does not close a session whose connect() raised.
+            self.discard()
+            raise
+
+    def _verify_no_failover(self) -> None:
+        """Refuse a Thick-mode session that Oracle Client may fail over transparently.
+
+        A transparent failover opens a new server session and drops the
+        DBMS_LOCK and the session settings without raising an error (spec
+        Section 12, invariant 6).  Only Thick mode implements it, so Thin mode
+        never runs this query.  Oracle exposes the failover type only through
+        v$session.
+        """
+        try:
+            row = (
+                self._cursor()
+                .execute(
+                    "SELECT failover_type, failover_method FROM v$session "
+                    "WHERE sid = sys_context('USERENV','SID')"
+                )
+                .fetchone()
+            )
+        except oracledb.Error as exc:
+            if self.error_code(exc) in _PRIVILEGE_ORA_CODES:
+                raise ConnectionSetupError(
+                    "Thick mode needs to read the session's failover type from V$SESSION, "
+                    f"which this user cannot read ({self.describe_exception(exc)}). Grant "
+                    "SELECT on SYS.V_$SESSION to the connecting user, or use Thin mode, "
+                    "which has no transparent failover.",
+                    phase="connect",
+                ) from exc
+            raise self.setup_error(exc, "reading the session failover type") from exc
+        failover_type = str(row[0]).upper() if row and row[0] is not None else None
+        if failover_type != "NONE":
+            method = row[1] if row else None
+            raise ConnectionSetupError(
+                f"this Thick-mode session has failover type {failover_type or 'unknown'}"
+                f"{f' (method {method})' if method else ''}. A transparent failover would "
+                "replace the server session and silently drop the migration lock and the "
+                "session settings. Remove FAILOVER_MODE from the connect descriptor (or "
+                "the TNS alias), or use Thin mode.",
+                phase="connect",
+            )
 
     def _configure_session(self) -> None:
         cursor = self._cursor()
@@ -464,22 +554,23 @@ class OracleAdapter(Adapter):
             cursor.execute("ALTER SESSION SET COMMIT_WAIT = FORCE_WAIT")
             cursor.execute("ALTER SESSION SET COMMIT_LOGGING = IMMEDIATE")
         except oracledb.Error as exc:
-            raise UsageError(
-                f"cannot establish synchronous commit durability: {exc}. There is no setting "
-                "to weaken required commit durability, so setup fails."
+            raise self.setup_error(
+                exc,
+                "establishing synchronous commit durability",
+                hint="There is no setting to weaken required commit durability, so setup fails.",
             ) from exc
         self._commit_wait_note = self._probe_commit_wait()
         try:
             cursor.execute(f"ALTER SESSION SET DDL_LOCK_TIMEOUT = {self._ddl_lock_timeout}")
         except oracledb.Error as exc:
-            raise UsageError(f"cannot set DDL_LOCK_TIMEOUT: {exc}") from exc
+            raise self.setup_error(exc, "setting DDL_LOCK_TIMEOUT") from exc
         if self._schema != self._user:
             # CURRENT_SCHEMA changes name resolution only; it grants nothing, and
             # engine writes stay schema-qualified regardless.
             try:
                 cursor.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._schema}"')
             except oracledb.Error as exc:
-                raise UsageError(f"cannot set CURRENT_SCHEMA to {self._schema}: {exc}") from exc
+                raise self.setup_error(exc, f"setting CURRENT_SCHEMA to {self._schema}") from exc
         self._verify_namespace_access()
 
     def _probe_commit_wait(self) -> str:
@@ -510,9 +601,11 @@ class OracleAdapter(Adapter):
                 "SELECT COUNT(*) FROM all_objects WHERE owner = :owner", owner=self._schema
             ).fetchone()
         except oracledb.Error as exc:
-            raise UsageError(
-                f"cannot inspect objects owned by {self._schema} through ALL_OBJECTS: {exc}. "
-                "An inaccessible probe is an error, not evidence that the namespace is empty."
+            raise self.setup_error(
+                exc,
+                f"inspecting objects owned by {self._schema} through ALL_OBJECTS",
+                hint="An inaccessible probe is an error; it does not show that the namespace is "
+                "empty.",
             ) from exc
 
     def _read_banner(self) -> str:
@@ -531,11 +624,14 @@ class OracleAdapter(Adapter):
 
     def _read_session_identity(self) -> str:
         cursor = self._cursor()
-        base = cursor.execute(
-            "SELECT sys_context('USERENV','SID'), sys_context('USERENV','SESSIONID'), "
-            "sys_context('USERENV','INSTANCE_NAME'), sys_context('USERENV','SERVER_HOST') "
-            "FROM dual"
-        ).fetchone()
+        try:
+            base = cursor.execute(
+                "SELECT sys_context('USERENV','SID'), sys_context('USERENV','SESSIONID'), "
+                "sys_context('USERENV','INSTANCE_NAME'), sys_context('USERENV','SERVER_HOST') "
+                "FROM dual"
+            ).fetchone()
+        except oracledb.Error as exc:
+            raise self.setup_error(exc, "reading the session identity") from exc
         sid, audsid, instance, host = base
         serial = None
         try:
@@ -562,6 +658,13 @@ class OracleAdapter(Adapter):
                 self._conn.close()
             finally:
                 self._conn = None
+
+    def is_contention(self, exc: BaseException) -> bool:
+        return self.error_code(exc) in _CONTENTION_ORA_CODES
+
+    @property
+    def connection_held(self) -> bool:
+        return self._conn is not None
 
     def discard(self) -> None:
         """Drop the session without issuing any further SQL.
@@ -598,10 +701,18 @@ class OracleAdapter(Adapter):
                 timeout=self._lock_timeout,
             )
         except oracledb.Error as exc:
-            raise UsageError(
-                f"cannot call {self._lock_package}.REQUEST: {exc}. Required grants must be "
-                "established before running migrations; the engine does not fall back to an "
-                "ineffective lock."
+            # Only a privilege error says the grants are missing.  A lost
+            # connection or any other error says nothing about them.
+            missing_grant = self.error_code(exc) in _LOCK_PRIVILEGE_ORA_CODES
+            raise self.setup_error(
+                exc,
+                f"calling {self._lock_package}.REQUEST",
+                hint=(
+                    "Required grants must be established before running migrations; the "
+                    "engine does not fall back to an ineffective lock."
+                    if missing_grant
+                    else ""
+                ),
             ) from exc
         code = int(result.getvalue())
         if code == 0:
@@ -1023,6 +1134,23 @@ class OracleAdapter(Adapter):
         """
         return self._read_transaction_identity() is not None
 
+    def batch_transaction_state(self) -> BatchTransactionState:
+        """The driver's ``Connection.transaction_in_progress``, read without a round trip.
+
+        A commit inside a PL/SQL block ends the transaction, so the next facade
+        call inside a batch is refused here; the transaction-identity check at
+        the end of the batch stays as the second guard.  The attribute is the
+        client's view of the last server response.  In Thin mode it follows the
+        end-of-call transaction flag; in Thick mode the driver reads the OCI
+        attribute ``OCI_ATTR_TRANSACTION_IN_PROGRESS``.  The live suite runs Thin
+        only, so the Thick path has not been exercised here.  The flag does not
+        say how the transaction ended, so a transaction that is no longer in
+        progress counts as ended by a commit.
+        """
+        if self._conn is not None and self._conn.transaction_in_progress:
+            return BatchTransactionState.OPEN
+        return BatchTransactionState.ENDED
+
     # --- transaction identity ---------------------------------------------------------------------
 
     def _establish_transaction_identity(self) -> str | None:
@@ -1034,7 +1162,7 @@ class OracleAdapter(Adapter):
         value = holder.getvalue()
         if not value:
             raise UsageError(
-                "Oracle did not return a local transaction id when establishing atomic "
+                "Oracle did not return a local transaction id when establishing the "
                 "transaction identity"
             )
         return value
@@ -1109,11 +1237,14 @@ class OracleAdapter(Adapter):
                 self._cursor().execute(_REQUIRED_SQL.format(branches=branches), **binds).fetchall()
             )
         except oracledb.Error as exc:
+            if self.classify_exception(exc) is not OutcomeClass.SERVER_REJECTION:
+                # A lost session goes to the operation guard, which latches the run.
+                raise
             return ValidityResult(
                 failures=(
                     "required-object inspection failed: "
                     f"{self.describe_exception(exc)}. An inaccessible probe is an "
-                    "error, not evidence that the object is absent.",
+                    "error; it does not show that the object is absent.",
                 )
             )
         for otype, oname, status, exact_count, other_types, hard, soft in rows:
@@ -1171,8 +1302,13 @@ class OracleAdapter(Adapter):
                 )
                 .fetchall()
             )
-        except oracledb.Error:
-            return "(compiler messages are not readable with the current privileges)"
+        except oracledb.Error as exc:
+            if self.classify_exception(exc) is not OutcomeClass.SERVER_REJECTION:
+                raise
+            code = self.error_code(exc)
+            if code in _PRIVILEGE_ORA_CODES:
+                return "(compiler messages are not readable with the current privileges)"
+            return f"(compiler messages could not be read: {code or type(exc).__name__})"
         if not rows:
             return "(no compiler message recorded)"
         return "; ".join(f"line {row[0]}:{row[1]} {str(_lob(row[2])).strip()}" for row in rows)
@@ -1226,13 +1362,18 @@ class OracleAdapter(Adapter):
           raises before submitting anything.
 
         Everything else -- a driver error this adapter has not justified, an
-        unrecognised exception, or a transport ORA code -- is a communication
-        failure, so a commit-capable call that raised it has an unknown outcome.
+        unrecognised exception, a transport ORA code, or any error the driver
+        reports as ``DPY-4011`` or with ``is_session_dead`` set -- is a
+        communication failure, so a commit-capable call that raised it has an
+        unknown outcome.  The driver keeps the ORA code on a ``DPY-4011`` error,
+        so the session-dead test runs before the code is read.
         """
         if isinstance(exc, oracledb.Error) and exc.args:
             error = exc.args[0]
             code = getattr(error, "code", 0) or 0
             full_code = getattr(error, "full_code", "") or ""
+            if full_code == SESSION_DEAD_DPY_CODE or getattr(error, "is_session_dead", False):
+                return OutcomeClass.COMMUNICATION_FAILURE
             if code:
                 return (
                     OutcomeClass.COMMUNICATION_FAILURE

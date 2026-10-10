@@ -17,9 +17,9 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .adapters.base import Adapter, Boundary, RunnerInfo
-from .checks import preflight, verify_bindings
+from .checks import SqlCategory, admit_sql_entry, preflight, verify_bindings
 from .config import Config
-from .context import build_context
+from .context import build_context, check_transaction_identity
 from .diagnostics import RunLog
 from .errors import (
     OUTCOME_NAMES,
@@ -36,7 +36,6 @@ from .latch import RunLatch
 from .loader import check_result, load_entry
 from .manifest import Language, Mode
 from .model import Capture, CapturedUnit, MetadataReport, MetadataState, Plan, Snapshot
-from .sqltext import StatementKind, normalize
 from .statevalidate import (
     build_plan,
     check_recovery_admission,
@@ -65,7 +64,11 @@ class RunReport:
     #: Where the failure happened, for root-cause analysis.
     failed_migration: str | None = None
     phase: str | None = None
-    #: Populated on exit 2 when an amended active migration needs admitting.
+    #: Set on exit 2 to the id of the amended active migration that needs
+    #: admitting.  The CLI renders ``recovery_command`` from it, because only
+    #: the CLI knows which ``--config`` and ``--manifest`` the operator passed.
+    recovery_id: str | None = None
+    #: The command that admits ``recovery_id``; filled in by the CLI.
     recovery_command: str | None = None
     adapter: str | None = None
     namespace: str | None = None
@@ -116,13 +119,38 @@ class Engine:
         self.log = log if log is not None else RunLog(self.run_id)
         self.latch = RunLatch()
         self.report = RunReport(run_id=self.run_id, adapter=adapter.name)
+        #: True once ``report`` holds the run's outcome, whatever teardown does next.
+        self._reported = False
+        #: True once the run got past its start event; an interrupt before that
+        #: found nothing submitted and no connection.
+        self._started = False
         adapter.latch = self.latch
         adapter.runner = runner_info(self.run_id)
 
     # --- top level --------------------------------------------------------------------------------
 
+    @property
+    def outcome_recorded(self) -> bool:
+        """True once :attr:`report` holds the run's outcome."""
+        return self._reported
+
     def run(self) -> RunReport:
+        """Execute the run and return its report.
+
+        An interrupt (SIGINT, or SIGTERM and SIGHUP through the CLI's handler)
+        that arrives while the run is already ending never replaces the outcome
+        the run reached.  Signals are not masked: no call timeout is set, so a
+        close on a dead link can block until the TCP timeout, and the operator's
+        interrupt must still end it.  The interrupted step falls back to
+        discarding the connection instead.
+        """
         started = time.monotonic()
+        try:
+            return self._run(started)
+        except KeyboardInterrupt:
+            return self._settle_interrupted_teardown(started)
+
+    def _run(self, started: float) -> RunReport:
         connected = False
         self.log.event(
             "run_start",
@@ -133,6 +161,7 @@ class Engine:
             recover=self.recover_id,
         )
         try:
+            self._started = True
             preflight(self.capture, self.adapter)
             self.log.event("preflight_passed")
             self.adapter.connect()
@@ -154,18 +183,52 @@ class Engine:
             self._execute(plan)
         except BaseException as exc:
             return self._terminate(exc, connected=connected, started=started)
+        self._reported = True
         if connected:
             self._close_quietly()
         self.log.event("run_end", outcome="ok", executed=list(self.report.executed))
         return self._finish(started)
 
+    def _settle_interrupted_teardown(self, started: float) -> RunReport:
+        """Finish a run interrupted before it started, or whose teardown was interrupted again.
+
+        When the outcome is already in the report it stays as it is.  When the
+        interrupt arrived before the outcome was recorded, the latched failure
+        or an interruption failure is recorded now.  Either way a connection
+        still held is discarded, and the report says so.
+        """
+        dropped = self._discard_quietly()
+        if not self._reported:
+            error = self.latch.error or self._interruption_error()
+            code = Exit(error.exit_code)
+            self._fail(error, code, discarded=dropped or code is Exit.UNKNOWN_OUTCOME)
+        if dropped:
+            self._note_discarded("the run was interrupted while it was ending")
+        return self._finish(started)
+
+    def _interruption_error(self) -> MigrationFailedError:
+        if not self._started:
+            return MigrationFailedError(
+                "the run was interrupted (KeyboardInterrupt) before it started; nothing "
+                "was sent to the database. Rerun to continue.",
+                phase="interrupted",
+            )
+        return MigrationFailedError(
+            "the run was interrupted (KeyboardInterrupt) while it was ending; uncommitted "
+            "work was rolled back and any restartable migration remains ACTIVE. Rerun to "
+            "continue.",
+            phase="interrupted",
+        )
+
     def _terminate(self, exc: BaseException, *, connected: bool, started: float) -> RunReport:
         """Report one terminal failure, with the run latch deciding the outcome.
 
-        A latched unknown outcome or contract violation outranks whatever
-        exception arrived here.  Author code that catches the latched error and
-        returns, or replaces it with one of its own, must not be able to change
-        what the run reports (spec Sections 7.2 and 9.2).
+        A latched unknown outcome, contract violation or failed batch outranks
+        whatever exception arrived here.  A failed batch exits 3 and closes the
+        connection normally, since nothing of it is in doubt.  Author code that
+        catches the latched error and returns, or replaces it with one of its
+        own, must not be able to change what the run reports (spec Sections 7.2
+        and 9.2).
         """
         error = self.latch.error or (exc if isinstance(exc, Migr8Error) else None)
         if error is None:
@@ -175,9 +238,9 @@ class Engine:
         discarded = code is Exit.UNKNOWN_OUTCOME
         self._fail(error, code, discarded=discarded)
         if isinstance(error, RecoveryRequiredError):
-            self.report.recovery_command = f"migr8 migrate --recover {error.migration_id}"
+            self.report.recovery_id = error.migration_id
         if connected and discarded:
-            self.adapter.discard()
+            self._discard_quietly()
         elif connected:
             self._close_quietly()
         return self._finish(started)
@@ -188,6 +251,7 @@ class Engine:
         self.report.failed_migration = error.migration_id
         self.report.phase = error.phase
         self.report.connection_discarded = discarded
+        self._reported = True
         self.log.event(
             "run_end",
             outcome=OUTCOME_NAMES[code],
@@ -218,10 +282,11 @@ class Engine:
             "rolled back and any restartable migration remains ACTIVE",
             phase="interrupted" if interrupted else "internal_error",
         )
-        if connected:
-            self._rollback_quietly()
+        # Record the outcome first, so an interrupt during the rollback or the
+        # close below cannot replace it.
         self._fail(error, Exit.MIGRATION_FAILED)
         if connected:
+            self._rollback_quietly()
             self._close_quietly()
         if not interrupted:
             # The traceback carries the driver's own message, which quotes the
@@ -247,8 +312,43 @@ class Engine:
     def _close_quietly(self) -> None:
         try:
             self.adapter.close()
+        except KeyboardInterrupt:
+            # A close makes round trips, and one on a dead link can block until
+            # the TCP timeout.  The interrupt ends it by discarding the session.
+            if self._discard_quietly():
+                self._note_discarded("closing the connection was interrupted")
         except Exception as exc:  # pragma: no cover - best-effort teardown
             LOGGER.warning("closing the session did not complete cleanly: %s", self._describe(exc))
+
+    def _discard_quietly(self) -> bool:
+        """Drop the connection without SQL; neither a failure nor an interrupt escapes.
+
+        Returns True when a connection was still held, so there was one to
+        drop; after a clean close there is none.  Discarding is idempotent, so
+        one interrupted attempt is repeated once.  A second interrupt abandons
+        the attempt: the process is ending and the operating system closes the
+        socket.
+        """
+        held = self.adapter.connection_held
+        for _attempt in range(2):
+            try:
+                self.adapter.discard()
+                break
+            except KeyboardInterrupt:
+                continue
+            except Exception as exc:  # pragma: no cover - best-effort teardown
+                LOGGER.warning("discarding the session failed: %s", self._describe(exc))
+                break
+        return held
+
+    def _note_discarded(self, reason: str) -> None:
+        """Say in the report that teardown discarded the connection."""
+        self.report.connection_discarded = True
+        self.report.warnings.append(
+            f"{reason}; the connection was discarded without further SQL. The server ends "
+            "the session and releases the namespace lock when it notices, so a rerun "
+            "started at once can exit 5 until then."
+        )
 
     # --- initialization ---------------------------------------------------------------------------
 
@@ -360,7 +460,14 @@ class Engine:
             # (spec Sections 7.2 and 9.2).
             self.latch.check()
             self._require_valid(unit)
-            self._check_transaction_identity(unit, identity)
+            check_transaction_identity(
+                adapter,
+                self.latch,
+                identity,
+                migration_id=unit.id,
+                scope="atomic",
+                outcome="No success row was written.",
+            )
             adapter.insert_success_row(
                 seq=unit.position,
                 migration_id=unit.id,
@@ -398,23 +505,6 @@ class Engine:
         does not get to downgrade the outcome.
         """
         return self.latch.error if self.latch.error is not None else ordinary
-
-    def _check_transaction_identity(self, unit: CapturedUnit, established: str | None) -> None:
-        if established is None:
-            return  # This adapter states a different enforcement boundary.
-        current = self.adapter.read_transaction_identity()
-        if current == established:
-            return
-        detail = "no transaction is open" if current is None else f"identity is now {current!r}"
-        raise self.latch.latch_violation(
-            ContractViolationError(
-                f"atomic migration {unit.id!r} broke its transaction: established "
-                f"{established!r} but {detail}. No success row was written. Durable effects "
-                "of the migration may require manual remediation.",
-                phase="transaction_identity",
-                migration_id=unit.id,
-            )
-        )
 
     def _rollback_quietly(self) -> None:
         if self.latch.unknown:
@@ -467,8 +557,9 @@ class Engine:
                 ),
             ) from exc
 
-        # A latched unknown outcome or contract violation cannot be cleared by
-        # author code catching its exception (spec Sections 7.2 and 9.2).
+        # A latched unknown outcome, contract violation or failed batch cannot be
+        # cleared by author code catching its exception (spec Sections 7.2 and
+        # 9.2).
         self.latch.check()
 
         if (context is not None and context.batch_open) or adapter.has_open_transaction():
@@ -503,10 +594,12 @@ class Engine:
         The latch is checked before anything else, and not only inside
         ``_rollback_quietly``: ``has_open_transaction`` is itself a round trip on
         Oracle, and no SQL at all may follow an unknown outcome (spec Section 7.2).
+        After a contract violation the guarded probe would re-raise the latched
+        error, so the rollback runs without asking first.
         """
         if self.latch.unknown:
             return
-        if self.adapter.has_open_transaction():
+        if self.latch.latched or self.adapter.has_open_transaction():
             self._rollback_quietly()
 
     # --- invocation -------------------------------------------------------------------------------
@@ -521,24 +614,23 @@ class Engine:
     def _invoke_sql(self, unit: CapturedUnit) -> None:
         """Run a SQL entry file through the same operation guard as the facade.
 
-        Admission differs between the two entry paths; classification does not.
-        Whether a call can commit follows from the execution context the engine
-        established, not from the statement's leading token (spec Section 7.2).
+        The category comes from :func:`admit_sql_entry`, the decision preflight
+        already made for this file.  Whether a call can commit follows from the
+        category, which follows from the execution context the engine
+        established (spec Section 7.2).
         """
-        text = (unit.source_dir / unit.definition.entry).read_text(encoding="utf-8")
-        statement = normalize(text)
-        if unit.mode is Mode.ATOMIC:
-            self.adapter.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
+        admitted = admit_sql_entry(unit, self.adapter, phase="migration_execution")
+        statement = admitted.statement
+        if admitted.category is SqlCategory.ATOMIC_STATEMENT:
             self._guarded(unit, "execute", self.adapter.execute, statement, None)
             return
-        if statement.kind is StatementKind.PLSQL_BLOCK:
+        if admitted.category is SqlCategory.RESTARTABLE_PROCEDURAL:
             # A procedural block in restartable mode may own its transactions;
             # it is trusted to commit all intended work before returning.
             self._guarded(
                 unit, "execute", self.adapter.execute, statement, None, commit_capable=True
             )
             return
-        self.adapter.admit_ddl(statement)
         if self.adapter.has_open_transaction():
             raise MigrationFailedError(
                 f"migration {unit.id!r} cannot run DDL with a transaction already open",

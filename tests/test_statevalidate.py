@@ -388,6 +388,15 @@ def test_history_longer_than_the_manifest_is_a_validation_failure():
         build_plan(cap, snapshot)
 
 
+def test_changed_stored_language_of_an_active_row_is_a_validation_failure():
+    """The fingerprint matches, so only the stored language differs from the manifest."""
+    cap = capture(unit(1, "a", language=Language.PYTHON, fingerprint=fp("1")))
+    snapshot = Snapshot(history=(active(1, "a", fp("1"), language="sql"),), progress=())
+    with pytest.raises(ValidationError, match="ACTIVE migration 'a' recorded language") as info:
+        build_plan(cap, snapshot)
+    assert info.value.exit_code == 2
+
+
 def test_active_declared_atomic_in_the_manifest_is_a_validation_failure():
     cap = capture(unit(1, "a", mode=Mode.ATOMIC, fingerprint=fp("1")))
     snapshot = Snapshot(history=(active(1, "a", fp("1")),), progress=())
@@ -412,7 +421,8 @@ def test_changed_active_without_the_flag_reports_the_exact_command():
         require_no_recovery_needed(plan)
     message = str(info.value)
     assert fp("1") in message and fp("9") in message
-    assert "migrate --recover a" in message
+    assert "rerun migrate with --recover a" in message
+    assert "migr8" not in message
     assert info.value.exit_code == 2
 
 

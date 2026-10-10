@@ -112,6 +112,40 @@ def test_duplicate_unit_paths_are_rejected(project):
         load(path)
 
 
+def test_unit_paths_differing_only_in_case_are_rejected_when_they_alias(tmp_path):
+    """On a case-insensitive filesystem 'u1' and 'U1' name one directory."""
+    support.unit(tmp_path, "u1", {"up.sql": "SELECT 1;\n"})
+    if not (tmp_path / "U1").exists():
+        pytest.skip("the filesystem is case-sensitive")
+    path = support.manifest(
+        tmp_path,
+        [
+            _ok_entry(id="a", path="u1"),
+            _ok_entry(id="b", path="U1"),
+        ],
+    )
+    with pytest.raises(ManifestError, match="same unit directory"):
+        load(path)
+
+
+def test_a_unit_nested_under_a_case_alias_of_another_is_rejected(tmp_path):
+    """On a case-insensitive filesystem 'U1/sub' lies inside the unit 'u1'."""
+    support.unit(tmp_path, "u1", {"up.sql": "SELECT 1;\n"})
+    support.unit(tmp_path, "u1/sub", {"up.sql": "SELECT 2;\n"})
+    if not (tmp_path / "U1").exists():
+        pytest.skip("the filesystem is case-sensitive")
+    for first, second, contained in (("u1", "U1/sub", "b"), ("U1/sub", "u1", "a")):
+        path = support.manifest(
+            tmp_path,
+            [
+                _ok_entry(id="a", path=first),
+                _ok_entry(id="b", path=second),
+            ],
+        )
+        with pytest.raises(ManifestError, match=f"unit of migration '{contained}' is contained"):
+            load(path)
+
+
 def test_nested_units_are_rejected(tmp_path):
     support.unit(tmp_path, "outer", {"up.sql": "SELECT 1;\n"})
     support.unit(tmp_path, "outer/inner", {"up.sql": "SELECT 2;\n"})
@@ -138,6 +172,7 @@ def test_nested_units_are_rejected(tmp_path):
         "é",
         "x" * 201,
         "tab\there",
+        "a\n",
     ],
 )
 def test_invalid_ids_are_rejected(project, bad_id):

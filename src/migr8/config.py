@@ -48,7 +48,11 @@ class Config:
     options: dict[str, object] = field(default_factory=dict)
 
     def password(self) -> str | None:
-        """Return the password from the environment, or ``None`` for external auth."""
+        """Return the password from the environment, or ``None`` when none is set.
+
+        Oracle then authenticates externally. PostgreSQL leaves the password to
+        libpq's own sources, such as ``PGPASSWORD`` and ``.pgpass``.
+        """
         return os.environ.get(PASSWORD_ENV) or None
 
 

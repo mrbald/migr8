@@ -160,6 +160,38 @@ authenticates externally through a wallet, which the thin driver cannot do.
 **`lock.timeout_seconds`** is how long to wait for another runner to finish. It is
 an operator policy, unrelated to how long a statement may take.
 
+On PostgreSQL the configuration names a libpq connection string and the user:
+
+```toml
+[database]
+adapter = "postgres"
+dsn = "postgresql://db.internal:5432/orders"   # or "host=db.internal dbname=orders"
+user = "orders_migrator"
+target_schema = "orders"               # defaults to public
+
+[lock]
+provider = "advisory"
+id = 4711
+timeout_seconds = 60
+```
+
+```bash
+export MIGR8_PASSWORD="$(read-from-your-secret-store)"
+```
+
+The adapter passes `user` and `MIGR8_PASSWORD` to the driver as separate
+arguments, never inside the connection string, so a password may contain spaces,
+quotes, backslashes and `=`. The user can come from `database.user`, from a
+`user` in the DSN, or from both when they are equal; two different values are a
+configuration error (exit 1). A DSN that contains a password, in either the
+`key=value` or the URI form, is refused with the same exit code: use
+`MIGR8_PASSWORD`. When neither a DSN user nor `database.user` is set, libpq picks
+the user itself (`PGUSER`, then the operating-system user). When
+`MIGR8_PASSWORD` is unset, libpq's own sources still apply (`PGPASSWORD`,
+`PGPASSFILE` and `~/.pgpass`), and the server may need no password at all
+(`trust`, `peer` or certificate authentication). `target_schema` must be an
+unquoted lowercase identifier.
+
 On SQLite the configuration names the file and the durability it requires:
 
 ```toml
@@ -263,6 +295,31 @@ Semicolons and slashes inside literals and comments are safe. A trailing `;` on 
 plain statement is removed; a PL/SQL block keeps its final `;`; one trailing `/`
 on its own line is accepted and discarded. A second bare `;` is an error.
 
+A file is encoded in UTF-8. A file with any other byte sequence fails `validate`
+and `migrate` with exit code 2, naming the migration and the file.
+
+Every command checks each SQL entry file against the same admission rule before it
+connects, and `migrate` applies the rule again before running the file. What a **restartable** SQL
+entry may contain depends on the first word of the file:
+
+| Adapter | DDL, run in its own transaction | Procedural block, trusted to commit its own work |
+|---|---|---|
+| Oracle | `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `RENAME`, `COMMENT`, `ANALYZE`, including stored PL/SQL definitions | an anonymous `BEGIN` or `DECLARE` block |
+| PostgreSQL | `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `COMMENT`, `REINDEX` | `DO` or `CALL` |
+| SQLite | `CREATE`, `ALTER`, `DROP` | none |
+
+A `BEGIN` or `DECLARE` file on PostgreSQL or SQLite is refused: neither engine has
+PL/SQL blocks, and transaction control belongs to the engine. Plain
+DML and queries are refused in a restartable SQL entry on every adapter; use an
+atomic migration or Python with `ctx.transaction()`.
+
+Every entry, atomic or restartable, is refused when it uses `m8_history`,
+`m8_progress` or `m8_meta` as an identifier. The check reads identifiers, so a
+comment or a string value that mentions a name passes. Two forms of identifier
+are included: the body of a PostgreSQL `DO` block, and on SQLite a single-quoted
+string where a table name belongs (`DELETE FROM 'm8_history'`). SQL assembled from
+string literals inside a `DO` body is not examined.
+
 ### Python migrations
 
 The entry module defines `migrate(ctx)`. Siblings are imported **relatively** —
@@ -325,6 +382,24 @@ checkpoint outside a batch, or touch `m8_history`, `m8_progress` or `m8_meta`. T
 driver connection is not exposed. These are guards against honest mistakes, not a
 sandbox — your code is trusted, and a routine with autonomous transactions can
 still defeat them.
+
+Catching a statement error inside a batch does not keep the batch on every engine.
+PostgreSQL aborts the whole transaction on the error, so the batch is not committed
+and the run exits 3; handle an expected conflict with `INSERT ... ON CONFLICT` or a
+`DO` block with an `EXCEPTION` clause. On SQLite, `INSERT OR ROLLBACK`, an `ON
+CONFLICT ROLLBACK` constraint and a `RAISE(ROLLBACK)` trigger roll the transaction
+back. If you catch that error inside the batch, the next call in the batch, or a
+clean end of the batch, fails with exit 3 and a message that the database rolled
+the batch transaction back and the batch is not committed; the migration stays
+ACTIVE, and a rerun repeats the batch. Catching this failure does not let the
+migration complete: the run is latched, so later calls and a new
+`ctx.transaction()` raise the same error, and returning normally still ends the run
+with exit 3. The same holds on PostgreSQL when a batch that swallowed a statement
+error reaches its end and cannot be committed. An exception that leaves the `with`
+block is different: the batch is rolled back, you receive the real error unchanged,
+and you may handle it. A commit inside a batch, such as one
+in an Oracle PL/SQL block, is a contract violation: the run exits 8 and warns that
+committed effects may need manual remediation.
 
 ## Run it
 
@@ -421,6 +496,19 @@ changed, which is a problem to fix in source control, not in the database.
 `status` is read-only and takes no lock, so it is safe and useful while a long
 migration is running. Add `--json` for scripts.
 
+`status` reads the history even when a pending unit fails the checks that need no
+connection, such as a Python file that does not compile. It still lists the
+applied rows, the ACTIVE row and every pending unit, marks the failing unit, and
+exits with that problem's own code: 2 for a source error, 1 for an unsupported
+capability. When the database reports its own condition as well (exit 6, 7, a
+binding error, or a recovery or history validation failure), the database
+condition decides the exit code and the preflight problem is listed after it
+(`also preflight: ...` in the text form). `--json` carries every problem in the
+`problems` list, the deciding one first; `problem` and `problem_kind` hold that
+first one. Preflight stops at the first failing unit, so `problems` holds at most
+one preflight entry. `validate` differs: it stops at the preflight problem with
+that problem's exit code (2 or 1) before it connects.
+
 ## When something fails
 
 The exit code is the interface. Each one means a different action.
@@ -456,9 +544,13 @@ format, orphaned progress. The tool will not repair it, because a repair that
 guessed wrong would corrupt the record of what ran. Read the message, inspect
 `m8_history`, and restore from backup if the metadata was lost.
 
-Exit 8 means a migration broke its own atomic transaction, usually by committing
-inside a PL/SQL block. No success row was written, but earlier durable effects may
-exist. Inspect what the migration did, remediate, then fix the migration.
+Exit 8 means a migration broke a transaction the engine owns: its atomic
+transaction, or a `ctx.transaction()` batch. The usual causes are a COMMIT inside a
+PL/SQL block and, on SQLite, a caught error from a statement such as `INSERT OR
+ROLLBACK` that had already ended the batch's transaction. The engine rolls back what
+remains: an atomic migration gets no success row, and a batch is not committed, so
+its migration stays ACTIVE. Work committed before the check may be durable.
+Inspect what the migration did, remediate, then fix the migration.
 
 ## Recovery
 
@@ -468,11 +560,20 @@ A restartable migration that fails stays ACTIVE with its checkpoint intact.
 your code from the top; your checkpoint tells you where to resume.
 
 **If you must amend the migration**, plain `migrate` refuses with exit 2 and prints
-the exact command:
+the recovery command (`recovery_command` in `--json`):
 
 ```bash
 migr8 migrate --recover backfill-region
 ```
+
+When you passed `--config` or `--manifest`, the printed command repeats both as
+quoted absolute paths, so it runs from any directory:
+
+```bash
+migr8 migrate --recover backfill-region --config '/srv/release candidate/migr8.toml' --manifest '/srv/release candidate/manifest.toml'
+```
+
+`status` and `validate` print the same command when they find the amended source.
 
 `--recover` admits amended source for the one ACTIVE migration. It preserves the
 identity, position, mode, original start time and first fingerprint; it updates
@@ -580,7 +681,11 @@ Operational notes:
 
 * Set `MIGR8_LOG_FILE` to a path you collect, and mount it.
 * `SIGTERM` is handled: a supervised stop is classified against the durable state
-  rather than abandoning the connection. Give the job time to exit.
+  rather than abandoning the connection. Give the job time to exit. A `SIGINT`,
+  `SIGTERM` or `SIGHUP` that arrives after the run has its outcome, during the
+  connection close or the cleanup, does not change the exit code. An interrupted
+  close discards the connection and the report says so; the server then releases
+  the namespace lock when it notices, so an immediate rerun can exit 5.
 * Alert on exit 4, 7 and 8. Exit 5 means contention, which may be normal.
 * There is no client-side statement timeout. Bound long statements with database
   policy: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout`

@@ -2,7 +2,7 @@
 # session-level advisory lock; it does not emulate Oracle.
 [database]
 adapter = "postgres"
-dsn = "host=127.0.0.1 port=15433 dbname=migr8_test user=migr8_test"
+dsn = "host=127.0.0.1 port=15433 dbname=migr8_test"
 user = "migr8_test"
 target_schema = "migr8"
 

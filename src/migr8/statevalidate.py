@@ -236,6 +236,13 @@ def build_plan(capture: Capture, snapshot: Snapshot) -> Plan:
                 f"ACTIVE history at position {active.seq} is {active.migration_id!r} but the "
                 f"manifest has {unit.id!r}"
             )
+        # A language change is admitted only through recovery, which also changes the
+        # fingerprint. A changed language under an unchanged fingerprint is an edited row.
+        if active.language != unit.language.value and active.fingerprint == unit.fingerprint:
+            raise ValidationError(
+                f"ACTIVE migration {active.migration_id!r} recorded language "
+                f"{active.language!r} but the manifest declares {unit.language.value!r}"
+            )
         if unit.mode is not Mode.RESTARTABLE:
             raise ValidationError(
                 f"ACTIVE migration {active.migration_id!r} is declared {unit.mode.value!r} in "
@@ -264,8 +271,8 @@ def require_no_recovery_needed(plan: Plan) -> None:
     raise RecoveryRequiredError(
         f"active migration {plan.active.migration_id!r} source has changed: recorded "
         f"{plan.active.fingerprint}, requested {unit.fingerprint}. "
-        f"To admit the amended source run: migr8 migrate --recover "
-        f"{plan.active.migration_id}",
+        f"To admit the amended source, rerun migrate with --recover "
+        f"{plan.active.migration_id}.",
         migration_id=plan.active.migration_id,
     )
 

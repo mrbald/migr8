@@ -271,7 +271,14 @@ def test_an_application_writer_holding_the_database_fails_the_run_with_no_histor
     try:
         blocker.execute("BEGIN EXCLUSIVE")
         result = run(root, "migrate")
-        assert result.returncode == Exit.MIGRATION_FAILED, result.stdout + result.stderr
+        if 'journal_mode = "delete"' in (root / "migr8.toml").read_text():
+            # A rollback-journal reader is blocked while the connection is set
+            # up: contention there is exit 5, not the fallback handler's exit 3.
+            assert result.returncode == Exit.LOCK_NOT_ACQUIRED, result.stdout + result.stderr
+            assert "SQLITE_BUSY" in result.stderr
+        else:
+            # WAL readers pass the setup; the busy write comes later, in the run.
+            assert result.returncode == Exit.MIGRATION_FAILED, result.stdout + result.stderr
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()

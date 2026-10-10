@@ -28,7 +28,7 @@ from .errors import (
     ValidationError,
 )
 from .model import Capture, MetadataState, Snapshot
-from .reporting import MigrationStatus, Report, status_from_row
+from .reporting import MigrationStatus, Problem, Report, status_from_row
 from .statevalidate import build_plan, require_no_recovery_needed
 
 
@@ -234,6 +234,7 @@ def _run(
     with_liveness: bool,
     recovery_suffix: str = "",
     baseline: Path | None = None,
+    defer_preflight: bool = False,
 ) -> Report:
     """The shared body of both read-only commands.
 
@@ -241,38 +242,95 @@ def _run(
     how much the recovery-required message spells out, so the sequence itself
     exists once: preflight, connect, inspect, read, then validate the plan
     without acting on it.
+
+    ``validate`` runs preflight first and stops at its error, before any
+    connection.  ``status`` sets ``defer_preflight``: a preflight error is kept,
+    the history is read, and the error is attached to the report afterwards.
     """
-    preflight(capture, adapter)
+    deferred: Migr8Error | None = None
+    try:
+        preflight(capture, adapter)
+    except Migr8Error as exc:
+        if not defer_preflight:
+            raise
+        deferred = exc
     if baseline is not None:
         verify_baseline(capture, baseline)
     adapter.connect()
     try:
-        report, snapshot = _prepare(command, adapter, capture)
-        if snapshot is None:
-            return report
-        _fill(report, capture, snapshot, adapter, with_liveness=with_liveness)
-        try:
-            plan = build_plan(capture, snapshot)
-            require_no_recovery_needed(plan)
-        except RecoveryRequiredError as exc:
-            report.problem_kind = "recovery required"
-            report.problem = exc.message + recovery_suffix
-            report.recovery_command = f"migr8 migrate --recover {exc.migration_id}"
-            report.exit_code = int(exc.exit_code)
-        except Migr8Error as exc:
-            report.problem_kind = (
-                "metadata damaged" if isinstance(exc, MetadataDamagedError) else "validation"
-            )
-            report.problem = exc.report()
-            report.exit_code = int(exc.exit_code)
-        return report
+        report = _read(command, adapter, capture, with_liveness, recovery_suffix)
     finally:
         adapter.close()
+    if deferred is not None:
+        _attach_preflight_problem(report, deferred)
+    return report
+
+
+def _read(
+    command: str, adapter: Adapter, capture: Capture, with_liveness: bool, recovery_suffix: str
+) -> Report:
+    """Inspect and read the namespace on a connected adapter, then check the plan."""
+    report, snapshot = _prepare(command, adapter, capture)
+    if snapshot is None:
+        return report
+    _fill(report, capture, snapshot, adapter, with_liveness=with_liveness)
+    try:
+        plan = build_plan(capture, snapshot)
+        require_no_recovery_needed(plan)
+    except RecoveryRequiredError as exc:
+        report.problem_kind = "recovery required"
+        report.problem = exc.message + recovery_suffix
+        report.recovery_id = exc.migration_id
+        report.exit_code = int(exc.exit_code)
+    except Migr8Error as exc:
+        report.problem_kind = (
+            "metadata damaged" if isinstance(exc, MetadataDamagedError) else "validation"
+        )
+        report.problem = exc.report()
+        report.exit_code = int(exc.exit_code)
+    return report
+
+
+def _attach_preflight_problem(report: Report, error: Migr8Error) -> None:
+    """Add a preflight problem found before the history was read to a status report.
+
+    Precedence when both a preflight problem and a database condition exist
+    (not initialized 6, metadata damaged 7, a binding error 1, a recovery
+    condition or history validation failure 2): the database condition decides
+    the exit code and is the report's ``problem``.  It describes the state the
+    operator has to act on first, and it is what the same namespace reports
+    without the broken unit.  The preflight problem is kept in ``problems``
+    after it and in the text form.  Without a database condition the preflight
+    problem decides: exit 2 for a source error, exit 1 for an unsupported
+    capability.  Preflight stops at the first failing unit, so at most one
+    preflight problem is reported.
+    """
+    preflight_problem = Problem(
+        kind="preflight",
+        message=error.report(),
+        exit_code=int(error.exit_code),
+        migration_id=error.migration_id,
+    )
+    for entry in report.migrations:
+        if entry.id == error.migration_id:
+            entry.problem = error.message
+    if report.problem is None:
+        report.problem_kind = preflight_problem.kind
+        report.problem = preflight_problem.message
+        report.exit_code = preflight_problem.exit_code
+        report.problems = [preflight_problem]
+        return
+    report.problems = [report.problem_list()[0], preflight_problem]
 
 
 def run_status(adapter: Adapter, capture: Capture) -> Report:
-    """Always describe the namespace; the exit code still reflects any failure."""
-    return _run("status", adapter, capture, with_liveness=True)
+    """Always describe the namespace; the exit code still reflects any failure.
+
+    A pending unit that fails preflight does not stop the history read.  The
+    report shows the applied rows, any ACTIVE row and the pending list, and
+    carries the preflight problem (see :func:`_attach_preflight_problem`).
+    """
+    return _run("status", adapter, capture, with_liveness=True, defer_preflight=True)
 
 
 def run_validate(adapter: Adapter, capture: Capture, *, baseline: Path | None = None) -> Report:

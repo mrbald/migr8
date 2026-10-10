@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum, auto
+from itertools import pairwise
 
 from .errors import SqlSyntaxError
 
@@ -327,11 +328,180 @@ class Statement:
     #: literals contribute nothing, so a name mentioned in prose is not a
     #: reference.  Callers match object names against this rather than scanning
     #: the raw text, where ``m8_history`` would also hit ``custom8_history``.
+    #: The body of a ``DO`` statement is the exception: its identifiers are
+    #: included, because the body is code that arrives as one string token.
     names: frozenset[str] = frozenset()
+    #: Single-quoted strings that stand where an identifier belongs (after
+    #: ``FROM``, ``INTO``, ``UPDATE``, ``JOIN``, ``TABLE`` and the like, or after
+    #: a ``.``), upper-cased with the quotes removed.  SQLite reads such a string
+    #: as a table name, so its adapter matches these like ``names``; elsewhere
+    #: the same string is a literal (``TRIM(BOTH ' ' FROM 'x')``) and is ignored.
+    string_names: frozenset[str] = frozenset()
+    #: For a statement that starts with ``WITH``, the upper-cased verb that
+    #: follows the common-table-expression list (``SELECT``, ``DELETE``, ...);
+    #: empty for any other statement or when no such verb is found.
+    cte_verb: str = ""
+    #: For a statement that starts with ``WITH``, the upper-cased DML verbs
+    #: (``INSERT``, ``UPDATE``, ``DELETE``, ``MERGE``) that open a CTE body:
+    #: the first word inside ``AS (``, ``AS MATERIALIZED (`` or ``AS NOT
+    #: MATERIALIZED (``.  PostgreSQL runs such a body as a data-modifying
+    #: statement whatever the main verb is.
+    cte_body_verbs: frozenset[str] = frozenset()
 
     @property
     def first_token(self) -> str:
         return self.lead[0] if self.lead else ""
+
+
+#: Words after which a SQLite single-quoted string names an object.  The list
+#: covers the object-naming positions of INSERT, REPLACE, UPDATE, DELETE, DROP,
+#: ALTER, CREATE and joins; ``OR REPLACE`` and the other conflict words precede
+#: the table in ``UPDATE OR ROLLBACK 't'``.
+_IDENTIFIER_POSITION_WORDS = frozenset(
+    {
+        "FROM",
+        "INTO",
+        "UPDATE",
+        "JOIN",
+        "TABLE",
+        "VIEW",
+        "INDEX",
+        "TRIGGER",
+        "EXISTS",
+        "ON",
+        "TO",
+        "REFERENCES",
+        "REPLACE",
+        "ROLLBACK",
+        "ABORT",
+        "FAIL",
+        "IGNORE",
+    }
+)
+
+
+def _string_value(token: Token) -> str | None:
+    """The contents of a plain ``'...'`` token, or ``None`` for any other string."""
+    if token.kind is not TokenKind.STRING or not token.text.startswith("'"):
+        return None
+    return token.text[1:-1].replace("''", "'")
+
+
+def _strings_in_identifier_position(significant: list[Token]) -> frozenset[str]:
+    found: set[str] = set()
+    for previous, token in pairwise(significant):
+        value = _string_value(token)
+        if value is None:
+            continue
+        if (previous.kind is TokenKind.WORD and previous.upper in _IDENTIFIER_POSITION_WORDS) or (
+            previous.kind is TokenKind.PUNCT and previous.text == "."
+        ):
+            found.add(value.upper())
+    return frozenset(found)
+
+
+def _identifier_words(tokens: list[Token]) -> set[str]:
+    """Upper-cased bare words and quoted identifiers among ``tokens``."""
+    names = {tok.upper for tok in tokens if tok.kind is TokenKind.WORD}
+    names.update(tok.text[1:-1].upper() for tok in tokens if tok.kind is TokenKind.QUOTED_IDENT)
+    return names
+
+
+#: Verbs that can follow a ``WITH`` list.
+_CTE_MAIN_VERBS = frozenset({"SELECT", "VALUES", "INSERT", "REPLACE", "UPDATE", "DELETE", "MERGE"})
+
+
+def _cte_main_verb(significant: list[Token]) -> str:
+    """The verb after the CTE list of a ``WITH`` statement, or ``""``.
+
+    Each CTE body and column list sits inside parentheses, so the first of
+    these verbs at parenthesis depth zero belongs to the main statement.  Names
+    and the words ``RECURSIVE``, ``AS``, ``NOT`` and ``MATERIALIZED`` are never
+    one of them unquoted.
+    """
+    depth = 0
+    for token in significant[1:]:
+        if token.kind is TokenKind.PUNCT:
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth -= 1
+        elif depth == 0 and token.kind is TokenKind.WORD and token.upper in _CTE_MAIN_VERBS:
+            return token.upper
+    return ""
+
+
+#: Verbs that make a CTE body a data-modifying statement on PostgreSQL.
+_CTE_BODY_DML_VERBS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
+
+
+def _cte_body_verbs(significant: list[Token]) -> frozenset[str]:
+    """The DML verbs that open a CTE body of a ``WITH`` statement.
+
+    A body opens at a ``(`` at parenthesis depth zero that follows ``AS``,
+    ``AS MATERIALIZED`` or ``AS NOT MATERIALIZED``; its first word is at depth
+    one.  PostgreSQL accepts a data-modifying CTE only at the top level of the
+    statement, so a deeper body is not searched.
+    """
+    found: set[str] = set()
+    depth = 0
+    for index, token in enumerate(significant):
+        if token.kind is TokenKind.PUNCT and token.text == "(":
+            if depth == 0 and _follows_as(significant, index):
+                body = significant[index + 1] if index + 1 < len(significant) else None
+                if (
+                    body is not None
+                    and body.kind is TokenKind.WORD
+                    and body.upper in _CTE_BODY_DML_VERBS
+                ):
+                    found.add(body.upper)
+            depth += 1
+        elif token.kind is TokenKind.PUNCT and token.text == ")":
+            depth -= 1
+    return frozenset(found)
+
+
+def _follows_as(significant: list[Token], index: int) -> bool:
+    """True when ``AS``, ``AS MATERIALIZED`` or ``AS NOT MATERIALIZED`` ends just before *index*."""
+    before = [
+        token.upper if token.kind is TokenKind.WORD else ""
+        for token in significant[max(0, index - 3) : index]
+    ]
+    return (
+        before[-1:] == ["AS"]
+        or before[-2:] == ["AS", "MATERIALIZED"]
+        or before[-3:] == ["AS", "NOT", "MATERIALIZED"]
+    )
+
+
+#: Word characters for the fallback scan of a DO body the tokenizer refuses.
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$#]*")
+
+
+def _do_body_names(significant: list[Token]) -> set[str]:
+    """Identifiers inside the body of a PostgreSQL ``DO`` statement.
+
+    The body arrives as one string token, dollar-quoted or single-quoted, so its
+    words are invisible to the token scan.  The body is tokenized again with the
+    same rules; a body this scanner cannot tokenize (a backslash-escaped quote
+    in an ``E'...'`` string, for example) contributes every word it contains,
+    which errs towards refusing.  Strings inside the body are not examined, so dynamic SQL built
+    from a string literal stays outside this guard.
+    """
+    names: set[str] = set()
+    for token in significant:
+        if token.kind is not TokenKind.STRING:
+            continue
+        if token.text.startswith("'"):
+            body = token.text[1:-1].replace("''", "'")
+        else:
+            tag_end = token.text.index("$", 1) + 1
+            body = token.text[tag_end : len(token.text) - tag_end]
+        try:
+            names |= _identifier_words(significant_tokens(body))
+        except SqlSyntaxError:
+            names.update(word.upper() for word in _WORD_RE.findall(body))
+    return names
 
 
 def classify(sql: str) -> StatementKind:
@@ -442,9 +612,11 @@ def normalize(sql: str) -> Statement:
     # Quoted identifiers are folded to upper case here as well.  A lower-case
     # quoted name is a different object on Oracle, so treating both forms as a
     # reference is the conservative direction.
-    names = frozenset(word_tokens).union(
-        tok.text[1:-1].upper() for tok in significant if tok.kind is TokenKind.QUOTED_IDENT
-    )
+    name_set = _identifier_words(significant)
+    if words and words[0] == "DO":
+        name_set |= _do_body_names(significant)
+    names = frozenset(name_set)
+    string_names = _strings_in_identifier_position(significant)
     first = significant[0]
     if first.kind is TokenKind.PUNCT and first.text == "@":
         raise SqlSyntaxError("'@' script inclusion is a SQL*Plus command and is not supported")
@@ -458,7 +630,16 @@ def normalize(sql: str) -> Statement:
             f"{words[0]} is an unsupported SQL*Plus or client command; "
             "this tool has no SQL*Plus interpreter"
         )
-    return Statement(text=stripped, kind=kind, lead=words, names=names)
+    is_with = bool(words) and words[0] == "WITH"
+    return Statement(
+        text=stripped,
+        kind=kind,
+        lead=words,
+        names=names,
+        string_names=string_names,
+        cte_verb=_cte_main_verb(significant) if is_with else "",
+        cte_body_verbs=_cte_body_verbs(significant) if is_with else frozenset(),
+    )
 
 
 def _is_also_valid_sql(words: tuple[str, ...]) -> bool:

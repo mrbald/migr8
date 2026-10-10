@@ -75,6 +75,14 @@ class ConfigError(UsageError):
     pass
 
 
+class ConnectionSetupError(UsageError):
+    """The connection failed during setup or lock acquisition (exit 1).
+
+    Nothing that could commit had been submitted, so this never claims an
+    unknown outcome.
+    """
+
+
 class UnsupportedCapabilityError(UsageError):
     """The adapter cannot honour something the manifest or migration asked for."""
 

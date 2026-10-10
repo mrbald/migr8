@@ -14,10 +14,15 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from .adapters.base import Adapter, Boundary
+from .adapters.base import Adapter, BatchTransactionState, Boundary
 from .diagnostics import RunLog
-from .errors import MigrationFailedError, UnknownOutcomeError, UsageError
-from .latch import RunLatch
+from .errors import (
+    ContractViolationError,
+    MigrationFailedError,
+    UnknownOutcomeError,
+    UsageError,
+)
+from .latch import LatchState, RunLatch
 from .manifest import Mode
 from .model import PROGRESS_KEY_MAX_CHARS, PROGRESS_VALUE_MAX_BYTES, CapturedUnit
 from .paths import check_relative_path
@@ -25,6 +30,76 @@ from .sqltext import normalize
 from .testing import hooks
 
 LOGGER = logging.getLogger("migr8.migration")
+
+#: What a contract violation inside a batch leaves behind.
+BATCH_VIOLATION_OUTCOME = "The batch was not committed and the migration remains ACTIVE."
+
+
+def batch_rolled_back(latch: RunLatch, *, migration_id: str, before: str) -> MigrationFailedError:
+    """Latch and return the failure for a batch whose transaction the database rolled back.
+
+    *before* completes "before ...": the refused call, or the end of the batch.
+    The latch keeps an author who catches the failure from completing the
+    migration without the batch (spec Section 7.2).
+    """
+    return latch.latch_failure(
+        MigrationFailedError(
+            f"the database rolled the batch transaction back before {before}; the batch is "
+            "not committed",
+            phase="restartable_batch",
+            migration_id=migration_id,
+        )
+    )
+
+
+def transaction_violation(
+    latch: RunLatch, *, migration_id: str, detail: str, outcome: str, phase: str
+) -> ContractViolationError:
+    """Latch and return a detected transaction-contract violation (spec Section 5.1).
+
+    Atomic migrations and restartable batches report through this one message,
+    so both carry the same remediation warning: the check cannot undo work a
+    hidden commit already made durable.
+    """
+    return latch.latch_violation(
+        ContractViolationError(
+            f"migration {migration_id!r} broke its transaction: {detail}. {outcome} "
+            "Durable effects of the migration may require manual remediation.",
+            phase=phase,
+            migration_id=migration_id,
+        )
+    )
+
+
+def check_transaction_identity(
+    adapter: Adapter,
+    latch: RunLatch,
+    established: str | None,
+    *,
+    migration_id: str,
+    scope: str,
+    outcome: str,
+) -> None:
+    """Raise a latched violation when the transaction identity has changed.
+
+    *established* is what :meth:`Adapter.establish_transaction_identity`
+    returned after ``begin``; ``None`` means the adapter states a different
+    enforcement boundary and there is nothing to compare.  *scope* names the
+    transaction in the message: ``"atomic"`` or ``"batch"``.
+    """
+    if established is None:
+        return
+    current = adapter.read_transaction_identity()
+    if current == established:
+        return
+    now = "no transaction is open" if current is None else f"the identity is now {current!r}"
+    raise transaction_violation(
+        latch,
+        migration_id=migration_id,
+        detail=f"the {scope} transaction was established as {established!r} but {now}",
+        outcome=outcome,
+        phase="transaction_identity",
+    )
 
 
 class _BaseContext:
@@ -62,8 +137,34 @@ class _BaseContext:
     def _mode(self) -> Mode:
         return self._unit.mode
 
-    def _prepare(self, sql: str):
+    def _admit_call(self, operation: str) -> None:
+        """Refuse a facade call after a latched failure or inside an ended batch.
+
+        A batch's transaction can end inside a statement while the author
+        catches the statement error: SQLite rolls it back for ``INSERT OR
+        ROLLBACK``, and an Oracle PL/SQL block can commit.  Every later
+        statement and checkpoint would then autocommit on its own, so the call
+        is refused before it is sent (spec Section 5.2).  A rollback latches a
+        failed batch (exit 3); a commit, or an end the adapter cannot attribute,
+        latches a contract violation (exit 8).
+        """
         self._latch.check()
+        if not self._in_batch:
+            return
+        state = self._adapter.batch_transaction_state()
+        if state is BatchTransactionState.ROLLED_BACK:
+            raise batch_rolled_back(self._latch, migration_id=self.migration_id, before=operation)
+        if state is BatchTransactionState.ENDED:
+            raise transaction_violation(
+                self._latch,
+                migration_id=self.migration_id,
+                detail=f"the batch transaction ended before {operation} inside the batch",
+                outcome=BATCH_VIOLATION_OUTCOME,
+                phase="restartable_batch",
+            )
+
+    def _prepare(self, sql: str, operation: str):
+        self._admit_call(operation)
         statement = normalize(sql)
         self._adapter.admit_statement(statement, mode=self._mode, in_batch=self._in_batch)
         return statement
@@ -107,7 +208,7 @@ class _BaseContext:
 
     def execute(self, sql: str, params: object | None = None) -> int:
         """Execute one statement.  Returns the affected-row count for supported DML."""
-        statement = self._prepare(sql)
+        statement = self._prepare(sql, "ctx.execute()")
         return self._guard_call("execute", self._adapter.execute, statement, params)
 
     def executemany(self, sql: str, parameter_sets: list[object]) -> int:
@@ -117,21 +218,21 @@ class _BaseContext:
         """
         if not isinstance(parameter_sets, list):
             parameter_sets = list(parameter_sets)
-        statement = self._prepare(sql)
+        statement = self._prepare(sql, "ctx.executemany()")
         if not parameter_sets:
             return 0
         return self._guard_call("executemany", self._adapter.executemany, statement, parameter_sets)
 
     def query(self, sql: str, params: object | None = None) -> list[tuple]:
         """Execute one query and return a list of tuples in selected-column order."""
-        statement = self._prepare(sql)
+        statement = self._prepare(sql, "ctx.query()")
         return self._guard_call("query", self._adapter.query, statement, params)
 
     # --- unit-local files -------------------------------------------------------------------------
 
     def sql(self, relative_path: str) -> str:
         """Read text from a regular SQL file inside this migration's staged unit."""
-        self._latch.check()
+        self._admit_call("ctx.sql()")
         check_relative_path(relative_path, what=f"ctx.sql() path for {self.migration_id!r}")
         root = self._unit.source_dir
         candidate = (root / relative_path).resolve(strict=False)
@@ -184,7 +285,7 @@ class ProgressFacade:
 
     def get(self, key: str, default: str | None = None) -> str | None:
         ctx = self._context
-        ctx._latch.check()
+        ctx._admit_call("ctx.progress.get()")
         _check_progress_key(key)
         value = ctx._guard_call(
             "progress_get",
@@ -202,7 +303,7 @@ class ProgressFacade:
         durable with it.
         """
         ctx = self._context
-        ctx._latch.check()
+        ctx._admit_call("ctx.progress.set()")
         _check_progress_key(key)
         _check_progress_value(value)
         if not ctx._in_batch:
@@ -250,10 +351,11 @@ class _BatchContext:
     report.
     """
 
-    __slots__ = ("_owner",)
+    __slots__ = ("_identity", "_owner")
 
     def __init__(self, owner: RestartableContext) -> None:
         self._owner = owner
+        self._identity: str | None = None
 
     def __enter__(self) -> RestartableContext:
         owner = self._owner
@@ -269,6 +371,13 @@ class _BatchContext:
                 migration_id=owner.migration_id,
             )
         owner._adapter.begin()
+        try:
+            self._identity = owner._adapter.establish_transaction_identity()
+        except UnknownOutcomeError:
+            raise
+        except Exception:
+            owner._rollback_batch()
+            raise
         owner._in_batch = True
         owner._open_batch = self
         return owner
@@ -277,16 +386,7 @@ class _BatchContext:
         owner = self._owner
         owner._in_batch = False
         owner._open_batch = None
-        if exc_type is not None:
-            # After an unknown commit outcome no further SQL may be issued, so
-            # the batch is abandoned without a rollback (spec Section 7.2).
-            if not owner._latch.unknown:
-                try:
-                    owner._adapter.rollback()
-                except Exception:
-                    LOGGER.warning("rollback after batch failure did not complete cleanly")
-            return False
-        owner._commit_batch()
+        owner._finish_batch(self._identity, failed=exc_type is not None)
         return False
 
 
@@ -311,6 +411,87 @@ class RestartableContext(_BaseContext):
         """
         self._latch.check()
         return _BatchContext(self)
+
+    def _finish_batch(self, established: str | None, *, failed: bool) -> None:
+        """Check the batch's transaction, then commit a clean batch or roll back a failed one.
+
+        The check runs on both paths, because a hidden commit followed by an
+        exception is still a contract violation and the exit code has to say
+        so.  A violation, latched here or earlier in the batch, rolls back the
+        remainder and replaces any exception the batch raised.  After an
+        unknown outcome no SQL is issued at all, so the batch is abandoned
+        without a rollback (spec Section 7.2).
+
+        A batch that leaves with an exception is an ordinary failure: the
+        author has the real error, the batch is rolled back, and nothing new is
+        latched.  A clean exit from a batch whose transaction the database
+        rolled back, or that cannot be committed, latches a failed batch,
+        because the author never saw the transaction end.
+        """
+        latch = self._latch
+        if not latch.latched:
+            try:
+                state = self._adapter.batch_transaction_state()
+                if state is BatchTransactionState.ROLLED_BACK:
+                    self._rollback_batch()
+                    if failed:
+                        return
+                    raise batch_rolled_back(
+                        latch, migration_id=self.migration_id, before="the batch ended"
+                    )
+                if state is BatchTransactionState.ENDED:
+                    raise transaction_violation(
+                        latch,
+                        migration_id=self.migration_id,
+                        detail="the batch transaction ended before the batch did",
+                        outcome=BATCH_VIOLATION_OUTCOME,
+                        phase="restartable_batch",
+                    )
+                check_transaction_identity(
+                    self._adapter,
+                    latch,
+                    established,
+                    migration_id=self.migration_id,
+                    scope="batch",
+                    outcome=BATCH_VIOLATION_OUTCOME,
+                )
+            except (ContractViolationError, UnknownOutcomeError):
+                pass  # Latched by the check itself and raised below.
+            except MigrationFailedError:
+                raise
+            except Exception as exc:
+                # A definite rejection of the identity read.  On PostgreSQL it
+                # fails this way inside a transaction an earlier statement
+                # error aborted.  A failed batch reports its own exception as an
+                # ordinary failure; a clean one could not be committed, which
+                # latches a failed batch.
+                self._rollback_batch()
+                if failed:
+                    return
+                raise latch.latch_failure(
+                    MigrationFailedError(
+                        "batch transaction could not be checked before commit and was rolled "
+                        f"back: {self._adapter.describe_exception(exc)}",
+                        phase="restartable_batch",
+                        migration_id=self.migration_id,
+                    )
+                ) from exc
+        if latch.latched:
+            if not latch.unknown:
+                self._rollback_batch()
+            if failed and latch.state is LatchState.BATCH_FAILED:
+                return  # The batch's own exception propagates; the latch outranks it.
+            latch.check()
+        if failed:
+            self._rollback_batch()
+            return
+        self._commit_batch()
+
+    def _rollback_batch(self) -> None:
+        try:
+            self._adapter.rollback()
+        except Exception:
+            LOGGER.warning("rollback of the batch did not complete cleanly")
 
     def _commit_batch(self) -> None:
         try:

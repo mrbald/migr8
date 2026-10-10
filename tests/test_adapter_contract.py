@@ -87,10 +87,13 @@ def _postgres_config(tmp_path):
             pytest.skip(f"PostgreSQL test service not configured: {name} is unset")
     psycopg = pytest.importorskip("psycopg")
     schema = os.environ.get("MIGR8_PG_SCHEMA", "migr8")
-    conninfo = (
+    # The configured DSN carries no user, so the run takes it from database.user
+    # and the keyword-argument path to the driver is exercised.
+    dsn = (
         f"host={os.environ['MIGR8_PG_HOST']} port={os.environ['MIGR8_PG_PORT']} "
-        f"dbname={os.environ['MIGR8_PG_DB']} user={os.environ['MIGR8_PG_USER']}"
+        f"dbname={os.environ['MIGR8_PG_DB']}"
     )
+    conninfo = f"{dsn} user={os.environ['MIGR8_PG_USER']}"
     password = os.environ["MIGR8_PG_PASSWORD"]
     try:
         with psycopg.connect(f"{conninfo} password={password}", autocommit=True) as conn:
@@ -104,7 +107,7 @@ def _postgres_config(tmp_path):
         f"""
         [database]
         adapter = "postgres"
-        dsn = "{conninfo}"
+        dsn = "{dsn}"
         user = "{os.environ["MIGR8_PG_USER"]}"
         target_schema = "{schema}"
 
@@ -414,6 +417,67 @@ def test_queries_are_admitted_outside_a_batch(ready: Adapter):
     ready.admit_statement(
         normalize("SELECT 1 FROM probe_table"), mode=Mode.RESTARTABLE, in_batch=False
     )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE probe_new (id INTEGER)",
+        "ALTER TABLE probe_table ADD COLUMN extra INTEGER",
+        "DROP TABLE probe_table",
+        "TRUNCATE TABLE probe_table",
+    ],
+)
+def test_ddl_inside_a_batch_is_refused_and_names_ctx_ddl(ready: Adapter, sql):
+    with pytest.raises(UsageError, match=r"ctx\.ddl\(\) outside the batch"):
+        ready.admit_statement(normalize(sql), mode=Mode.RESTARTABLE, in_batch=True)
+
+
+@pytest.mark.parametrize("verb", ["INSERT", "UPDATE", "DELETE", "MERGE"])
+def test_a_cte_that_ends_in_dml_is_refused_outside_a_batch(ready: Adapter, verb):
+    tails = {
+        "INSERT": "INSERT INTO probe_table (col) SELECT n FROM c",
+        "UPDATE": "UPDATE probe_table SET col = 1",
+        "DELETE": "DELETE FROM probe_table",
+        "MERGE": "MERGE INTO probe_table USING c ON (1 = 1) WHEN MATCHED THEN DELETE",
+    }
+    statement = normalize(f"WITH c(n) AS (SELECT 1 FROM probe_table) {tails[verb]}")
+    assert statement.cte_verb == verb
+    with pytest.raises(UsageError, match=rf"WITH \.\.\. {verb} outside a ctx\.transaction"):
+        ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
+    ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=True)
+    ready.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
+
+
+def test_a_cte_that_ends_in_select_is_admitted_outside_a_batch(ready: Adapter):
+    statement = normalize("WITH c(n) AS (SELECT 1 FROM probe_table) SELECT n FROM c")
+    ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH d AS (DELETE FROM probe_table RETURNING col) SELECT count(*) FROM d",
+        "WITH d AS MATERIALIZED (UPDATE probe_table SET col = 1 RETURNING col) SELECT 1",
+        "WITH c AS (SELECT 1), d(n) AS NOT MATERIALIZED "
+        "(INSERT INTO probe_table (col) VALUES (1) RETURNING col) SELECT n FROM d",
+    ],
+)
+def test_a_data_modifying_cte_body_is_refused_outside_a_batch_on_postgres(ready: Adapter, sql):
+    """PostgreSQL runs a DML body whatever the main verb, so outside a batch it autocommits.
+
+    SQLite and Oracle CTE bodies cannot hold DML, so their admission reads the
+    main verb only and the database refuses the body.
+    """
+    statement = normalize(sql)
+    assert statement.cte_verb == "SELECT"
+    if ready.name == "postgres":
+        with pytest.raises(UsageError, match=r"modifies data and would autocommit"):
+            ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
+    else:
+        ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
+    ready.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=True)
+    ready.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
 
 
 @pytest.mark.parametrize(

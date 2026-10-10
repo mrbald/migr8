@@ -31,6 +31,8 @@ from typing import Any, ClassVar
 
 from ..config import Config
 from ..errors import (
+    ConnectionSetupError,
+    LockNotAcquiredError,
     MetadataDamagedError,
     Migr8Error,
     UnknownOutcomeError,
@@ -63,6 +65,17 @@ class OutcomeClass(StrEnum):
     SERVER_REJECTION = "server_rejection"
     #: The call's outcome is unknown.  This is the conservative default.
     COMMUNICATION_FAILURE = "communication_failure"
+
+
+class BatchTransactionState(StrEnum):
+    """What the driver's local state says about a batch's transaction (spec Section 5.2)."""
+
+    #: The transaction is still open, aborted or not.
+    OPEN = "open"
+    #: The database rolled the transaction back, and nothing of it is durable.
+    ROLLED_BACK = "rolled_back"
+    #: The transaction ended by a commit, or the adapter cannot tell how it ended.
+    ENDED = "ended"
 
 
 class Boundary(StrEnum):
@@ -113,6 +126,15 @@ class Capabilities:
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
+#: Leading tokens of DDL.  A restartable batch admits none of them on any
+#: adapter, whatever the engine's DDL transactionality (spec Section 5.2).
+_BATCH_DDL_TOKENS = frozenset({"CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT"})
+
+#: Verbs that make a ``WITH`` statement DML rather than a query.  ``REPLACE`` is
+#: SQLite's spelling of ``INSERT OR REPLACE``.
+_CTE_DML_VERBS = frozenset({"INSERT", "REPLACE", "UPDATE", "DELETE", "MERGE"})
+
+
 @dataclass(frozen=True, slots=True)
 class StatementPolicy:
     """Declarative statement admission for one engine (spec Section 5.3).
@@ -134,6 +156,14 @@ class StatementPolicy:
     forbidden: frozenset[str]
     #: Whether the engine has PL/SQL blocks and stored definitions at all.
     allows_plsql: bool = False
+    #: Whether a single-quoted string in identifier position names an object, as
+    #: SQLite accepts ``DELETE FROM 't'``.  The reserved-name check then matches
+    #: :attr:`Statement.string_names` as well as the identifier tokens.
+    quoted_string_identifiers: bool = False
+    #: Whether a CTE body can modify data, as PostgreSQL runs ``WITH d AS
+    #: (DELETE ... RETURNING ...) SELECT ...``.  Such a ``WITH`` is then refused
+    #: outside a batch, whatever its main verb.
+    cte_bodies_modify: bool = False
 
 
 class Adapter(ABC):
@@ -216,7 +246,8 @@ class Adapter(ABC):
             raise
         except BaseException as exc:
             if isinstance(exc, Exception):
-                if self.classify_exception(exc) is OutcomeClass.SERVER_REJECTION:
+                outcome = self.classify_call_failure(exc, commit_capable=commit_capable)
+                if outcome is OutcomeClass.SERVER_REJECTION:
                     raise
             elif not commit_capable:
                 raise
@@ -334,6 +365,11 @@ class Adapter(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release the lock if held and close the session cleanly."""
+
+    @property
+    @abstractmethod
+    def connection_held(self) -> bool:
+        """True while the adapter holds a driver connection that close or discard would drop."""
 
     @abstractmethod
     def discard(self) -> None:
@@ -937,7 +973,18 @@ class Adapter(ABC):
     def _has_open_transaction(self) -> bool:
         """Ask the driver or server; the caller supplies the guard."""
 
-    # --- atomic transaction identity --------------------------------------------------------------
+    @abstractmethod
+    def batch_transaction_state(self) -> BatchTransactionState:
+        """Whether the batch's transaction is open, and if not, how it ended.
+
+        The facade asks before every call inside a batch and before the batch
+        commits.  The answer comes from the client library without a round
+        trip, so it never needs the operation guard.  An adapter answers
+        ``ROLLED_BACK`` only when no admitted statement could have committed;
+        when it cannot tell a commit from a rollback it answers ``ENDED``.
+        """
+
+    # --- transaction identity (atomic migrations and restartable batches) -------------------------
 
     def establish_transaction_identity(self) -> str | None:
         """Create and capture the transaction identity before any migration code runs.
@@ -1015,6 +1062,11 @@ class Adapter(ABC):
                 "facade: transaction control, session state and maintenance statements "
                 "are engine-owned"
             )
+        if in_batch and first in _BATCH_DDL_TOKENS:
+            raise UsageError(
+                f"{first} is DDL and is not admitted inside ctx.transaction() on any "
+                "adapter; run it with ctx.ddl() outside the batch"
+            )
         self._extra_statement_checks(statement, mode=mode, in_batch=in_batch)
         self._reject_reserved(statement)
         if mode is Mode.ATOMIC or in_batch:
@@ -1031,6 +1083,18 @@ class Adapter(ABC):
                 f"{first} outside a ctx.transaction() block is rejected in restartable "
                 "mode; use ctx.transaction() for DML or ctx.ddl() for DDL"
             )
+        if first == "WITH" and statement.cte_verb in _CTE_DML_VERBS:
+            raise UsageError(
+                f"WITH ... {statement.cte_verb} outside a ctx.transaction() block is "
+                "rejected in restartable mode; use ctx.transaction() for DML"
+            )
+        if first == "WITH" and policy.cte_bodies_modify and statement.cte_body_verbs:
+            verbs = ", ".join(sorted(statement.cte_body_verbs))
+            raise UsageError(
+                f"WITH ... AS ({verbs} ...) outside a ctx.transaction() block is rejected "
+                "in restartable mode: the common table expression modifies data and "
+                "would autocommit; use ctx.transaction() for DML"
+            )
 
     def admit_ddl(self, statement: Statement) -> None:
         """Admit or refuse a ``ctx.ddl()`` statement against the adapter allow-list.
@@ -1042,6 +1106,13 @@ class Adapter(ABC):
         policy = self.statement_policy
         first = statement.first_token
         if statement.kind is StatementKind.PLSQL_BLOCK:
+            if not policy.allows_plsql:
+                # A BEGIN or DECLARE file reaches this method on engines whose
+                # procedural set has neither word; the capability answer is the
+                # accurate one.
+                raise UnsupportedCapabilityError(
+                    f"the {self.name} adapter has no PL/SQL support; {first} is not admitted"
+                )
             raise UsageError(
                 "an anonymous PL/SQL block is not DDL; run it with ctx.execute() in a "
                 "restartable migration, where it may own its own transactions"
@@ -1064,10 +1135,15 @@ class Adapter(ABC):
         The comparison is against the statement's identifier tokens, not its raw
         text.  A substring scan refuses far more than it should: a table called
         ``custom8_history`` contains ``m8_history``, and so does a comment or a
-        string literal that merely mentions the engine table.
+        string literal that merely mentions the engine table.  An engine that
+        reads a single-quoted string as an object name (SQLite) also has the
+        strings in identifier position checked.
         """
+        names = statement.names
+        if self.statement_policy.quoted_string_identifiers:
+            names = names | statement.string_names
         for reserved in sorted(RESERVED_OBJECT_NAMES):
-            if reserved.upper() in statement.names:
+            if reserved.upper() in names:
                 raise UsageError(
                     f"migration code must not reference the reserved metadata object "
                     f"{reserved}; use the supplied progress API"
@@ -1154,6 +1230,16 @@ class Adapter(ABC):
         failure and therefore an unknown outcome from a commit-capable call.
         """
 
+    def classify_call_failure(self, exc: Exception, *, commit_capable: bool) -> OutcomeClass:
+        """Classify a failure of one guarded call, knowing whether the call could commit.
+
+        The operation guard asks this.  The default ignores *commit_capable*
+        and answers as :meth:`classify_exception` does; an adapter overrides it
+        where an error code settles the outcome only for a call that could not
+        have committed.
+        """
+        return self.classify_exception(exc)
+
     def error_code(self, exc: BaseException) -> str | None:
         """This engine's code for *exc*, or ``None`` when it has none.
 
@@ -1174,6 +1260,43 @@ class Adapter(ABC):
         name = f"{type(exc).__module__}.{type(exc).__qualname__}"
         code = self.error_code(exc)
         return f"{name} [{code}]" if code else name
+
+    # --- connection setup and lock acquisition ----------------------------------------------------
+
+    def is_contention(self, exc: BaseException) -> bool:
+        """True when *exc* says another session holds what setup asked for."""
+        return False
+
+    def setup_error(self, exc: BaseException, doing: str, *, hint: str = "") -> Migr8Error:
+        """Turn a driver error raised outside any commit-capable call into an engine error.
+
+        Setup and lock acquisition submit nothing that can commit, so no
+        outcome is in doubt and this never returns an unknown-outcome error.
+        Contention maps to exit 5, a lost connection to exit 1 as a connection
+        setup failure, and any other driver error to exit 1 with the driver's
+        code.  The driver's message is not used: it can quote connection
+        details (spec Section 11.5).  *doing* completes "while ...".  *hint* is
+        appended to the generic case only, where the operator has something to
+        fix.
+        """
+        code = self.describe_exception(exc)
+        if self.is_contention(exc):
+            return LockNotAcquiredError(
+                f"the database was busy while {doing} ({code}). Another session holds it; "
+                "contention is not evidence that the other holder has stopped.",
+                phase="connect",
+            )
+        if self.classify_exception(exc) is OutcomeClass.COMMUNICATION_FAILURE:
+            return ConnectionSetupError(
+                f"the connection was lost while {doing} ({code}). Nothing that could commit "
+                "had been submitted, so no outcome is in doubt. Check the network path and "
+                "the server, then rerun.",
+                phase="connect",
+            )
+        suffix = f" {hint}" if hint else ""
+        return UsageError(
+            f"the database reported an error while {doing} ({code}).{suffix}", phase="connect"
+        )
 
 
 def _listed(tokens: frozenset[str]) -> str:

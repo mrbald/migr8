@@ -116,6 +116,7 @@ def test_bytes_are_not_newline_normalised():
         "fp2:" + "0" * 64,
         "fp1:" + "A" * 64,
         "sha256:" + "0" * 64,
+        "fp1:" + "0" * 64 + "\n",
     ],
 )
 def test_unsupported_fingerprint_formats_are_rejected(value):

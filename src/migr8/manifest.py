@@ -145,7 +145,7 @@ def _build_migration(entry: dict[str, object], position: int, directory: Path) -
         )
 
     migration_id = _require_str(entry["id"], f"migration at position {position} id")
-    if not ID_RE.match(migration_id):
+    if not ID_RE.fullmatch(migration_id):
         raise ManifestError(
             f"migration id {migration_id!r} at position {position} does not match "
             r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$"

@@ -251,16 +251,18 @@ def pg_project(tmp_path, pg_settings):
     with psycopg.connect(pg_settings["conninfo"], autocommit=True) as connection:
         connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         connection.execute(f'CREATE SCHEMA "{schema}"')
+    # The configured DSN carries no user, so the run takes it from database.user
+    # and the keyword-argument path to the driver is exercised.
+    dsn = (
+        f"host={os.environ['MIGR8_PG_HOST']} port={os.environ['MIGR8_PG_PORT']} "
+        f"dbname={os.environ['MIGR8_PG_DB']}"
+    )
     config = support.write(
         tmp_path / "migr8.toml",
         f"""
         [database]
         adapter = "postgres"
-        dsn = "{
-            pg_settings["conninfo"]
-            .replace("password=" + os.environ["MIGR8_PG_PASSWORD"], "")
-            .strip()
-        }"
+        dsn = "{dsn}"
         user = "{pg_settings["user"]}"
         target_schema = "{schema}"
 

@@ -52,6 +52,7 @@ from ..sqltext import Statement
 from . import metadata as md
 from .base import (
     Adapter,
+    BatchTransactionState,
     Boundary,
     Capabilities,
     OutcomeClass,
@@ -115,6 +116,7 @@ _POLICY = StatementPolicy(
         }
     ),
     allows_plsql=False,
+    quoted_string_identifiers=True,
 )
 
 _DDL = {
@@ -454,8 +456,13 @@ class SqliteAdapter(Adapter):
             raise UsageError(
                 f"the database {self._path} cannot be opened: {self.describe_exception(exc)}"
             ) from exc
-        self._conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-        self._establish_settings()
+        try:
+            self._conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            self._establish_settings()
+        except BaseException:
+            # The engine does not close a session whose connect() raised.
+            self.discard()
+            raise
 
     def _establish_settings(self) -> None:
         """Set every connection-level setting the adapter requires, and read it back.
@@ -470,7 +477,8 @@ class SqliteAdapter(Adapter):
         at the inspection that would have named the object at fault.  That is a
         damaged namespace, and it gets the exit code that says so.  Contention is
         not: a database another connection holds is unavailable now, and saying
-        "damaged" about it would send an operator looking for a repair.
+        "damaged" about it would send an operator looking for a repair.  It
+        raises :class:`LockNotAcquiredError`.
         """
         try:
             self._set_and_verify("foreign_keys", "ON", 1)
@@ -483,7 +491,7 @@ class SqliteAdapter(Adapter):
             )
         except sqlite3.DatabaseError as exc:
             if _is_contention(exc):
-                raise
+                raise self.setup_error(exc, "setting up the connection") from exc
             raise MetadataDamagedError(
                 f"the schema of {self._path} cannot be read: {self.describe_exception(exc)}"
             ) from exc
@@ -532,6 +540,10 @@ class SqliteAdapter(Adapter):
             self._conn.close()
             self._conn = None
         self.release_lock()
+
+    @property
+    def connection_held(self) -> bool:
+        return self._conn is not None
 
     def discard(self) -> None:
         """Drop the connection without issuing any SQL."""
@@ -791,13 +803,19 @@ class SqliteAdapter(Adapter):
         deferred constraint, a refusal made before anything was written -- keep
         the ordinary definite path.
 
+        A COMMIT sent with no transaction open fails with "no transaction is
+        active".  That reports a known state: the transaction ended earlier,
+        for example through ``INSERT OR ROLLBACK``, and this COMMIT wrote
+        nothing.  It is a definite rejection.
+
         Sources: https://www.sqlite.org/lang_transaction.html,
         https://www.sqlite.org/atomiccommit.html.
         """
+        was_open = self._db.in_transaction
         try:
             self._db.execute("COMMIT")
         except sqlite3.Error as exc:
-            if _settles_the_transaction(exc):
+            if not was_open or _settles_the_transaction(exc):
                 raise
             raise CommitOutcomeUnknown(getattr(exc, "sqlite_errorname", None)) from exc
         self._txn_epoch += 1
@@ -853,6 +871,23 @@ class SqliteAdapter(Adapter):
     def _has_open_transaction(self) -> bool:
         return bool(self._db.in_transaction)
 
+    def batch_transaction_state(self) -> BatchTransactionState:
+        """SQLite's native ``in_transaction`` flag.
+
+        ``INSERT OR ROLLBACK``, an ``ON CONFLICT ROLLBACK`` constraint, a
+        ``RAISE(ROLLBACK)`` trigger and an automatic rollback after
+        ``SQLITE_FULL``, ``SQLITE_IOERR``, ``SQLITE_NOMEM`` or ``SQLITE_BUSY``
+        end the whole transaction while the statement error reaches author
+        code, which may catch it.  Every later statement would then autocommit.
+        The facade admits no statement that can commit, so a transaction that
+        is no longer open was rolled back.
+        """
+        if self._conn is None:
+            return BatchTransactionState.ENDED
+        if self._conn.in_transaction:
+            return BatchTransactionState.OPEN
+        return BatchTransactionState.ROLLED_BACK
+
     # --- transaction identity ---------------------------------------------------------------------
 
     def _establish_transaction_identity(self) -> str | None:
@@ -860,7 +895,7 @@ class SqliteAdapter(Adapter):
         if not self._db.in_transaction:
             # BEGIN IMMEDIATE already acquired a write lock, so the transaction
             # is live; this path means the caller did not begin one.
-            raise UsageError("no transaction is open when establishing atomic identity")
+            raise UsageError("no transaction is open when establishing the transaction identity")
         return f"sqlite-txn:{self._txn_epoch}"
 
     def _read_transaction_identity(self) -> str | None:
@@ -878,6 +913,9 @@ class SqliteAdapter(Adapter):
         return max(cursor.rowcount, 0)
 
     # --- error classification ---------------------------------------------------------------------
+
+    def is_contention(self, exc: BaseException) -> bool:
+        return isinstance(exc, sqlite3.Error) and _is_contention(exc)
 
     def classify_exception(self, exc: BaseException) -> OutcomeClass:
         """SQLite runs in-process, so an error it raises is a definite rejection.

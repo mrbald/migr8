@@ -186,6 +186,101 @@ def test_batch_rollback_discards_data_and_checkpoint(oracle_project, oracle_quer
     assert oracle_query("SELECT COUNT(*) FROM m8_progress") == [(0,)]
 
 
+def _backfill_manifest(root, body: str):
+    entries = _orders_table(root)
+    support.unit(root, "m_fill", {"migration.py": body})
+    return support.manifest(
+        root,
+        [
+            *entries,
+            {
+                "id": "backfill",
+                "path": "m_fill",
+                "language": "python",
+                "mode": "restartable",
+                "entry": "migration.py",
+            },
+        ],
+    )
+
+
+HIDDEN_COMMIT = """\
+def migrate(ctx):
+    with ctx.transaction() as tx:
+        tx.execute("UPDATE orders SET region = 'EU' WHERE id = 1")
+        tx.execute("BEGIN UPDATE orders SET region = 'EU' WHERE id = 2; COMMIT; END;")
+        ctx.progress.set("last_id", "2")
+{tail}
+    with ctx.transaction() as tx:
+        tx.execute("UPDATE orders SET region = 'EU' WHERE id = 3")
+"""
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param("", id="clean-exit"),
+        pytest.param('        raise RuntimeError("author failure")', id="exception"),
+    ],
+)
+def test_a_commit_inside_a_batch_is_a_contract_violation(oracle_project, oracle_query, tail):
+    """The identity check runs on both batch exits, so an exception does not hide it."""
+    root, config, schema = oracle_project
+    manifest = _backfill_manifest(root, HIDDEN_COMMIT.format(tail=tail))
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.CONTRACT_VIOLATION
+    assert "broke its transaction" in report.message
+    assert "batch transaction" in report.message
+    assert "manual remediation" in report.message
+    assert oracle_query("SELECT status FROM m8_history WHERE migration_id = 'backfill'") == [
+        ("ACTIVE",)
+    ]
+    # The work before the PL/SQL COMMIT is durable; the checkpoint written after
+    # it was rolled back, and the later batch never ran.
+    assert oracle_query("SELECT id FROM orders WHERE region = 'EU' ORDER BY id") == [(1,), (2,)]
+    assert oracle_query("SELECT COUNT(*) FROM m8_progress") == [(0,)]
+
+
+def test_a_statement_after_a_hidden_commit_is_refused_before_it_is_sent(
+    oracle_project, oracle_query
+):
+    """The driver's transaction flag refuses the next call after the commit."""
+    root, config, schema = oracle_project
+    body = (
+        "def migrate(ctx):\n"
+        "    with ctx.transaction() as tx:\n"
+        "        tx.execute(\"BEGIN UPDATE orders SET region = 'EU' WHERE id = 1; COMMIT; END;\")\n"
+        "        tx.execute(\"UPDATE orders SET region = 'EU' WHERE id = 2\")\n"
+    )
+    manifest = _backfill_manifest(root, body)
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.CONTRACT_VIOLATION
+    assert "the batch transaction ended before ctx.execute() inside the batch" in report.message
+    assert oracle_query("SELECT status FROM m8_history WHERE migration_id = 'backfill'") == [
+        ("ACTIVE",)
+    ]
+    # The PL/SQL COMMIT made row 1 durable; the second UPDATE was never sent.
+    assert oracle_query("SELECT id FROM orders WHERE region = 'EU' ORDER BY id") == [(1,)]
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        pytest.param('        tx.query("SELECT COUNT(*) FROM orders")', id="read-only"),
+        pytest.param('        ctx.progress.set("step", "1")', id="progress-only"),
+        pytest.param("        pass", id="empty"),
+    ],
+)
+def test_batches_without_data_writes_pass_the_identity_check(oracle_project, oracle_query, batch):
+    root, config, schema = oracle_project
+    body = f"def migrate(ctx):\n    with ctx.transaction() as tx:\n{batch}\n"
+    manifest = _backfill_manifest(root, body)
+    assert support.migrate(config, manifest) == Exit.OK
+    assert oracle_query("SELECT status FROM m8_history WHERE migration_id = 'backfill'") == [
+        ("SUCCESS",)
+    ]
+
+
 def test_executemany_raises_on_error_instead_of_collecting_row_errors(oracle_project, oracle_query):
     root, config, schema = oracle_project
     entries = _orders_table(root)

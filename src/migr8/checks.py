@@ -8,11 +8,14 @@ loader. The read-only commands import nothing that can import migration code.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum, auto
+
 from .adapters.base import Adapter
-from .errors import MetadataDamagedError, PythonSyntaxError, UsageError
+from .errors import MetadataDamagedError, PythonSyntaxError, SqlSyntaxError, UsageError
 from .manifest import Language, Mode
 from .model import LAYOUT_VERSION, Capture, CapturedUnit
-from .sqltext import StatementKind, normalize
+from .sqltext import Statement, normalize
 
 #: What :func:`preflight` checked, named for the report that says so.
 CHECKS = (
@@ -37,15 +40,74 @@ def preflight(capture: Capture, adapter: Adapter) -> None:
         adapter.admit_combination(unit.language, unit.mode)
         adapter.admit_required_objects(unit.definition.required)
         if unit.language is Language.SQL:
-            entry_path = unit.source_dir / unit.definition.entry
-            text = entry_path.read_text(encoding="utf-8")
-            statement = normalize(text)
-            if unit.mode is Mode.ATOMIC:
-                adapter.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
-            elif statement.kind is not StatementKind.PLSQL_BLOCK:
-                adapter.admit_ddl(statement)
+            admit_sql_entry(unit, adapter)
         else:
             compile_python(unit)
+
+
+class SqlCategory(StrEnum):
+    """How a SQL entry file may be executed once the adapter has admitted it."""
+
+    #: One statement or block in the migration's single transaction.
+    ATOMIC_STATEMENT = auto()
+    #: One DDL statement in its own transaction (restartable mode).
+    RESTARTABLE_DDL = auto()
+    #: A procedural block that may own its transactions (restartable mode).
+    RESTARTABLE_PROCEDURAL = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedSql:
+    """A SQL entry file's normalised statement and the category it was admitted as."""
+
+    statement: Statement
+    category: SqlCategory
+
+
+def read_sql_entry(unit: CapturedUnit, *, phase: str) -> str:
+    """Decode a SQL unit's entry file, or raise the exit-2 source error naming it."""
+    entry = unit.definition.entry
+    try:
+        return (unit.source_dir / entry).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise SqlSyntaxError(
+            f"migration {unit.id!r} has a {entry} that is not valid UTF-8: "
+            f"{exc.reason} at byte {exc.start}",
+            migration_id=unit.id,
+            phase=phase,
+        ) from exc
+
+
+def admit_sql_entry(
+    unit: CapturedUnit, adapter: Adapter, *, phase: str = "preflight"
+) -> AdmittedSql:
+    """The one admission decision for a SQL unit's entry file (spec Section 5.3).
+
+    Preflight and the engine's execution both call this, so the engine cannot
+    run a file under a category preflight did not admit it under.
+
+    * Atomic: any statement the adapter admits inside its transaction.
+    * Restartable, first token in the adapter's procedural set (``BEGIN`` and
+      ``DECLARE`` on Oracle, ``DO`` and ``CALL`` on PostgreSQL): a block that
+      owns its transactions, admitted as ``ctx.execute()`` would admit it in
+      restartable mode outside a batch.
+    * Restartable, anything else: DDL, admitted against the DDL allow-list.  A
+      ``BEGIN`` or ``DECLARE`` file on an engine without PL/SQL ends here and is
+      refused by the adapter.
+
+    The branch is the leading token and not the statement kind, because the
+    scanner classifies every ``BEGIN`` or ``DECLARE`` file as a block whichever
+    engine will run it.
+    """
+    statement = normalize(read_sql_entry(unit, phase=phase))
+    if unit.mode is Mode.ATOMIC:
+        adapter.admit_statement(statement, mode=Mode.ATOMIC, in_batch=False)
+        return AdmittedSql(statement, SqlCategory.ATOMIC_STATEMENT)
+    if statement.first_token in adapter.statement_policy.procedural:
+        adapter.admit_statement(statement, mode=Mode.RESTARTABLE, in_batch=False)
+        return AdmittedSql(statement, SqlCategory.RESTARTABLE_PROCEDURAL)
+    adapter.admit_ddl(statement)
+    return AdmittedSql(statement, SqlCategory.RESTARTABLE_DDL)
 
 
 def compile_python(unit: CapturedUnit) -> None:
@@ -113,4 +175,13 @@ def verify_bindings(adapter: Adapter, plan_meta) -> None:
         )
 
 
-__all__ = ["CHECKS", "compile_python", "preflight", "verify_bindings"]
+__all__ = [
+    "CHECKS",
+    "AdmittedSql",
+    "SqlCategory",
+    "admit_sql_entry",
+    "compile_python",
+    "preflight",
+    "read_sql_entry",
+    "verify_bindings",
+]

@@ -38,6 +38,15 @@ comes back thin fails, because the two are different libraries, a different
 network stack and different authentication paths — not a detail to discover
 later.
 
+In thick mode `migr8` also reads the session's failover type from `V$SESSION`
+and refuses any value other than `NONE`. Oracle Client can fail a session over
+to another instance without raising an error; the new server session has lost
+the `DBMS_LOCK` lock and the session settings the runner made. A connect
+descriptor or TNS alias with `FAILOVER_MODE` set therefore fails at connect with
+exit 1. The check needs `SELECT` on `SYS.V_$SESSION`; without it the run refuses
+thick mode and names the grant. Thin mode has no transparent failover and does
+not run the query.
+
 `client_lib_dir` is optional: without it the client is found the way Oracle
 documents (`ldconfig`, `LD_LIBRARY_PATH`, `ORACLE_HOME`). With it, the directory
 still has to be on the loader's path, because the client resolves its *own*

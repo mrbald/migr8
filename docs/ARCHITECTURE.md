@@ -92,6 +92,7 @@ These members stay per-adapter:
 | `classify_exception`, `error_code` | `ORA-`/`DPY-` numbers, SQLSTATEs and `sqlite3` result codes are different namespaces. |
 | `_establish_transaction_identity`, `_read_transaction_identity` | `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`, `pg_current_xact_id*` and an adapter-owned epoch. |
 | `_has_open_transaction`, `_read_snapshot` | Oracle asks `DBMS_TRANSACTION` and reads the whole snapshot in one statement; PostgreSQL reads the driver's transaction status and opens a repeatable-read block; SQLite reads `in_transaction`. |
+| `batch_transaction_state` | The local check before each call inside a batch and at batch exit, answering open, rolled back, or ended by a commit (or ended in a way the adapter cannot attribute). PostgreSQL reads the driver's transaction status: `INERROR` is open and `IDLE` is ended by a commit. SQLite reads `in_transaction`, and a transaction that is no longer open was rolled back, because the facade admits no statement that can commit. Oracle reads `Connection.transaction_in_progress`, and a transaction no longer in progress counts as ended by a commit. |
 | `acquire_lock`, `release_lock`, `lock_binding` | `DBMS_LOCK`, advisory locks, a lock file. |
 | `_run`, `_metadata_execute`, `_metadata_query`, `connect`, `close`, `discard` | Driver API. |
 | `statement_policy`, `capabilities` | Token sets and what the adapter claims to enforce. |

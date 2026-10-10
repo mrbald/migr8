@@ -114,21 +114,46 @@ def _lstat_or_fail(path: Path, migration_id: str) -> os.stat_result:
 
 
 def check_units_disjoint(units: list[tuple[str, Path]]) -> None:
-    """Reject overlapping units: equal paths, or one containing another."""
+    """Reject overlapping units: equal paths, one directory reached by two names, or
+    one unit containing another.
+
+    Two paths that differ only in case name one directory on a case-insensitive
+    filesystem, so ``u1`` and ``U1/sub`` overlap although neither path is a
+    prefix of the other.  The checks therefore compare the device and inode of
+    each unit directory and of each of its ancestors as well as the paths.
+    """
+    identities = [_directory_identity(path) for _, path in units]
+    ancestors = [_ancestor_identities(path) for _, path in units]
     for i, (id_a, path_a) in enumerate(units):
-        for id_b, path_b in units[i + 1 :]:
-            if path_a == path_b:
+        for j, (id_b, path_b) in enumerate(units[i + 1 :], start=i + 1):
+            same_directory = identities[i] is not None and identities[i] == identities[j]
+            if path_a == path_b or same_directory:
                 raise ManifestError(
-                    f"migrations {id_a!r} and {id_b!r} resolve to the same unit directory {path_a}"
+                    f"migrations {id_a!r} and {id_b!r} resolve to the same unit directory "
+                    f"({path_a} and {path_b})"
                 )
-            if path_a in path_b.parents:
+            if path_a in path_b.parents or identities[i] in ancestors[j]:
                 raise ManifestError(
                     f"unit of migration {id_b!r} is contained in the unit of {id_a!r}"
                 )
-            if path_b in path_a.parents:
+            if path_b in path_a.parents or identities[j] in ancestors[i]:
                 raise ManifestError(
                     f"unit of migration {id_a!r} is contained in the unit of {id_b!r}"
                 )
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _ancestor_identities(path: Path) -> set[tuple[int, int]]:
+    """The device and inode of every ancestor directory of *path* that can be read."""
+    found = {_directory_identity(parent) for parent in path.parents}
+    return {identity for identity in found if identity is not None}
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,7 +15,12 @@ import pytest
 import support
 
 from migr8.adapters.base import Boundary, OutcomeClass
-from migr8.errors import ContractViolationError, Exit, UnknownOutcomeError
+from migr8.errors import (
+    ContractViolationError,
+    Exit,
+    MigrationFailedError,
+    UnknownOutcomeError,
+)
 from migr8.latch import LatchState, RunLatch
 from migr8.testing import hooks
 
@@ -58,6 +63,20 @@ def test_contract_violation_latch_is_distinct_from_unknown():
     latch.latch_violation(ContractViolationError("broke the transaction"))
     assert latch.latched and not latch.unknown
     assert latch.state is LatchState.CONTRACT_VIOLATION
+
+
+def test_a_failed_batch_latch_is_single_shot_and_still_rolls_back():
+    latch = RunLatch()
+    first = MigrationFailedError("the database rolled the batch transaction back")
+    latch.latch_failure(first)
+    assert latch.latched and not latch.unknown
+    assert latch.state is LatchState.BATCH_FAILED
+    latch.latch_violation(ContractViolationError("broke the transaction"))
+    latch.latch_failure(MigrationFailedError("a later batch"))
+    with pytest.raises(MigrationFailedError) as info:
+        latch.check()
+    assert info.value is first
+    assert info.value.exit_code == Exit.MIGRATION_FAILED
 
 
 def test_unknown_outcome_is_catchable_but_the_latch_is_not_clearable():
@@ -352,3 +371,70 @@ def test_lost_atomic_completion_acknowledgement_is_not_inferred_as_rollback(proj
     assert [r[2] for r in support.history(db)] == ["SUCCESS", "SUCCESS"]
     # A later run sees the success and skips it.
     assert support.migrate(config, manifest) == Exit.OK
+
+
+def _lose_identity_probe(adapter, method: str) -> dict:
+    """Make one transaction-identity call lose its reply, as a lost transport would."""
+    state = {"fired": False, "rollbacks_after_latch": 0}
+    real_rollback = adapter.rollback
+
+    def lost(*args):
+        state["fired"] = True
+        raise SimulatedTransportLoss(f"simulated loss of the reply to {method}")
+
+    def rollback():
+        if adapter.latch is not None and adapter.latch.latched:
+            state["rollbacks_after_latch"] += 1
+        return real_rollback()
+
+    setattr(adapter, method, lost)
+    adapter.rollback = rollback
+    return state
+
+
+def test_lost_reply_on_the_batch_identity_read_exits_four(project):
+    """The read at batch exit precedes the commit, so the batch is not durable."""
+    root, config, db = project
+    manifest = _batch_project(root, BODY)
+    state: dict = {}
+    report = support.migrate_report(
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector", _lose_identity_probe(a, "_read_transaction_identity")
+        ),
+    )
+    assert state["injector"]["fired"]
+    assert report.exit_code == Exit.UNKNOWN_OUTCOME
+    assert report.connection_discarded
+    assert state["injector"]["rollbacks_after_latch"] == 0
+    assert support.db_query(db, "SELECT id FROM dst") == []
+    assert support.progress(db) == []
+    assert [r[2] for r in support.history(db)] == ["SUCCESS", "ACTIVE"]
+
+
+def test_lost_reply_on_the_batch_identity_establishment_exits_four(project):
+    root, config, db = project
+    marker = root / "batch-body-ran"
+    body = (
+        "import pathlib\n\n\n"
+        "def migrate(ctx):\n"
+        "    with ctx.transaction() as tx:\n"
+        f"        pathlib.Path({str(marker)!r}).write_text('yes')\n"
+        '        tx.execute("INSERT INTO dst (id) VALUES (1)")\n'
+    )
+    manifest = _batch_project(root, body)
+    state: dict = {}
+    report = support.migrate_report(
+        config,
+        manifest,
+        adapter_hook=lambda a: state.__setitem__(
+            "injector", _lose_identity_probe(a, "_establish_transaction_identity")
+        ),
+    )
+    assert state["injector"]["fired"]
+    assert report.exit_code == Exit.UNKNOWN_OUTCOME
+    assert state["injector"]["rollbacks_after_latch"] == 0
+    assert not marker.exists()
+    assert support.db_query(db, "SELECT id FROM dst") == []
+    assert [r[2] for r in support.history(db)] == ["SUCCESS", "ACTIVE"]

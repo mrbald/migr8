@@ -18,7 +18,7 @@ FINGERPRINT_RE = re.compile(r"^fp1:[0-9a-f]{64}$")
 
 def is_supported_fingerprint(value: str) -> bool:
     """True when ``value`` is a syntactically valid fingerprint of a known format."""
-    return bool(FINGERPRINT_RE.match(value))
+    return bool(FINGERPRINT_RE.fullmatch(value))
 
 
 def _u32be(value: int) -> bytes:

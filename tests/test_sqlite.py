@@ -488,7 +488,7 @@ def test_failure_mid_way_retains_active_and_the_checkpoint(project):
     assert support.migrate(config, manifest) == Exit.VALIDATION  # source changed
     report = support.report_for("status", config, manifest)
     assert report.exit_code == Exit.VALIDATION
-    assert report.recovery_command.endswith("--recover copy")
+    assert report.recovery_id == "copy"
     assert support.migrate(config, manifest, recover="copy") == Exit.OK
     assert support.db_query(db, "SELECT id FROM dst ORDER BY id") == [(n,) for n in range(1, 6)]
     row = next(r for r in support.history(db) if r[1] == "copy")
@@ -639,6 +639,58 @@ def test_ddl_inside_a_batch_is_rejected(project):
     assert support.migrate(config, manifest) == Exit.MIGRATION_FAILED
     names = support.db_query(db, "SELECT name FROM sqlite_master WHERE name='nope'")
     assert names == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "CREATE TABLE nope (id INTEGER)",
+        "ALTER TABLE dst ADD COLUMN nope INTEGER",
+        "DROP TABLE dst",
+    ],
+)
+def test_ddl_through_a_batch_handle_is_rejected_and_names_ctx_ddl(project, statement):
+    root, config, db = project
+    body = (
+        f"def migrate(ctx):\n    with ctx.transaction() as tx:\n        tx.execute({statement!r})\n"
+    )
+    manifest = _batch_project(root, body)
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.MIGRATION_FAILED
+    assert "ctx.ddl() outside the batch" in report.message
+    assert support.db_query(db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'nope'") == [(0,)]
+    assert support.db_query(db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'dst'") == [(1,)]
+
+
+def test_a_cte_that_deletes_is_rejected_outside_a_batch(project):
+    """``WITH ... DELETE`` autocommits outside a batch, as a bare DELETE would."""
+    root, config, db = project
+    body = (
+        "def migrate(ctx):\n"
+        "    ctx.execute('WITH doomed AS (SELECT 1) DELETE FROM src')\n"
+        "    ctx.execute('WITH doomed AS (SELECT 1) UPDATE src SET id = id + 100')\n"
+    )
+    manifest = _batch_project(root, body)
+    report = support.migrate_report(config, manifest)
+    assert report.exit_code == Exit.MIGRATION_FAILED
+    assert "WITH ... DELETE outside a ctx.transaction()" in report.message
+    assert support.db_query(db, "SELECT COUNT(*) FROM src") == [(5,)]
+
+
+def test_a_cte_that_selects_is_admitted_outside_a_batch(project):
+    root, config, db = project
+    body = (
+        "def migrate(ctx):\n"
+        "    rows = ctx.query('WITH s(n) AS (SELECT COUNT(*) FROM src) SELECT n FROM s')\n"
+        "    with ctx.transaction() as tx:\n"
+        "        tx.execute('INSERT INTO dst (id) VALUES (?)', (rows[0][0],))\n"
+        "        tx.execute('WITH s(n) AS (SELECT 1) DELETE FROM src WHERE id IN s')\n"
+        "        ctx.progress.set('done', 'yes')\n"
+    )
+    manifest = _batch_project(root, body)
+    assert support.migrate(config, manifest) == Exit.OK
+    assert support.db_query(db, "SELECT id FROM dst") == [(5,)]
+    assert support.db_query(db, "SELECT COUNT(*) FROM src") == [(4,)]
 
 
 def test_migration_cannot_modify_reserved_metadata_objects(project):
