@@ -8,6 +8,11 @@
 # pyproject.toml is a promise to operators, and an untested floor is not one.
 # `databases` runs on the newest only: it provisions Oracle, which dominates
 # its runtime, and the adapters it exercises are version-independent DB-API.
+#
+# release.yml calls this workflow as its `gates` job, so a release passes the
+# same list. `uv sync --locked` fails when uv.lock no longer matches
+# pyproject.toml instead of re-resolving: the release exports its runtime
+# dependency sets from uv.lock, and this is the run that tests that lock.
 
 name: tests
 
@@ -15,6 +20,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   checks:
@@ -26,11 +35,13 @@ jobs:
         python-version: ["3.12", "3.14"]
     name: checks (${{ matrix.python-version }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --all-extras
+      - run: uv sync --locked --all-extras
       # The whole repository, which is the command AGENTS.md documents: the
       # Python blocks in docs/ and the example migrations are checked too.
       - run: uv run ruff check .
@@ -63,11 +74,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.14"
-      - run: uv sync --all-extras
+      - run: uv sync --locked --all-extras
       - name: start Oracle and PostgreSQL
         run: testenv/dbctl.sh up
       - name: record the server versions the run is evidence for

@@ -1,26 +1,27 @@
-# Publish to PyPI via trusted publishing (OIDC, no stored tokens) on version
-# tags. One-time setup on pypi.org: Account -> Publishing -> add a pending
+# Release a tagged candidate to PyPI via trusted publishing (OIDC, no stored
+# tokens). One-time setup on pypi.org: Account -> Publishing -> add a pending
 # publisher (project migr8, owner mrbald, repository migr8, workflow
-# release.yml, environment pypi). Release: git tag vX.Y.Z && git push origin
-# vX.Y.Z.
+# release.yml, environment pypi). Release: README "Make a release".
 #
-# Nothing is published that has not passed the real-database gate. A migration
-# engine whose Oracle and PostgreSQL adapters were never run against a server
-# in the release build is not a release candidate, so the whole suite runs here
-# against the same disposable services CI uses, not just the fast tier.
+# Nothing is published that did not pass the whole CI gate list and the
+# installed-artifact smoke test. `gates` calls ci.yml, which runs the full suite
+# against live Oracle and PostgreSQL. `build` checks the tag, builds the sdist
+# and the wheel, and exports the runtime dependency set of each extra from
+# uv.lock with hashes. `smoke` starts its own Oracle and PostgreSQL with
+# testenv/dbctl.sh, records their versions, and runs scripts/release_smoke.sh on
+# the files `build` uploaded: the base wheel against the SQLite example, and
+# the wheel with each extra against its live server in a schema of its own.
+# `publish` uploads those same files and `release-assets` attaches them, with
+# the dependency sets, the server versions and SHA256SUMS, to the GitHub
+# release.
 #
-# The suite runs from the checkout, which is not what an operator installs. The
-# smoke steps below install the built wheel into clean virtual environments that
-# contain nothing else, and run it from outside the source tree: once with no
-# extra against SQLite, and once with the oracle extra against the live server
-# that is still up at that point. The artifacts published afterwards are the
-# ones those steps installed.
+# The release jobs keep no git credentials and use no uv cache, so nothing a
+# cache or an earlier step left behind reaches the candidate.
 #
-# Run it by hand from the Actions tab to exercise everything up to the upload
-# and stop: `build` runs in full and `publish` is skipped, because only a tag
-# push may publish. Use that before trusting a change to this file -- a bump to
-# the artifact actions moves the distributions between `build` and `publish`,
-# and a tag is an expensive place to discover that it broke.
+# Publication needs a tag: a tag push, or a manual run (workflow_dispatch) from
+# a tag with `publish` set. `release-assets` follows every publish. A manual
+# run from any other ref, or without `publish`, is a rehearsal: it runs
+# `gates`, `build` and `smoke` and publishes nothing.
 
 name: release
 
@@ -28,156 +29,171 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI and create the GitHub release (tag refs only; tag pushes always publish)"
+        type: boolean
+        default: false
+
+permissions: {}
 
 jobs:
+  gates:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      # The floor from pyproject.toml. The dependency sets recorded below are
-      # resolved here, so resolving at the floor keeps them installable across
-      # the whole supported range; the smoke environments use it for the same
-      # reason. The wheel itself is pure Python and tagged py3-none-any.
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-      - run: uv sync --all-extras
-
-      # The tag is the release's name and src/migr8/version.py is the version
-      # written into every durable history row. A mismatch means a published
-      # artifact would record a version nobody can find, so refuse before doing
-      # any work. A manual run has no tag to check and publishes nothing, so it
-      # reports the version it is about to build instead.
-      - name: the tag matches the package version
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      # src/migr8/version.py is the version source: pyproject.toml reads it with
+      # this pattern, and TOOL_VERSION is written into every durable history
+      # row. On a tag ref the tag must name that version and be annotated, since
+      # its message is the release note. The explicit fetch keeps the tag
+      # object, whatever the checkout did with it.
+      - name: the tag names TOOL_VERSION and is annotated
+        env:
+          REF: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          pkg="$(uv run python -c 'from migr8.version import TOOL_VERSION; print(TOOL_VERSION)')"
-          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
-            echo "dry run of ${pkg}: every gate below runs, nothing is published"
+          version="$(sed -n 's/^TOOL_VERSION = "\([^"]*\)"$/\1/p' src/migr8/version.py)"
+          if [ -z "$version" ]; then
+            echo "::error::no TOOL_VERSION line in src/migr8/version.py"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_ENV"
+          if [ "$REF_TYPE" != tag ]; then
+            echo "rehearsal of $version from $REF: nothing is published"
             exit 0
           fi
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$tag" != "$pkg" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not match src/migr8/version.py (${pkg})"
+          TAG="$REF"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match src/migr8/version.py TOOL_VERSION $version"
             exit 1
           fi
-          echo "releasing ${pkg}"
+          git fetch --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+          kind="$(git cat-file -t "refs/tags/$TAG")"
+          if [ "$kind" != tag ]; then
+            echo "::error::tag $TAG is lightweight ($kind); release tags are annotated"
+            exit 1
+          fi
+          echo "tag $TAG is annotated and matches TOOL_VERSION $version"
+      # sdist and wheel are built separately from the tree, so the wheel is
+      # not built from the sdist; smoke then rebuilds a wheel from the sdist
+      # and compares the two, which catches a file the sdist lost.
+      - run: uv build --sdist
+      - run: uv build --wheel
+      - name: the distributions carry TOOL_VERSION
+        run: |
+          set -euo pipefail
+          ls dist
+          test -f "dist/migr8-$version.tar.gz"
+          test -f "dist/migr8-$version-py3-none-any.whl"
+      # twine is pinned: a check that moves with the tool is not a gate.
+      - run: uvx twine==7.0.0 check --strict dist/*
+      # The base profile has no runtime dependencies. Each extra's set is the
+      # closure gates tested (ci.yml syncs with --locked), with every version
+      # pinned and hashed: pinning migr8 alone does not freeze an open-ended
+      # driver requirement.
+      - name: export the runtime dependency set of each extra (hashes included)
+        run: |
+          set -euo pipefail
+          mkdir exports
+          uv export --frozen --no-dev --no-emit-project --extra oracle -o exports/runtime-oracle.txt
+          uv export --frozen --no-dev --no-emit-project --extra postgres -o exports/runtime-postgres.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate
+          path: |
+            dist/
+            exports/
+          if-no-files-found: error
 
-      # The whole repository, the same scope as the tests workflow and AGENTS.md.
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy
-      - run: uv run coverage run -m pytest -q -m "not oracle and not postgres"
-      - run: uv run coverage report
-
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    # Oracle Free initialises its database on first start; dbctl.sh allows it
+    # 15 minutes.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # The checkout supplies the script, its example inputs and the test rig;
+      # the code under test comes from the candidate only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      # the floor of requires-python
+      - run: uv python install 3.12
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate
+          path: candidate
+      # dbctl.sh and the provisioning scripts run on .venv/bin/python and need
+      # both drivers. migr8 itself stays out of .venv.
+      - run: uv sync --locked --all-extras --no-install-project
       - name: start Oracle and PostgreSQL
         run: testenv/dbctl.sh up
-      - name: record the server versions this release was built against
-        run: testenv/dbctl.sh versions | tee versions.txt
-      # A live fixture skips when its service is unreachable or unconfigured,
-      # and nothing is published on a suite that quietly did not run. The skips
-      # that remain with both services up name a fixture no plain runner has: a
-      # bounded filesystem for the ENOSPC case, and an Oracle wallet plus Client
-      # libraries for the two certificate tests. docs/ACCEPTANCE.md records
-      # running those elsewhere. Print every skip, and fail on a service one.
-      - name: full suite against both servers
+      - name: record the server versions the smoke runs against
         run: |
           set -euo pipefail
-          testenv/dbctl.sh test -q | tee suite.log
-          # pytest colours the summary even when stdout is a pipe.
-          skips="$(sed $'s/\x1b\\[[0-9;]*m//g' suite.log | grep '^SKIPPED' || true)"
-          echo "${skips:-nothing skipped}"
-          if printf '%s\n' "$skips" |
-             grep -E 'not reachable|not configured|is unset|could not import'; then
-            echo "a live suite skipped with both services up; not releasing"
-            exit 1
-          fi
-      - run: uv build
-      - run: uvx twine check --strict dist/*
-
-      # The runtime dependency set for each installable profile, with the exact
-      # versions and hashes this release resolved. Pinning migr8 alone does not
-      # freeze an open-ended driver requirement, so the set is published with it.
-      - name: record the runtime dependency set per profile
-        run: |
-          set -euo pipefail
-          uv pip compile pyproject.toml --generate-hashes -o runtime-base.txt
-          uv pip compile pyproject.toml --extra oracle --generate-hashes -o runtime-oracle.txt
-
-      - name: the base wheel runs the SQLite example from a clean environment
-        run: |
-          set -euo pipefail
-          wheel="$(ls dist/*.whl)"
-          work="$(mktemp -d)"
-          cp -r examples/sqlite "$work/example"
-          uv venv --python 3.12 "$work/venv"
-          uv pip install --python "$work/venv/bin/python" "$wheel"
-          # Installed, not imported from the checkout: a source-tree import would
-          # test the repository rather than the artifact.
-          "$work/venv/bin/python" -c 'import migr8; assert "site-packages" in migr8.__file__, migr8.__file__; print(migr8.__file__)'
-          uv pip list --python "$work/venv/bin/python" --format=freeze | tee "$work/installed.txt"
-          if grep -Eiq '^(oracledb|psycopg|pytest|ruff|mypy|coverage)' "$work/installed.txt"; then
-            echo "the base profile installed more than migr8 and its runtime needs"
-            exit 1
-          fi
-          cd "$work/example"
-          "$work/venv/bin/migr8" --version
-          "$work/venv/bin/migr8" validate --offline
-          "$work/venv/bin/migr8" migrate
-          "$work/venv/bin/migr8" validate
-          "$work/venv/bin/migr8" status
-
-      # A schema of its own: the suite above leaves MIGR8_TEST bound to its own
-      # lock id, and the example is configured for another, so reusing it would
-      # fail the binding check by design rather than tell us anything about the
-      # wheel.
-      - name: the oracle wheel runs against the live server from a clean environment
+          testenv/dbctl.sh versions | tee versions.txt
+      # Schemas of the smoke's own, so a local run against a developer's rig
+      # leaves the suite's MIGR8_TEST and migr8 schemas alone. The script
+      # refuses a namespace that is already initialized.
+      - name: provision the smoke schemas
         env:
-          MIGR8_PASSWORD: migr8_ora_test
           ORACLE_TEST_USER: MIGR8_SMOKE
           ORACLE_TEST_PASSWORD: migr8_ora_test
+          MIGR8_PG_SCHEMA: migr8_smoke
         run: |
           set -euo pipefail
-          uv run testenv/provision_oracle.py
-          wheel="$(ls dist/*.whl)"
-          work="$(mktemp -d)"
-          cp -r examples/oracle "$work/example"
-          sed -i 's/MIGR8_TEST/MIGR8_SMOKE/g' "$work/example/migr8.toml"
-          uv venv --python 3.12 "$work/venv"
-          uv pip install --python "$work/venv/bin/python" "${wheel}[oracle]"
-          uv pip list --python "$work/venv/bin/python" --format=freeze | tee "$work/installed.txt"
-          grep -qi '^oracledb' "$work/installed.txt"
-          if grep -qi '^psycopg' "$work/installed.txt"; then
-            echo "the oracle profile pulled the PostgreSQL driver"
-            exit 1
-          fi
-          cd "$work/example"
-          "$work/venv/bin/migr8" validate --offline
-          "$work/venv/bin/migr8" migrate
-          "$work/venv/bin/migr8" validate
-          "$work/venv/bin/migr8" status
-
+          .venv/bin/python testenv/provision_oracle.py
+          .venv/bin/python testenv/provision_postgres.py
+      # MIGR8_SMOKE_REQUIRE_LIVE turns a skipped live run into a failure.
+      - name: installed-artifact smoke
+        env:
+          MIGR8_SMOKE_REQUIRE_LIVE: "1"
+          MIGR8_SMOKE_ORACLE_DSN: localhost:15210/FREEPDB1
+          MIGR8_SMOKE_ORACLE_USER: MIGR8_SMOKE
+          MIGR8_SMOKE_ORACLE_PASSWORD: migr8_ora_test
+          MIGR8_SMOKE_PG_DSN: host=127.0.0.1 port=15433 dbname=migr8_test
+          MIGR8_SMOKE_PG_USER: migr8_test
+          MIGR8_SMOKE_PG_PASSWORD: migr8_pg_test
+          MIGR8_SMOKE_PG_SCHEMA: migr8_smoke
+        run: |
+          set -euo pipefail
+          PYTHON="$(uv python find --managed-python 3.12)"
+          export PYTHON
+          bash scripts/release_smoke.sh candidate/dist candidate/exports
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: servers
+          path: versions.txt
+          if-no-files-found: error
+      - name: service logs
+        if: failure()
+        run: testenv/dbctl.sh logs
       - name: stop the services
         if: always()
         run: testenv/dbctl.sh destroy
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: |
-            dist/
-            versions.txt
-            runtime-base.txt
-            runtime-oracle.txt
-
-  # Only a tag push publishes. `on` admits manual runs so the build above can be
-  # exercised on demand, and this condition is what keeps such a run from
-  # reaching PyPI: the upload cannot be started by hand, whatever is selected in
-  # the Actions tab. github-release needs this job, so it is skipped with it.
   publish:
-    if: github.event_name == 'push'
-    needs: build
+    needs: [gates, build, smoke]
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -186,44 +202,49 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: .
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          name: candidate
+          path: candidate
+      # the smoked files, nothing rebuilt; exports/ stays off PyPI
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: candidate/dist/
 
-  github-release:
+  release-assets:
     needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      # --notes-from-tag reads the annotation from the local repository
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: dist
-          path: .
-      # The release notes carry the server versions the build was tested
-      # against, because "tested on Oracle" without a release number is not a
-      # claim anyone can check.
-      - name: publish the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          persist-credentials: false
+      - run: git fetch --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate
+          path: candidate
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: servers
+          path: servers
+      # versions.txt names the Oracle and PostgreSQL servers the smoke ran the
+      # installed wheel against.
+      - name: assets and SHA256SUMS
         run: |
           set -euo pipefail
-          {
-            echo "Tested against:"
-            echo
-            echo '```'
-            cat versions.txt
-            echo '```'
-            echo
-            echo "The attached runtime-*.txt files are the resolved runtime"
-            echo "dependency set for each installable profile, with hashes."
-          } > notes.md
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file notes.md \
-            --generate-notes \
-            dist/* runtime-base.txt runtime-oracle.txt
+          mkdir assets
+          cp candidate/dist/* candidate/exports/* servers/versions.txt assets/
+          cd assets
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+      - name: create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" --verify-tag --notes-from-tag assets/*
