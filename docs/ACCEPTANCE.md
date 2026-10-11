@@ -1,21 +1,42 @@
 # Acceptance report
 
-Specification: [`SPEC.md`](SPEC.md) (v6.2). Implementation: `src/migr8/`.
-Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md). Report date: 2026-09-13.
+Specification: [`SPEC.md`](SPEC.md) (v6.3). Implementation: `src/migr8/`.
+Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md). Report date: 2026-10-10, for
+commit `0c33699`. Runs dated 2026-09-13 to 2026-09-16 stay below with their
+dates; [Not rerun at 0c33699](#not-rerun-at-0c33699) lists the ones not repeated.
 
 ## Status
 
-Every test listed below passes, and that is not the same thing as a
-production-readiness claim. What is open is enumerated under
-[Open gates](#open-gates).
+On 2026-10-10, at commit `0c33699`, 1087 of the 1090 collected tests passed
+against Oracle Free 23.9.0.25.07 and PostgreSQL 17.5, and three skipped for a
+missing fixture. That is not a production-readiness claim. What is open is
+enumerated under [Open gates](#open-gates).
 
-What this report claims, for the exact versions recorded below:
+What this report claims, for the exact versions recorded below. A claim that
+names a September date was last shown on that date and not at `0c33699`.
 
 - The state machine, fingerprint encoding, manifest rules, lexical scanner and
   pure state validator behave as specified, with deterministic fixtures.
 - Oracle and PostgreSQL adapters execute real atomic and restartable migrations,
   hold a real database-backed namespace lock across every commit, and detect a
   broken atomic transaction before writing a SUCCESS row.
+- A restartable batch whose transaction ended inside the batch is detected at the
+  next facade call and at batch exit. A PL/SQL block that commits is a contract
+  violation (exit 8) on Oracle, with the earlier work durable and the later
+  batch never run. A PostgreSQL batch rolled back after an error the author
+  caught exits 3 and leaves the migration ACTIVE. SQLite `INSERT OR ROLLBACK` and
+  `ON CONFLICT ROLLBACK` inside a batch exit 3 the same way. The Oracle and
+  PostgreSQL cases ran against live servers; the SQLite cases need no service.
+- Outcome classification is checked without a server for PostgreSQL SQLSTATE
+  classes 57, 58 and XX on commit-capable calls, and for Oracle `DPY-4011` and the
+  driver's session-dead codes. These use fake connections and scripted cursors:
+  they cover how the adapters classify, not what a server does.
+- A PostgreSQL DSN that carries a password is refused at configuration; the
+  password reaches the driver as a keyword argument.
+- `status` reports the history when a pending source fails to compile, attaching
+  the problem; the recovery command names the config and manifest paths the run
+  was started with; a busy SQLite database at connect exits 5; an interrupt during
+  teardown keeps the outcome the run had reached and renders the report once.
 - Both directions of commit-acknowledgement failure were induced at transport
   level at all five engine-owned durable transitions, on both databases, with an
   independent observer establishing which branch occurred.
@@ -48,26 +69,32 @@ What this report claims, for the exact versions recorded below:
 - `validate --offline` completes the plan checks with no connection, no secret,
   no import, no execution and no bytecode, and an approved plan artifact refuses
   an edited, reordered or removed published entry.
-- The wheel built from this tree installs on Linux into an environment holding
-  nothing else and runs the examples from outside the source tree, and the
-  service-free suite passes there against a second SQLite library version.
-- A real filesystem filling during a batch commit is reported as an unknown
-  outcome, and leaves the durable rows equal to the durable checkpoint.
-- The three runbooks in `MANUAL.md` have been walked end to end on all three
-  adapters, including an interrupted restartable migration and its rerun, and a
-  PostgreSQL namespace dumped and restored as one consistent pair.
-- The whole Oracle suite passes in python-oracledb **Thick** mode as well as
-  Thin, with the client libraries loaded by the adapter from configuration, and
-  a TNS alias from `tnsnames.ora` reaches the same namespace in both modes.
+- On 2026-09-13 the wheel built from the then-current tree (`migr8-0.1.0`)
+  installed on Linux into an environment holding nothing else and ran the
+  examples from outside the source tree, and the service-free suite passed there
+  against a second SQLite library version. Not repeated at `0c33699`.
+- On 2026-09-13 a real filesystem filling during a batch commit was reported as
+  an unknown outcome, and left the durable rows equal to the durable checkpoint.
+  The case last passed on 2026-09-15 and skipped on 2026-10-10
+  (`MIGR8_SMALL_FS` unset).
+- On 2026-09-13 the three runbooks in `MANUAL.md` were walked end to end on all
+  three adapters, including an interrupted restartable migration and its rerun,
+  and a PostgreSQL namespace was dumped and restored as one consistent pair. Not
+  repeated at `0c33699`.
+- On 2026-09-13 the whole Oracle suite (97 tests then) passed in python-oracledb
+  **Thick** mode as well as Thin, with the client libraries loaded by the adapter
+  from configuration, and a TNS alias from `tnsnames.ora` reached the same
+  namespace in both modes. Not repeated at `0c33699`.
 - A proxy connect string, `RUNNER[OWNER]`, authenticates as the runner and runs
   as the owner against the real server, with the objects owned by the owner.
-- An initial install runs over TLS, authenticated by a client certificate and
-  proxying into the schema, with no password in the configuration or the
-  environment.
+- On 2026-09-13 an initial install ran over TLS, authenticated by a client
+  certificate and proxying into the schema, with no password in the
+  configuration or the environment. The two certificate tests skipped on
+  2026-10-10 (`MIGR8_ORACLE_TLS_ADMIN` unset).
 
-What it does not claim: nothing about Oracle 19c, thick-mode drivers, wallet or
-external authentication, Windows, network filesystems, RAC, Data Guard,
-performance, or scale. The SQLite results are results on this host's SQLite
+What it does not claim: nothing about Oracle 19c, Thick-mode clients other than
+the one recorded below, wallet or external authentication beyond the one TLS
+fixture, Windows, network filesystems, RAC, Data Guard, performance, or scale. The SQLite results are results on this host's SQLite
 library and Python, within the profile stated in `SPEC.md` §13.3; a killed
 process is not a power failure, and no test here removes power or fills a
 filesystem.
@@ -77,7 +104,56 @@ only Oracle release distributed as a freely redistributable container image and
 is therefore the release this project's CI and acceptance runs can use. A 19c
 result would require a licensed installation; see [Open gates](#open-gates).
 
+### Not rerun at 0c33699
+
+These results date from 2026-09-13 to 2026-09-16, on the tree of that time, and
+were not repeated on 2026-10-10. The code they exercise has changed since.
+
+- **Oracle Thick mode** (Instant Client 23.9.0.25.07, Linux ARM64): last run
+  2026-09-13. The adapter now refuses a Thick-mode failover type other than
+  `NONE`, and reads the driver's `transaction_in_progress` for the batch check.
+  Both are covered by fakes only (`tests/test_oracle_failover.py`).
+- **The installed-wheel runbook walk-through** of `MANUAL.md` on SQLite, Oracle
+  and PostgreSQL: last run 2026-09-13, with the `migr8-0.1.0` wheel.
+- **Linux in `python:3.14-slim`** (service-free suite, installed wheel, bounded
+  filesystem case): last run 2026-09-13 to 2026-09-15.
+- **The whole suite on Python 3.12**, against both servers (2026-09-15): not
+  repeated. CI's `checks (3.12)` job covers the interpreter floor without the
+  servers; the `databases` job runs on 3.14 only.
+- **TLS certificate authentication and TNS aliases**: last run 2026-09-13. The
+  two certificate tests skipped on 2026-10-10.
+- **The filesystem-fills case**: last run 2026-09-15. It skipped on 2026-10-10.
+
 ## Recorded environment
+
+### 2026-10-10, commit 0c33699
+
+| Component | Value |
+|---|---|
+| Host | macOS Darwin 25.6.0, arm64 |
+| Python | 3.14.0 |
+| Container engine | podman 6.1.1 behind the docker CLI 29.8.0 (`docker context podman`) |
+| Oracle | Oracle Free 23.9.0.25.07, driven in Thin mode |
+| PostgreSQL | 17.5 |
+
+The server images are those pinned in `testenv/compose.yaml`, whose digests are
+the ones in the table below. Library versions read on this host on 2026-10-11,
+after the run: SQLite 3.50.4, python-oracledb 26.0.0, psycopg 3.3.5.
+
+Commands and exit status: `ruff check .`, `ruff format --check .` (90 files),
+`mypy src` and `mypy testenv` each exited 0.
+`pytest -m 'not oracle and not postgres' -q`: 887 passed, 1 skipped, 202
+deselected. `testenv/dbctl.sh test -q -rs`: 1087 passed, 3 skipped, exit 0. The
+skips are the two Oracle TLS cases (`MIGR8_ORACLE_TLS_ADMIN` unset) and the
+SQLite bounded-filesystem case (`MIGR8_SMALL_FS` unset).
+
+GitHub Actions run 38076260436 on `0c33699`, 2026-10-10: `checks (3.12)`,
+`checks (3.14)` and `databases` all succeeded. The `checks` jobs ran 885 passed,
+3 skipped, 202 deselected; `databases` ran 1085 passed, 5 skipped. On those
+Linux runners the two case-alias manifest tests also skip, because the
+filesystem is case-sensitive.
+
+### 2026-09-13 to 2026-09-16
 
 | Component | Value |
 |---|---|
@@ -154,7 +230,8 @@ testenv/dbctl.sh down              # containers removed, volumes kept
 testenv/dbctl.sh destroy           # also removes this project's volumes
 ```
 
-Examples, each run end to end while preparing this report. Run
+Examples, each run end to end while preparing the 2026-09-13 report and not
+repeated since. Run
 `testenv/dbctl.sh provision` first: `tests/test_adapter_contract.py` binds lock
 id 4719 in the shared test schemas so it never contends with the other suites,
 and the examples are configured for 4711, so a schema left behind by that suite
@@ -188,24 +265,28 @@ docker run --rm --tmpfs /small:rw,size=8m -v "$PWD:/src:ro" python:3.14-slim bas
 ## Results by evidence level
 
 Levels are partitioned by pytest marker: `oracle`, `postgres`, `sqlite`,
-and everything else.
+and everything else. Counts are from `pytest --collect-only` at `0c33699`; the
+results are from the run of 2026-10-10 on this host.
 
 | Level | Result | Tests | Evidence |
 |---|---|---|---|
-| Pure / unit | **PASS** | 278 | Deterministic fixtures, including malformed, colliding and corrupt definitions, and dictionary rows recorded from the live servers. No database. |
-| SQLite | **PASS** | 339 | Real SQLite files, real transactions, real cooperating OS processes, real signals and real `SIGKILL`s, in both supported journal modes. |
-| PostgreSQL integration | **PASS** | 63 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures, live metadata mutation. |
-| Oracle integration | **PASS** | 99 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures, live metadata mutation. |
+| Pure / unit | **PASS** | 485 | Deterministic fixtures, including malformed, colliding and corrupt definitions, dictionary rows recorded from the live servers, and fake connections for PostgreSQL and Oracle classification and setup errors. No database. |
+| SQLite | **PASS**, 1 skipped | 403 | Real SQLite files, real transactions, real cooperating OS processes, real signals and real `SIGKILL`s, in both supported journal modes. The skip is the bounded-filesystem case. |
+| PostgreSQL integration | **PASS** | 84 | Real PostgreSQL 17.5, session advisory lock, concurrent processes, transport failures, live metadata mutation, batch transactions the database rolled back. |
+| Oracle integration | **PASS**, 2 skipped | 118 | Real Oracle 23.9.0.25.07, `DBMS_LOCK`, PL/SQL, DDL, dictionary validity checks, transport failures, live metadata mutation, a PL/SQL block that commits inside a batch. The skips are the two certificate tests. |
 | Oracle 19c release gate | **NOT RUN** | 0 | No 19.x installation is available. See [Open gates](#open-gates). |
 
-Total: **779 tests, 776 passed, 0 failed, 3 skipped** with both services up, run
-on 2026-09-13 against the versions recorded above. Run time about 81 s. The three
-skips each name the fixture they need: the filesystem-fills case wants a small
-bounded filesystem in `MIGR8_SMALL_FS`, and the two certificate tests want the
-TLS fixture and the Oracle Client libraries. Both fixtures and the results of
-running with them are recorded below. Without the services, 617 run and the live
-suites skip with an explicit message naming the missing environment variables; a
-skip is never counted as coverage. The
+Total: **1090 tests, 1087 passed, 0 failed, 3 skipped** with both services up,
+`testenv/dbctl.sh test -q -rs`, exit 0, on 2026-10-10 against the versions
+recorded above. The run time was not recorded. The three skips each name the
+fixture they need: the filesystem-fills case wants a small bounded filesystem in
+`MIGR8_SMALL_FS`, and the two certificate tests want the TLS fixture and the
+Oracle Client libraries. Both fixtures and the results of running with them on
+2026-09-13 to 2026-09-15 are recorded below. The offline selection,
+`pytest -m 'not oracle and not postgres' -q`, ran 888 tests: 887 passed, 1
+skipped, 202 deselected. Run without that selection and without the services,
+the live suites skip with an explicit message naming the missing environment
+variables; a skip is never counted as coverage. The
 `databases` job in CI runs the whole suite against both servers on every push
 and pull request. It prints every skip and fails on one whose reason says a
 service was unreachable or unconfigured, which is the failure that would
@@ -216,72 +297,85 @@ The `checks` job requires 100% branch coverage for `errors`, `fingerprint`,
 `latch`, `model` and `statevalidate`. `[tool.coverage.report]` in
 `pyproject.toml` lists the modules and states the scope limit: no adapter,
 engine or CLI coverage is measured, so that percentage says nothing about them.
+The job succeeded on `0c33699` on Python 3.12 and 3.14 (run 38076260436); this
+report does not record the coverage percentages.
 
-The adapter contract suite contributes 88 of those tests, in one file. It is one
+The adapter contract suite contributes 124 of those tests, in one file. It is one
 suite parametrised over every adapter, and `adapters.SUPPORTED` is asserted
 against the parametrisation, so a new adapter cannot skip it.
 
 | File | Tests |
 |---|---|
-| `tests/test_sqlite.py` | 89 |
-| `tests/test_adapter_contract.py` | 88 |
-| `tests/test_sqltext.py` | 66 |
-| `tests/test_statevalidate.py` | 52 |
-| `tests/test_manifest.py` | 49 |
+| `tests/test_adapter_contract.py` | 124 |
+| `tests/test_sqlite.py` | 99 |
+| `tests/test_sqltext.py` | 83 |
+| `tests/test_checks.py` | 63 |
+| `tests/test_statevalidate.py` | 53 |
+| `tests/test_postgres_offline.py` | 53 |
+| `tests/test_manifest.py` | 52 |
 | `tests/test_sqlite_layout.py` | 51 |
+| `tests/test_oracle_classification.py` | 49 |
 | `tests/test_sqlite_faults.py` | 45 |
+| `tests/integration/test_oracle_execution.py` | 33 |
 | `tests/test_metadata_damage.py` | 29 |
+| `tests/integration/test_postgres.py` | 26 |
 | `tests/test_outcome_authority.py` | 22 |
-| `tests/test_fingerprint.py` | 21 |
-| `tests/test_failure_reporting.py` | 19 |
+| `tests/test_fingerprint.py` | 22 |
 | `tests/test_offline.py` | 21 |
+| `tests/integration/test_oracle.py` | 20 |
+| `tests/integration/test_commit_failure.py` | 20 |
+| `tests/test_setup_errors.py` | 19 |
+| `tests/test_failure_reporting.py` | 19 |
 | `tests/test_entry_contract.py` | 18 |
+| `tests/test_oracle_config.py` | 17 |
 | `tests/test_cli.py` | 17 |
 | `tests/test_diagnostics.py` | 16 |
-| `tests/test_unknown_outcome.py` | 12 |
-| `tests/test_staging.py` | 11 |
-| `tests/test_loader.py` | 10 |
-| `tests/test_terminal_result.py` | 10 |
-| `tests/test_concurrency_probe.py` | 8 |
-| `tests/test_oracle_config.py` | 17 |
-| `tests/test_checks.py` | 2 |
-| `tests/integration/test_oracle_execution.py` | 27 |
-| `tests/integration/test_commit_failure.py` | 20 |
-| `tests/integration/test_oracle.py` | 20 |
-| `tests/integration/test_postgres.py` | 18 |
+| `tests/test_unknown_outcome.py` | 15 |
+| `tests/test_interrupt_teardown.py` | 14 |
 | `tests/integration/test_metadata_damage.py` | 14 |
+| `tests/test_staging.py` | 11 |
+| `tests/test_terminal_result.py` | 10 |
+| `tests/test_loader.py` | 10 |
+| `tests/test_status_preflight.py` | 9 |
+| `tests/test_oracle_failover.py` | 8 |
+| `tests/test_concurrency_probe.py` | 8 |
+| `tests/test_sqlite_batch_transaction.py` | 6 |
+| `tests/test_recovery_command.py` | 5 |
 | `tests/integration/test_oracle_concurrency.py` | 5 |
+| `tests/integration/test_status_preflight_live.py` | 2 |
 | `tests/integration/test_oracle_tls.py` | 2 |
 
 ## Required scenario groups
 
-Groups 1 to 11 are those of specification Section 14.2; 12 to 14 are this
-report's own. **PARTIAL** means some listed item in the group is not covered,
+Groups 1 to 11 are those of specification Section 14.2; 12 to 15 are this
+report's own. Results are those of the run of 2026-10-10 at `0c33699`. **PARTIAL** means some listed item in the group is not covered,
 and the gap is named.
 
 | # | Group | Result | Notes |
 |---|---|---|---|
-| 1 | Manifest and fingerprint | **PARTIAL** | Golden canonical encoding is asserted against a hand-built byte string, not against the implementation's own loops. All covered inputs change the fingerprint; required-set reordering does not. Location and position independence, duplicate ids, duplicate and nested units, symlinked roots and in-unit symlinks, special files, bytecode and tool caches, invalid paths, missing entry, changed successful source, and staged source unaffected by later working-tree edits are all covered. Distinct ids `a-b` and `a_b` load distinct helpers. **Gap:** the case-folding collision rule is tested at the function level only; this host's filesystem is case-insensitive, so a colliding pair cannot be created to drive it end to end. |
+| 1 | Manifest and fingerprint | **PARTIAL** | Golden canonical encoding is asserted against a hand-built byte string, not against the implementation's own loops. All covered inputs change the fingerprint; required-set reordering does not. Location and position independence, duplicate ids, duplicate and nested units, symlinked roots and in-unit symlinks, special files, bytecode and tool caches, invalid paths, missing entry, changed successful source, and staged source unaffected by later working-tree edits are all covered. Distinct ids `a-b` and `a_b` load distinct helpers. **Gap:** the case-folding collision rule is tested at the function level; the two end-to-end alias tests in `tests/test_manifest.py` run only on a filesystem that folds case, as on this macOS host, and skip on case-sensitive ones, including CI's Linux runners. |
 | 2 | History validation | **PASS** | Valid empty, prefix and full states; position gaps and duplicates; more than one ACTIVE; ACTIVE not next; ACTIVE marked atomic; ACTIVE without an attempt count; SUCCESS without a completion time; atomic SUCCESS carrying an attempt count; incorrect stored language and mode; orphaned progress; progress on a SUCCESS row; modified SUCCESS source; unsupported fingerprint and layout formats; corrupt enumerated fields. |
 | 3 | Initialization | **PARTIAL** | Interruption after each independently durable object creation (parametrised over all four objects) and before and after the final marker; permitted completion of an incomplete initialization; missing progress table, missing one-active index and incompatible column layout after completed initialization; populated history without a marker; lock and config binding mismatch. Live mutation in a disposable schema of a `DISABLED` unique key, a dropped foreign key, a replaced one-ACTIVE index expression, a check constraint rewritten as a tautology and a foreign key repointed at a same-named history table in a second disposable schema on Oracle; and of a re-keyed index, an unpredicated index, a `NOT VALID` foreign key, a tautological check constraint and a cross-schema foreign key on PostgreSQL. Each is reported as exit 7 and left unrepaired. At the dictionary-row level, a check constraint that is missing, altered or added is refused on both engines, as is one whose condition the comparison does not recognise. A namespace whose every check constraint was re-created from its own stored definition -- the round trip a logical restore performs -- is still accepted on both engines; on PostgreSQL the test asserts the rendering actually changed, so it cannot pass vacuously, and on Oracle the same round trip leaves the rendering unchanged. On SQLite, in both journal modes, live mutation of a completed namespace covers a one-ACTIVE index that is re-keyed, not unique, unpredicated, predicated on another literal, widened or extended; an index of that name on another table; an added index on a metadata table; a check constraint removed, widened, weakened with an added term or added; a missing unique key; a primary key on another column; a foreign key absent or pointing at another table; a shortened primary key; a table stored with different options that passes every structural check; and a hand-edited schema SQLite cannot parse. Each is exit 7 from both `validate` and `migrate`, and nothing is repaired. **Gap:** loss of dictionary inspection privilege mid-life is not simulated, though the adapter treats an inaccessible probe as an error and the equivalent "target schema absent" path is tested on PostgreSQL. |
 | 4 | Atomic | **PASS** | Normal DML; query-only success; statement error rollback; an error inserting the SUCCESS row rolling the migration work back with it; forbidden DDL; the transaction-identity tripwire firing on a real PL/SQL `COMMIT` with the work left durable and no SUCCESS row; no further work after a detected violation; work and history committing together; a latched unknown outcome reported as exit 4 with the connection discarded even when the migration catches it and returns or raises its own exception; and lost completion acknowledgement in **both** proven branches on both databases. |
-| 5 | Restartable | **PASS** | Failure after a batch boundary and after DDL plus a batch; completed work present before SUCCESS (induced at the completion boundary); no-op rerun of completed work; open transaction on return rolled back with ACTIVE retained; progress and data committing together and rolling back together; checkpoint derived from the exact processed keys; progress writes outside a batch rejected; nested batches rejected; no continuation after a caught unknown outcome, including when author code replaces it with an exception of its own or swallows every exception; a deferred entry point (`async def`, generator, async generator, or a synchronous wrapper returning one) refused before any history row is written; and a helper imported inside `migrate` reloaded from its edited source on a same-process recovery. |
+| 5 | Restartable | **PASS** | Failure after a batch boundary and after DDL plus a batch; completed work present before SUCCESS (induced at the completion boundary); no-op rerun of completed work; open transaction on return rolled back with ACTIVE retained; progress and data committing together and rolling back together; checkpoint derived from the exact processed keys; progress writes outside a batch rejected; nested batches rejected; no continuation after a caught unknown outcome, including when author code replaces it with an exception of its own or swallows every exception; a deferred entry point (`async def`, generator, async generator, or a synchronous wrapper returning one) refused before any history row is written; and a helper imported inside `migrate` reloaded from its edited source on a same-process recovery. A batch transaction the migration ended is detected at the next facade call inside the batch and at batch exit, with the migration left ACTIVE: a PL/SQL block that commits inside a batch is a contract violation, exit 8, with the earlier work durable and the later batch never run (Oracle, `tests/integration/test_oracle_execution.py`); a transaction boundary injected by wrapping the adapter's `execute` exits 8 on PostgreSQL, and a batch rolled back after an author-caught statement error exits 3 and cannot be turned into SUCCESS by catching the batch-exit failure (`tests/integration/test_postgres.py`); SQLite `INSERT OR ROLLBACK` and `ON CONFLICT ROLLBACK` inside a batch exit 3, and the rerun inserts the rows (`tests/test_sqlite_batch_transaction.py`). |
 | 6 | Required objects | **PARTIAL** | Missing, wrong-type and invalid declarations fail; the failure verdict is identical on a retry that skips recreation; a warning-only valid object passes; adding or removing a requirement changes the fingerprint; unsupported declaration types are refused before connecting. **Gaps:** an *ambiguous* `(owner, name, type)` row is not reproduced, because Oracle's dictionary does not permit two such rows in the supported namespace, so the branch exists without a live case; an object made inaccessible by privilege change is not simulated; and "unrelated invalid objects and compilation settings remain untouched" is argued from the read-only implementation rather than asserted by a test. |
-| 7 | Recovery admission | **PASS** | Unchanged retry without the flag; changed ACTIVE refused without the flag, reporting both fingerprints and the exact recovery command; wrong and absent active id refused; `--recover` against an absent namespace and against a partly created one refused with exit 2, with no metadata object, no marker and no migration execution left behind, while plain `migrate` still completes the same incomplete namespace; mode change refused even with the flag; SQL-to-Python recovery recording consistent metadata while preserving identity, position, mode, first fingerprint and original start time; convergence from checkpoints written by two earlier source versions; and an edit to a successful migration never admitted. |
+| 7 | Recovery admission | **PASS** | Unchanged retry without the flag; changed ACTIVE refused without the flag, reporting both fingerprints and the exact recovery command; wrong and absent active id refused; `--recover` against an absent namespace and against a partly created one refused with exit 2, with no metadata object, no marker and no migration execution left behind, while plain `migrate` still completes the same incomplete namespace; mode change refused even with the flag; SQL-to-Python recovery recording consistent metadata while preserving identity, position, mode, first fingerprint and original start time; convergence from checkpoints written by two earlier source versions; and an edit to a successful migration never admitted. The recovery command carries the resolved `--config` and `--manifest` paths, shell-quoted, when either was given, and takes the short form for the default layout (`tests/test_recovery_command.py`). |
 | 8 | Concurrency | **PARTIAL** | Deterministic contention at zero timeout on all three adapters; a waiter that later acquires the lock, finds no pending work and exits 0 (SQLite and Oracle); the lock held across DDL and across batch commits (all three); a dead client leaving a live server session that still holds the lock, with the lock released only once that session ends (Oracle, via the proxy); read-only `status` and `validate` during a long migration on all three. On SQLite, an application reader is never shown an uncommitted batch, an application writer holding the database fails the run within the busy timeout and leaves no history behind, and the next run applies the same migration; both cases run in both journal modes. **Gaps:** the waiter-succeeds and dead-client cases are not repeated on PostgreSQL. |
 | 9 | Oracle and SQL details | **PARTIAL** | Correct `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` invocation with an output bind; multiline `UPDATE` with a line beginning `SET`; PL/SQL `EXIT WHEN`; literals and comments containing slashes and semicolons surviving normalisation and executing against the real server; stored PL/SQL keeping its terminator while `CREATE LIBRARY` does not; top-level SQL*Plus commands refused in preflight without rejecting valid internal tokens; direct DDL restrictions; synchronous commit session setup; native driver parameter handling; and the realistic bounded backfill example running against Oracle. **Gap:** `COMMIT_WAIT` cannot be read back at session level on Oracle, so its establishment is reported as NOT VERIFIED rather than asserted. |
-| 10 | Inspection | **PASS** | `validate` and `status` perform no initialization, no code import (driven by a unit whose module body raises), no migration execution, no database-object recompilation and no SQLite journal-mode change; consistent history snapshots; uninitialized distinguished from damaged and from incomplete-but-compatible; session-liveness diagnostics reporting `present` where privileges allow and `unknown` where they do not, with the honest caveat attached. |
+| 10 | Inspection | **PASS** | `validate` and `status` perform no initialization, no code import (driven by a unit whose module body raises), no migration execution, no database-object recompilation and no SQLite journal-mode change; consistent history snapshots; uninitialized distinguished from damaged and from incomplete-but-compatible; session-liveness diagnostics reporting `present` where privileges allow and `unknown` where they do not, with the honest caveat attached. `status` with a pending source that does not compile still reports the history and attaches the problem; when a database condition coexists (exit 6 and exit 7 were checked) that condition's code decides and both problems are reported, while `validate` still stops at preflight before connecting. SQLite in `tests/test_status_preflight.py`; PostgreSQL and Oracle in `tests/integration/test_status_preflight_live.py`. |
 | 11 | Plan lint | **PASS** | A Python entry point and a helper that do not compile, and a source with a null byte, each fail `migrate`, `validate` and `validate --offline` with exit 2 before any connection, naming the file and line, and leave no database file behind; `validate --offline` creates no database and no lock file, imports nothing (driven by a unit whose module body writes a marker file), and writes no `__pycache__`; a statement the backend does not admit fails offline; an approved plan artifact refuses an edited published unit, a reordered plan and a removed migration, admits appended work, and guards the online command too; a baseline that is not a plan report and a missing one are usage errors. |
-| 12 | Interruption and internal failure | **PASS** | Ctrl-C and `SIGTERM` between commits roll back, retain ACTIVE, exit 3 and print no traceback; an interruption during a commit latches an unknown outcome, discards the connection and exits 4; an injected internal defect produces a defined exit code naming the run id rather than a traceback. A real runner killed with `SIGKILL` at each of the six engine-owned boundaries, on either side of the commit, in both SQLite journal modes: the next run completes to the exact expected history and data, each row written once; the atomic commit's two sides are asserted separately; a kill between batches keeps the checkpoint and its data together with the migration ACTIVE; and the dead runner's lock file blocks nothing. A database path that is a directory, or a directory that cannot be created, is a usage error naming the path, and a read-only database file fails the run and changes no history. |
+| 12 | Interruption and internal failure | **PASS** | Ctrl-C and `SIGTERM` between commits roll back, retain ACTIVE, exit 3 and print no traceback; an interruption during a commit latches an unknown outcome, discards the connection and exits 4; an injected internal defect produces a defined exit code naming the run id rather than a traceback. A real runner killed with `SIGKILL` at each of the six engine-owned boundaries, on either side of the commit, in both SQLite journal modes: the next run completes to the exact expected history and data, each row written once; the atomic commit's two sides are asserted separately; a kill between batches keeps the checkpoint and its data together with the migration ACTIVE; and the dead runner's lock file blocks nothing. A database path that is a directory, or a directory that cannot be created, is a usage error naming the path, and a read-only database file fails the run and changes no history. An interrupt injected during teardown -- the connection discard, settlement, staging cleanup, the close, while the report is written, before the run starts and before the engine is entered -- leaves a latched exit 4 at 4 and a clean exit 0 at 0, says so when it discarded the connection, and renders the report once (`tests/test_interrupt_teardown.py`, SQLite). |
 | 13 | Diagnostics | **PASS** | The event log records the phases in order with a single correlation id and monotonic timings; the terminal record names the failing migration and phase; author `ctx.log` lines interleave; a canary planted in a driver message reaches neither the report, the event log nor stderr, and the same holds for a canary in a metadata-read rejection surfacing through `status --json`, one raised at CLI adapter construction reaching the fallback handler, one in a close or rollback cleanup warning, and one in the run log's own write failure; the log appends across runs and is absent unless configured; `--json` carries outcome, failing identity, phase and recovery command. A log file that cannot be opened fails with exit 1 before the command connects; a log whose close fails leaves an acknowledged exit 0 and its durable history unchanged; a log that stops writing while the engine reports exit 4 changes neither the result nor the SQL issued; and a failure handled before the engine is reached carries the run id in both `--json` and stderr. |
 | 14 | Adapter contract | **PASS** | Every behaviour below, per adapter: initialization to a verified layout, well-typed empty snapshot, physical-name resolution, engine-transaction state, uncommitted-work detection, transaction identity across a commit, the full admission/attempt/completion lifecycle including the permanence of `first_fingerprint` and `started_at`, a success row riding the caller's transaction, affected-row damage detection, bind narrowing and missing-bind detection, admission in every context, reserved-object refusal, the DDL allow-list, required-object consistency, error classification, and the identifier-level reserved-object rule with both its refusals and its admissions. |
+| 15 | Classification and setup errors | **PASS**, fakes only | PostgreSQL: connection loss and `40003` leave the outcome unknown; SQLSTATE classes 57, 58 and `XX` are unknown only on a commit-capable call, ordinary SQLSTATEs stay definite, a failed WAL write during commit latches unknown, and no `COMMIT` is sent after a connection failure, an interrupt or a latched run (`tests/test_postgres_offline.py`). Oracle: every session-dead code in the driver's own table is in the adapter's transport list, `DPY-4011` and a closed connection without an ORA number are unknown, other server errors stay definite, and a lost session in the required-object query or the compiler-message lookup latches unknown instead of reporting a validity failure (`tests/test_oracle_classification.py`). A PostgreSQL DSN that carries a password, or a user that conflicts with the configured one, is a configuration error that does not repeat the secret; the password and user reach psycopg as keyword arguments (`tests/test_postgres_offline.py`). Lock contention during setup exits 5, including a busy SQLite database for `migrate` and `status`; a lost connection during setup exits 1; any other driver error exits 1 with its code and without the driver message (`tests/test_setup_errors.py`). In Thick mode a failover type other than `NONE` is refused (`tests/test_oracle_failover.py`). **Limit:** these use intercepted driver calls, fake connections and scripted cursors. They show how the adapters classify an error, not what a server does, and the Thick-mode failover refusal has no run against a real Instant Client. |
 
 ## Linux, storage and the runbooks
 
 These were run on 2026-09-13 with the wheel built from this tree
 (`migr8-0.1.0-py3-none-any.whl`), installed into environments that contained
 nothing else. The commands are above and in `MANUAL.md`; what follows is what
-they reported.
+they reported. None of it was repeated at `0c33699`; see
+[Not rerun at 0c33699](#not-rerun-at-0c33699).
 
 **The service-free suite on Linux.** 607 collected, **606 passed, 1 skipped** in
 `python:3.14-slim` on kernel 6.10.14-linuxkit, aarch64, Python 3.14.7, SQLite
@@ -355,19 +449,24 @@ been run.
 The adapter selects the mode and reads it back, so "which driver mode was this
 tested in" has an answer per run rather than per machine.
 
-**Thin.** 97 Oracle tests pass on the macOS host, python-oracledb 26.0.0, against
-Oracle Free 23.9.0.25.07. This is the default and needs no Oracle client.
+**Thin.** On 2026-10-10, 116 of the 118 Oracle tests passed on the macOS host,
+python-oracledb 26.0.0, against Oracle Free 23.9.0.25.07; the two certificate
+tests skipped. On 2026-09-13, 97 non-certificate tests passed (99 with the TLS fixture).
+This is the default and needs no Oracle client.
 
-**Thick.** The same 97 tests pass with Oracle Instant Client 23.9.0.25.07
-(Linux ARM64), on 2026-09-13, in `python:3.14-slim` as an unprivileged user,
-against the same server. The suite runs in the configured mode end to end: the
+**Thick.** On 2026-09-13 the same 97 tests passed with Oracle Instant Client
+23.9.0.25.07 (Linux ARM64), in `python:3.14-slim` as an unprivileged user,
+against the same server. **NOT RERUN at `0c33699`:** the 19 non-certificate Oracle
+tests added since have not run in Thick mode, and the Thick-mode failover refusal is covered
+by fakes only. The suite runs in the configured mode end to end: the
 generated configs carry `allow_thick_mode` and `client_lib_dir`, so the runners
 the tests start in subprocesses load the client libraries too.
 
 The certificate tests need the TLS fixture as well, which adds
 `-v "$PWD/testenv/tls:/etc/oracle:ro" -e MIGR8_ORACLE_TLS_ADMIN=/etc/oracle` to
 the same command after `testenv/provision_tls.sh` has run. With the fixture in
-place the Oracle suite is **99 tests**, all passing.
+place the Oracle suite was **99 tests** on 2026-09-13, all passing. It is 118 at
+`0c33699`, and the fixture was not set up for the run of 2026-10-10.
 
 ```bash
 # Instant Client, once: unzip instantclient-basic-linux.arm64-23.9.0.25.07.zip
@@ -395,7 +494,7 @@ fresh schema: initial install through the alias in Thick mode (`status` exit 6,
 same alias in Thin mode, and validated again with a `host:port/service` DSN --
 the binding records the schema and the lock id, not the spelling of the address.
 
-**Certificate authentication over TLS.** `testenv/provision_tls.sh` builds the
+**Certificate authentication over TLS** (2026-09-13). `testenv/provision_tls.sh` builds the
 fixture: a server wallet and a client wallet, a TCPS endpoint on the listener
 demanding a client certificate, a database user whose identity is the client
 certificate's DN, and a proxy grant into a test schema. With it,
@@ -479,13 +578,14 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 | `CREATE INDEX CONCURRENTLY` outside a transaction | n/a | implemented, tested | n/a |
 | Database-backed namespace lock | implemented, tested (`DBMS_LOCK`) | implemented, tested (session advisory) | not applicable: POSIX file lock, an explicit exception |
 | Lock held across every commit | implemented, tested | implemented, tested | implemented, tested |
-| Transaction-identity tripwire | implemented, tested on a real PL/SQL `COMMIT` | implemented, tested (`pg_current_xact_id`) | not available; enforcement boundary stated instead |
+| Transaction-identity tripwire | implemented, tested on a real PL/SQL `COMMIT` | implemented, tested (`pg_current_xact_id`) | adapter-owned transaction epoch plus `in_transaction`; a commit reachable through the facade is detected, other paths are not claimed |
 | Oracle-style `require_valid` checking | implemented, tested | refused by design | refused by design |
 | Separate connect user and target schema | implemented, tested | not implemented | not applicable |
-| Unknown-outcome classification | implemented, tested at transport level | implemented, tested at transport level | implemented; no unknown outcomes possible |
+| Unknown-outcome classification | implemented, tested at transport level; `DPY-4011` and the driver's session-dead codes checked with scripted cursors | implemented, tested at transport level; SQLSTATE classes 57, 58 and `XX` checked with fakes | implemented; no unknown outcomes possible |
+| Batch transaction state check (restartable batch) | implemented; commit inside a batch tested live, exit 8 | implemented; rolled back after a caught error tested live, exit 3; injected boundary, exit 8 | implemented; `INSERT OR ROLLBACK` and `ON CONFLICT ROLLBACK` tested, exit 3 |
 | Session-liveness diagnostic | implemented, tested in both the privileged and unprivileged paths | implemented, tested | implemented, reports `unknown` |
 | Synchronous commit durability | set; **session read-back not available on Oracle** | set and verified by session read-back | n/a |
-| Thick-mode driver | refused unless explicitly enabled; **NOT RUN** | n/a | n/a |
+| Thick-mode driver | refused unless explicitly enabled; **PASS on 2026-09-13**, one client, **NOT RERUN at `0c33699`**; failover-type refusal tested with fakes only | n/a | n/a |
 | Wallet or external authentication | not implemented; **NOT RUN** | not implemented | n/a |
 
 ## Open gates
@@ -495,20 +595,20 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
 | Client-side statement timeout | **NOT IMPLEMENTED, by decision** | Nothing bounds a single migration statement; a blocked statement holds the namespace lock indefinitely. The specification declines a client-side timeout for the initial runner, and adding one would create a new unknown-outcome surface, since a timeout firing during a commit is indistinguishable from a lost acknowledgement. Bound long statements with database policy instead: `DDL_LOCK_TIMEOUT` and resource manager on Oracle, `statement_timeout` on PostgreSQL. |
 | Host-to-container TCP under Apple `container` | **PASS at 1.4.1; blocked at 1.2.2** | On 2026-09-15 with `container` CLI 1.4.1, a PostgreSQL 17.5 container accepted host connections on a published port (`127.0.0.1:15499`) and on its own address, 4 s after start, and the 3.12 run above drove the whole suite from a host interpreter against container addresses. At 1.2.2, published ports reset and direct addresses gave "no route to host" while ICMP succeeded, which is why the deployment example runs the job as a sibling container. See [`../deploy/container-job/APPLE-CONTAINER.md`](../deploy/container-job/APPLE-CONTAINER.md). The acceptance suite uses the Compose services, which publish host ports. |
 | Oracle 19c release compatibility | **NOT RUN** | The full applicable suite against a real Oracle 19.x installation, with the exact update level recorded. Oracle publishes no freely redistributable 19c container image, so this gate needs a licensed installation. Results on Free 23ai are results on Free 23ai; 19c support is not published on the strength of them. |
-| python-oracledb Thick mode | **PASS, one client** | All 97 Oracle tests pass in Thick mode with Instant Client 23.9.0.25.07 on Linux ARM64, recorded above. One client version, one architecture, one server release; and no Thick-mode-only feature is used, so this says the adapter works through that stack, not that it exercises it. |
-| TNS aliases and a driver configuration directory | **PASS, aliases only** | `oracle.config_dir` with a `tnsnames.ora` alias resolves in both modes against a real listener. `sqlnet.ora` settings, a wallet directory and Easy Connect Plus parameters are not exercised. |
+| python-oracledb Thick mode | **PASS on 2026-09-13, one client; NOT RERUN at `0c33699`** | All 97 Oracle tests passed in Thick mode with Instant Client 23.9.0.25.07 on Linux ARM64, recorded above. The tests added since, the failover-type refusal and the `transaction_in_progress` read behind the batch check have not run against Instant Client. One client version, one architecture, one server release; and no Thick-mode-only feature is used, so this says the adapter works through that stack, not that it exercises it. |
+| TNS aliases and a driver configuration directory | **PASS on 2026-09-13, aliases only; NOT RERUN at `0c33699`** | `oracle.config_dir` with a `tnsnames.ora` alias resolved in both modes against a real listener. `sqlnet.ora` settings, a wallet directory and Easy Connect Plus parameters are not exercised. |
 | Proxy-authenticated connect strings | **PASS** | `RUNNER[OWNER]` migrates and validates against the real server, running as the owner with the objects owned by the owner, and `[SCHEMA]` does the same authenticated by certificate. |
-| Wallet and external authentication | **PASS, one fixture** | An initial install over TCPS authenticated by client certificate, proxying into the schema, with no password anywhere; `testenv/provision_tls.sh` builds the fixture and `tests/integration/test_oracle_tls.py` runs it. Self-signed certificates, one listener, one client: no certificate authority, revocation, expiry or rotation, and no TLS-without-client-authentication case. |
+| Wallet and external authentication | **PASS on 2026-09-13, one fixture; NOT RERUN at `0c33699`** | The two certificate tests skipped on 2026-10-10 (`MIGR8_ORACLE_TLS_ADMIN` unset). An initial install over TCPS authenticated by client certificate, proxying into the schema, with no password anywhere; `testenv/provision_tls.sh` builds the fixture and `tests/integration/test_oracle_tls.py` runs it. Self-signed certificates, one listener, one client: no certificate authority, revocation, expiry or rotation, and no TLS-without-client-authentication case. |
 | Windows | **NOT SUPPORTED, NOT RUN** | The SQLite adapter refuses to start on Windows by design. Nothing has been run there. |
 | Network filesystems, hard-link aliases, shared in-memory SQLite | **OUT OF PROFILE** | Out of the SQLite profile by declaration, not by test. |
-| SQLite on Linux | **PASS, one distribution** | The service-free suite runs on Debian (`python:3.14-slim`, kernel 6.10.14-linuxkit, aarch64, SQLite 3.46.1) as an unprivileged user: 606 passed, 1 skipped. CI runs the same suite on ubuntu-latest, amd64, on every push. No other distribution, filesystem or kernel is recorded. |
+| SQLite on Linux | **PASS on 2026-09-13, one distribution; NOT RERUN in a container at `0c33699`** | The service-free suite ran on Debian (`python:3.14-slim`, kernel 6.10.14-linuxkit, aarch64, SQLite 3.46.1) as an unprivileged user: 606 passed, 1 skipped. CI runs the service-free suite on ubuntu-latest, amd64, on every push, on Python 3.12 and 3.14; both `checks` jobs succeeded on `0c33699` (885 passed, 3 skipped, run 38076260436). No other distribution, filesystem or kernel is recorded. |
 | Power loss | **NOT RUN** | Killing a process is not removing power: the kernel still writes what the process handed it. Nothing here cuts power to a host or a disk. |
-| A filesystem that fills | **PASS, at one failure point** | A real 8 MiB tmpfs filled during a batch commit: `SQLITE_FULL`, exit 4, and the durable rows equal the durable checkpoint. Recorded above. Where else ENOSPC can land -- a journal write, a WAL checkpoint, the metadata insert -- is not surveyed, and no failing physical disk was used. |
+| A filesystem that fills | **PASS on 2026-09-13 and 2026-09-15, at one failure point; skipped on 2026-10-10** | A real 8 MiB tmpfs filled during a batch commit: `SQLITE_FULL`, exit 4, and the durable rows equal the durable checkpoint. Recorded above. Where else ENOSPC can land -- a journal write, a WAL checkpoint, the metadata insert -- is not surveyed, and no failing physical disk was used. |
 | Installation through the operator's index or proxy | **NOT RUN** | The wheel installs into clean environments and runs the examples from outside the source tree: on Linux aarch64 here, and on the CI runner in the release workflow, which also installs the oracle extra and runs it against the live server. Installing a *published* version through the user's own proxy, on the user's own Linux, has not been done, and no x86_64 host other than CI has been recorded. |
 | Backup and restore of a SQLite namespace | **PARTIAL** | A backup taken through SQLite's own backup API, restored over the same canonical path, is rehearsed in both journal modes: `status` and `validate` pass on the restored file, history and application data match, and it accepts new work. A restore to another path is refused by the namespace binding. Not covered: a backup taken while a migration is running, and Oracle or PostgreSQL restore procedures. |
 | Restoring a PostgreSQL namespace | **PASS, one path** | `pg_dump -n <schema>` and a `psql` restore of application data and `m8_*` together, rehearsed on 17.5; it found the rendering defect recorded above and validates after the fix. Physical backups, PITR and cross-version restores are not covered. |
 | Restoring an Oracle namespace | **PARTIAL** | The rendering round trip is covered: re-creating every check constraint from its own `SEARCH_CONDITION` leaves the namespace accepted on 23.9.0.25.07. Data Pump, a physical restore and a cross-version restore have not been run. |
-| The runbooks in `MANUAL.md` | **PARTIAL** | All three walked end to end from the installed wheel on 2026-09-13, on SQLite (Linux), Oracle 23.9.0.25.07 and PostgreSQL 17.5, each in a fresh namespace, including an interrupted restartable migration and its rerun; recorded above. Not walked on a production-shaped target, and not by an operator other than the implementation. |
+| The runbooks in `MANUAL.md` | **PARTIAL; NOT RERUN since 2026-09-13** | All three walked end to end from the installed `migr8-0.1.0` wheel on 2026-09-13, on SQLite (Linux), Oracle 23.9.0.25.07 and PostgreSQL 17.5, each in a fresh namespace, including an interrupted restartable migration and its rerun; recorded above. Not walked on a production-shaped target, and not by an operator other than the implementation. |
 | Oracle RAC, Data Guard, Transaction Guard, Application Continuity | **OUT OF SCOPE** | Explicitly out of this recovery path. |
 | Performance and scale | **NOT RUN** | The runbook rehearsal above times one seed and one backfill per engine, at 100,000 and 200,000 rows on one laptop; the largest suite fixture is 2500 rows. No load test, no concurrent application traffic, no long-running migration, and no measurement on target-shaped hardware. |
 | Security review | **NOT RUN** | No review of identifier handling, credential handling or the test-hook activation gate by anyone other than the implementation. |
@@ -559,8 +659,9 @@ and has no transport to lose, so it produces no unknown outcomes of its own.
    since total metadata loss is explicitly outside this protocol. The SQLite
    procedure is written down; rehearse a restore and record it.
 5. Walk the runbooks in `MANUAL.md` on the actual target, with the operator who
-   will run them. They have been walked on disposable SQLite and Oracle targets
-   here; that is a rehearsal by the implementation, not by the operator.
+   will run them. They were walked on disposable SQLite, Oracle and PostgreSQL targets
+   on 2026-09-13 and not since; that is a rehearsal by the implementation, not by
+   the operator.
 6. Install the release through the target environment's own index or proxy, on
    the target Linux, and record the architecture, the resolved dependency set and
    the installation self-check.

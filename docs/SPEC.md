@@ -1,4 +1,4 @@
-# migr8 - Specification v6.2
+# migr8 - Specification v6.3
 
 The maintained specification, kept in step with the implementation in
 `src/migr8/`. No database version is certified by this document alone.
