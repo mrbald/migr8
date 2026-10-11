@@ -1,7 +1,7 @@
 [project]
 name = "migr8"
 dynamic = ["version"]
-description = "An inspectable database migration engine: ordered manifest, immutable history, atomic and restartable migrations. Oracle primary target."
+description = "Database migration engine for Oracle, PostgreSQL and SQLite: ordered SQL and Python migrations, atomic and restartable execution, explicit roll-forward recovery."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "AGPL-3.0-only"

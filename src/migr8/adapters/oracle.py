@@ -1,4 +1,4 @@
-"""The Oracle adapter: the specification's primary target (spec Section 12).
+"""The Oracle adapter: session, locking and transaction behavior (spec Section 12).
 
 One physical ``python-oracledb`` Thin-mode session serves the whole run. It
 holds the ``DBMS_LOCK`` namespace lock across every commit, establishes

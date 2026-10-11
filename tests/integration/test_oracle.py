@@ -1,4 +1,4 @@
-"""Oracle integration: the specification's primary execution and recovery gate.
+"""Oracle integration: execution and recovery contracts on a real server.
 
 These run against a real Oracle server. Nothing here is mocked, and nothing here
 certifies Oracle 19c: see docs/ACCEPTANCE.md for the recorded release.

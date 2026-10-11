@@ -1,7 +1,7 @@
 # Release a tagged candidate to PyPI via trusted publishing (OIDC, no stored
 # tokens). One-time setup on pypi.org: Account -> Publishing -> add a pending
 # publisher (project migr8, owner mrbald, repository migr8, workflow
-# release.yml, environment pypi). Release: README "Make a release".
+# release.yml, environment pypi). Release: docs/RELEASING.md.
 #
 # Nothing is published that did not pass the whole CI gate list and the
 # installed-artifact smoke test. `gates` calls ci.yml, which runs the full suite

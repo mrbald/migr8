@@ -4,6 +4,9 @@ How the code is arranged, what each layer owns, and the design positions that
 stand. The protocol itself is [`SPEC.md`](SPEC.md); what has been tested is
 [`ACCEPTANCE.md`](ACCEPTANCE.md).
 
+The migration protocol is database-agnostic. Adapters implement each database's
+SQL, transactions, locks and metadata inspection.
+
 ## Layering
 
 ```text
@@ -21,8 +24,8 @@ adapters, ~3,000 code lines
                 history transitions, metadata initialization and inspection,
                 the progress store, statement admission, engine transactions
   metadata      the logical layout, state classification, definition comparison
-  oracle        primary target: DBMS_LOCK, transaction identity, ALL_* validity
-  postgres      second adapter: advisory lock, transactional DDL, real xid guard
+  oracle        DBMS_LOCK, transaction identity, ALL_* validity
+  postgres      advisory lock, transactional DDL, real xid guard
   sqlite        local file database: file lock, stated enforcement boundary
 ```
 

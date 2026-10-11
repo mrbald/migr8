@@ -6,13 +6,13 @@ The maintained specification, kept in step with the implementation in
 Acceptance evidence, including which gates are open, is in
 [`ACCEPTANCE.md`](ACCEPTANCE.md).
 
-The primary target is Oracle. PostgreSQL is the second database adapter and a useful comparison target. SQLite is a supported local-file adapter within a stated profile. Their different roles are specified in §13.
+The migration protocol is database-agnostic. Oracle, PostgreSQL and SQLite adapters implement it using each database's transaction, locking and metadata behavior. Supported profiles and database-specific acceptance requirements are specified in §13.
 
 MUST and MUST NOT are requirements; SHOULD permits a documented reason to choose otherwise; MAY is optional. The runner is the migration process. The author writes trusted migration code. The operator chooses the target database and runs the tool.
 
 ## 1. Purpose and scope
 
-`migr8` manages one ordered migration sequence for one database migration-history namespace. In the initial Oracle implementation, a namespace is one target schema with fixed metadata object names. One namespace has one migration stream.
+`migr8` manages one ordered migration sequence for one database migration-history namespace. A namespace is one target schema on Oracle or PostgreSQL, or one database file within the SQLite profile. Metadata object names are fixed within a namespace. One namespace has one migration stream.
 
 The database contains an immutable successful prefix and may contain one active restartable migration immediately after it. A source-controlled manifest defines order. A migration has a permanent identity, a source unit, a language, an execution mode, and any declared final validity requirements.
 
@@ -679,7 +679,7 @@ One more Oracle detail shapes the adapter. Oracle assigns a local transaction id
 
 ## 13. Adapters and practical test databases
 
-### 13.1 Oracle: primary acceptance target
+### 13.1 Oracle
 
 Recommended local development path: run Oracle Database Free in a disposable container using the maintained `gvenzl/oracle-free` images. The project provides ARM64 images from the 23.5 generation onward, suitable for an Apple Silicon development host. Select a currently available compatible tag and pin its digest in the test infrastructure; record the actual server banner, since image tags and product names evolve.
 
@@ -691,7 +691,7 @@ Oracle Free exercises the implementation on that tested release. It does not cer
 
 Source: [Oracle Free image project](https://github.com/gvenzl/oci-oracle-free).
 
-### 13.2 PostgreSQL: second adapter and independent database behavior
+### 13.2 PostgreSQL
 
 Use the official PostgreSQL image in the same isolated Compose project, with its own credentials, port, health check, and storage. Pin the selected supported release and image digest. Choose the correct volume mount for that image version; do not assume its data-directory convention is identical across major releases.
 
@@ -738,7 +738,7 @@ Maintain a checked-in test matrix and an execution report with actual commands, 
 | Pure/unit | Manifest validation, canonical fingerprints, paths, lexer, state validation | Deterministic fixtures, including malformed and colliding definitions. |
 | SQLite | Fast real transactional and CLI feedback, and the SQLite profile itself | Actual SQLite files and processes, in both supported journal modes; real process death at each durable boundary; stated profile limits. |
 | PostgreSQL integration | Session locking and PostgreSQL execution contracts | Real pinned server, driver, concurrent sessions and process failures. |
-| Oracle integration | Primary execution and recovery contract | Real Oracle server, metadata/DDL/PLSQL behavior, lock and commit-failure evidence. |
+| Oracle integration | Oracle execution and recovery contracts | Real Oracle server, metadata/DDL/PLSQL behavior, lock and commit-failure evidence. |
 | Oracle 19c release gate | Claimed 19c compatibility | Full applicable suite on recorded real 19.x update. |
 
 ### 14.2 Required scenario groups

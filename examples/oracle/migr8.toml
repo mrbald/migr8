@@ -1,4 +1,4 @@
-# Oracle is the primary target. Credentials never appear here: the password
+# Oracle connection settings. Credentials never appear here: the password
 # comes from MIGR8_PASSWORD, or from supported wallet/external authentication.
 [database]
 adapter = "oracle"

@@ -1,4 +1,4 @@
-"""PostgreSQL integration: the second adapter's own transactional behaviour.
+"""PostgreSQL integration: execution and transaction contracts on a real server.
 
 These validate the state machine and PostgreSQL behaviour. They do not
 substitute for Oracle's DDL, PL/SQL, lock or commit-outcome evidence.

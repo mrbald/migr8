@@ -1,10 +1,9 @@
-"""The PostgreSQL adapter: the second adapter and an independent behaviour check
-(spec Section 13.2).
+"""The PostgreSQL adapter: dialect, locking and transactions (spec Section 13.2).
 
-PostgreSQL is not an Oracle emulator here. It uses its own transactional DDL,
-its own session-level advisory lock and its own transaction identity. Its tests
-validate the state machine and PostgreSQL behaviour; they do not substitute for
-Oracle's DDL, PL/SQL, lock or commit-outcome evidence.
+The adapter uses PostgreSQL's transactional DDL, session-level advisory lock
+and transaction identity. Its tests validate the state machine and PostgreSQL
+behaviour; they do not substitute for Oracle's DDL, PL/SQL, lock or commit-outcome
+evidence.
 
 The driver connection runs in autocommit mode and every engine transaction is an
 explicit ``BEGIN`` / ``COMMIT``. That is an adapter choice, not a relaxation of
