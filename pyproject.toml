@@ -45,7 +45,7 @@ migr8 = "migr8.cli:main"
 
 [dependency-groups]
 dev = [
-  "pytest>=8.4.0",
+  "pytest>=9.2.0",
   "pytest-timeout>=2.4.0",
   # branch coverage over the pure core, enforced at 100% ([tool.coverage.report]
   # names the modules and argues the scope). `[toml]` extra so the config lives
