@@ -33,7 +33,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-oracle = ["oracledb>=3.4.0"]
+oracle = ["oracledb>=26.1.0"]
 postgres = ["psycopg[binary]>=3.2.0"]
 
 [project.urls]
@@ -55,7 +55,7 @@ dev = [
   "mypy>=1.18",
   # Both drivers, so the type gate and the live suites see the real modules
   # rather than a missing-import stub.
-  "oracledb>=3.4.0",
+  "oracledb>=26.1.0",
   "psycopg[binary]>=3.2.0",
 ]
 
