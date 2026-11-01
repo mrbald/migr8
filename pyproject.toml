@@ -50,7 +50,7 @@ dev = [
   # branch coverage over the pure core, enforced at 100% ([tool.coverage.report]
   # names the modules and argues the scope). `[toml]` extra so the config lives
   # in this file with its reasoning beside it.
-  "coverage[toml]>=7.6",
+  "coverage[toml]>=7.17.0",
   "ruff>=0.15",
   "mypy>=1.18",
   # Both drivers, so the type gate and the live suites see the real modules
